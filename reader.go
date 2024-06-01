@@ -1,0 +1,5 @@
+package download
+
+func NewRangeReader() {
+
+}
