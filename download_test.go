@@ -1,8 +1,7 @@
 package download
 
 import (
-	"log"
-	"os"
+	"log/slog"
 	"testing"
 )
 
@@ -23,7 +22,7 @@ func TestManager_Get(t *testing.T) {
 			name: "Test 1",
 			fields: fields{
 				conf: &Config{
-					Logger: log.New(os.Stderr, "[INFO] ", log.LstdFlags),
+					Logger: slog.Default(),
 				},
 			},
 			args: args{

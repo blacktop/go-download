@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -43,7 +44,7 @@ type Config struct {
 	RestartAll bool
 
 	Progress bool
-	Logger   *log.Logger
+	Logger   *slog.Logger
 
 	IgnoreHash bool
 	Verbose    bool
@@ -55,7 +56,7 @@ type Manager struct {
 
 	client *http.Client
 
-	log *log.Logger
+	log *slog.Logger
 
 	progress     *mpb.Progress
 	totalBarIncr func(int)
@@ -198,7 +199,7 @@ func (mgr *Manager) state(url string) error {
 }
 
 func (mgr *Manager) head(url string) error {
-	mgr.log.Printf("HEAD %s", url)
+	mgr.log.Info("HEAD", "url", url)
 
 	var redirected bool
 	defer func() {
@@ -217,7 +218,7 @@ func (mgr *Manager) head(url string) error {
 		}
 
 		for k, v := range mgr.Headers {
-			mgr.log.Printf("%s: %s", k, v)
+			mgr.log.Info("Headers", k, v)
 			req.Header.Set(k, v)
 		}
 
@@ -437,7 +438,7 @@ func (mgr *Manager) concatenateParts() (err error) {
 			if err != nil {
 				return err
 			}
-			mgr.log.Printf("concatenating: %q into %q", fparti.Name(), fpart0.Name())
+			mgr.log.Info(fmt.Sprintf("concatenating: %q into %q", fparti.Name(), fpart0.Name()))
 			if _, err = io.Copy(fpart0, fparti); err != nil {
 				return err
 			}
