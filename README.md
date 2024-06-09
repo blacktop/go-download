@@ -40,13 +40,13 @@ func main() {
         Parts:    4,
     })
     if err != nil {
-		log.Error(err.Error())
-		os.Exit(1)
+        log.Error(err.Error())
+        os.Exit(1)
     }
 
     if err := mgr.Get(os.Args[1]); err != nil {
-		log.Error(err.Error())
-		os.Exit(1)
+        log.Error(err.Error())
+        os.Exit(1)
     }
 }
 ```
