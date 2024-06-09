@@ -36,33 +36,41 @@ import (
 
 func init() {
 	rootCmd.Flags().BoolP("verbose", "V", false, "verbose output")
+	rootCmd.Flags().BoolP("progess", "b", false, "progress bar")
+	rootCmd.Flags().IntP("parts", "p", 1, "number of parts")
 }
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "dl",
-	Short: "Download a file from the internet in parts",
-	Args:  cobra.ExactArgs(1),
+	Use:           "dl",
+	Short:         "Download a file from the internet in parts",
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
 		verbose, _ := cmd.Flags().GetBool("verbose")
+		progress, _ := cmd.Flags().GetBool("progress")
+		parts, _ := cmd.Flags().GetInt("parts")
 
-		logger := log.NewWithOptions(os.Stderr, log.Options{
+		logger := log.NewWithOptions(os.Stdout, log.Options{
 			ReportCaller:    true,
 			ReportTimestamp: true,
 			TimeFormat:      time.Kitchen,
-			Prefix:          "Downloading ⬇️ ",
+			Prefix:          "Downloading ⬇️",
 		})
 		if verbose {
 			logger.SetLevel(log.DebugLevel)
 		}
 
 		mgr, err := download.New(&download.Config{
-			Context: ctx,
-			Logger:  slog.New(logger),
-			Verbose: verbose,
+			Context:  ctx,
+			Logger:   slog.New(logger),
+			Progress: progress,
+			Verbose:  verbose,
+			Parts:    parts,
 		})
 		if err != nil {
 			return err
@@ -75,8 +83,12 @@ var rootCmd = &cobra.Command{
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
+		log.Error(err.Error())
 		os.Exit(1)
 	}
 }
+
+// func init() {
+// 	log.SetHandler(log.Default)
+// }

@@ -6,11 +6,11 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -18,7 +18,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -137,11 +136,11 @@ func New(conf *Config) (*Manager, error) {
 func (mgr *Manager) Get(url string) error {
 	// get URL info
 	if err := mgr.head(url); err != nil {
-		return err
+		return fmt.Errorf("failed to get URL info: %w", err)
 	}
 	// get state of the download
-	if err := mgr.state(url); err != nil {
-		return err
+	if err := mgr.state(); err != nil {
+		return fmt.Errorf("failed to get download state: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(mgr.ctx)
@@ -159,47 +158,57 @@ func (mgr *Manager) Get(url string) error {
 		p.single = len(mgr.Parts) == 1
 		p.progress = mgr.progress
 		p.totalBarIncr = mgr.totalBarIncr
-		p.logger = log.New(os.Stderr, fmt.Sprintf("[%s:R%%02d] ", p.name), log.LstdFlags)
+		p.logger = mgr.log
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			cancel()
 			return err
 		}
 		p := p // https://golang.org/doc/faq#closures_and_goroutines
-		var eg errgroup.Group
-		eg.Go(func() error {
-			defer func() {
-				// if e := recover(); e != nil {
-				// 	cancel()
-				// 	onceSessionHandle.Do(sessionHandle)
-				// 	panic(fmt.Sprintf("%s panic: %v", p.name, e)) // https://go.dev/play/p/55nmnsXyfSA
-				// }
-				switch {
-				case p.isDone():
-					atomic.AddUint32(&mgr.doneCount, 1)
-				case p.Skip:
-					mgr.totalCancel(true)
-				}
-			}()
-			return p.download(mgr.client, req)
-		})
+		// var eg errgroup.Group
+		// eg.Go(func() error {
+		// 	defer func() {
+		// 		// if e := recover(); e != nil {
+		// 		// 	cancel()
+		// 		// 	onceSessionHandle.Do(sessionHandle)
+		// 		// 	panic(fmt.Sprintf("%s panic: %v", p.name, e)) // https://go.dev/play/p/55nmnsXyfSA
+		// 		// }
+		// 		switch {
+		// 		case p.isDone():
+		// 			atomic.AddUint32(&mgr.doneCount, 1)
+		// 		case p.Skip:
+		// 			mgr.totalCancel(true)
+		// 		}
+		// 	}()
+		// return p.download(mgr.client, req, fmt.Sprintf("[%s:R%%02d] ", p.name))
+		if err := p.download(mgr.client, req, fmt.Sprintf("[%s:R%%02d] ", p.name)); err != nil {
+			return err
+		}
+		// })
 	}
 
 	return mgr.concatenateParts()
 }
 
-func (mgr *Manager) state(url string) error {
+func (mgr *Manager) state() error {
 	if mgr.resumable() {
 		if f, err := os.Stat(mgr.DestName + ".download"); !os.IsNotExist(err) {
 			mgr.size = f.Size()
+		} else {
+			if err := mgr.createParts(); err != nil {
+				return fmt.Errorf("failed to create download parts: %w", err)
+			}
 		}
 	} else {
+		if err := mgr.createParts(); err != nil {
+			return fmt.Errorf("failed to create download parts: %w", err)
+		}
 	}
 	return nil
 }
 
 func (mgr *Manager) head(url string) error {
-	mgr.log.Info("HEAD", "url", url)
+	mgr.log.Debug("HEAD", "url", url)
 
 	var redirected bool
 	defer func() {
@@ -218,7 +227,7 @@ func (mgr *Manager) head(url string) error {
 		}
 
 		for k, v := range mgr.Headers {
-			mgr.log.Info("Headers", k, v)
+			mgr.log.Debug("Headers", k, v)
 			req.Header.Set(k, v)
 		}
 
@@ -261,6 +270,10 @@ func (mgr *Manager) head(url string) error {
 		mgr.ContentSha1 = resp.Header.Get("x-amz-meta-digest-sh1")
 		mgr.ContentLength = resp.ContentLength
 
+		if mgr.DestName == "" {
+			mgr.DestName = path.Base(req.URL.Path)
+		}
+
 		return nil
 	})
 }
@@ -278,7 +291,9 @@ func (mgr *Manager) written() int64 {
 }
 
 func (mgr *Manager) createParts() error {
-	if !mgr.resumable() {
+	if mgr.conf.Parts == 0 {
+		mgr.conf.Parts = 1
+	} else if !mgr.resumable() {
 		mgr.conf.Parts = 1
 	}
 

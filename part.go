@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -37,11 +37,11 @@ type Part struct {
 	maxTry       uint
 	single       bool
 	progress     *mpb.Progress
-	logger       *log.Logger
+	logger       *slog.Logger
 	totalBarIncr func(int)
 }
 
-func (p *Part) download(client *http.Client, req *http.Request) (err error) {
+func (p *Part) download(client *http.Client, req *http.Request, prefix string) (err error) {
 	fpart, err := os.OpenFile(p.FileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return errors.WithMessage(err, p.name)
@@ -49,7 +49,7 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 	defer func() {
 		fpart.Close()
 		if p.Written == 0 {
-			p.logger.Printf("file %q is empty, removing", fpart.Name())
+			p.logger.Debug(fmt.Sprintf("file %q is empty, removing", fpart.Name()))
 			os.Remove(fpart.Name())
 		}
 		err = errors.WithMessage(err, p.name)
@@ -58,15 +58,21 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 	var bar progressBar
 	var curTry uint32
 	var statusPartialContent bool
+	var attempt uint32
+
+	if p.progress != nil {
+		bar.initialized.Load()
+	}
+
 	// resetTimeout := timeout
 	// prefix := p.logger.Prefix()
 
 	req.Header.Set("Range", p.getRange())
 
-	// p.logger.SetPrefix(fmt.Sprintf(prefix, attempt))
-	p.logger.Printf("GET %q", req.URL)
+	p.logger = p.logger.WithGroup(fmt.Sprintf(prefix, attempt))
+	p.logger.Debug("GET", "url", req.URL)
 	for k, v := range req.Header {
-		p.logger.Printf("%s: %v", k, v)
+		p.logger.Debug("Header", k, v)
 	}
 
 	ctx, cancel := context.WithCancel(p.ctx)
@@ -75,29 +81,37 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
 		if p.Written == 0 {
-			fmt.Fprintf(p.progress, "%s%s\n", p.logger.Prefix(), err.Error())
+			if p.progress != nil {
+				fmt.Fprintf(p.progress, "%s%s\n", prefix, err.Error())
+			} else {
+				p.logger.Error(err.Error())
+			}
 		} else {
-			err := bar.init(p, &curTry)
-			if err != nil {
-				return err
+			if p.progress != nil {
+				if err := bar.init(p, &curTry); err != nil {
+					return err
+				}
 			}
 		}
 		return err
 	}
 
-	p.logger.Printf("HTTP status: %s", resp.Status)
-	p.logger.Printf("ContentLength: %d", resp.ContentLength)
+	p.logger.Debug("HTTP Status", "status", resp.Status)
+	p.logger.Debug("ContentLength", "length", resp.ContentLength)
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		err := bar.init(p, &curTry)
-		if err != nil {
-			return err
+		if p.progress != nil {
+			if err := bar.init(p, &curTry); err != nil {
+				return err
+			}
 		}
 		if p.Written != 0 {
 			go func(written int64) {
-				p.logger.Printf("Setting bar refill: %d", written)
-				bar.SetRefill(written)
+				p.logger.Debug("Setting Bar Refill", "written", written)
+				if p.progress != nil {
+					bar.SetRefill(written)
+				}
 			}(p.Written)
 		}
 		statusPartialContent = true
@@ -108,18 +122,19 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 		if p.Written == 0 {
 			if p.order != 1 {
 				p.Skip = true
-				p.logger.Println("Stopping: no partial content")
+				p.logger.Error("Stopping: no partial content")
 				return nil
 			}
 			p.single = true
 			if resp.ContentLength > 0 {
 				p.Stop = resp.ContentLength - 1
 			}
-			err := bar.init(p, &curTry)
-			if err != nil {
-				return err
+			if p.progress != nil {
+				if err := bar.init(p, &curTry); err != nil {
+					return err
+				}
 			}
-		} else if bar.initialized.Load() {
+		} else if p.progress != nil && bar.initialized.Load() {
 			err := fpart.Close()
 			if err != nil {
 				panic(err)
@@ -129,20 +144,22 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 				panic(err)
 			}
 			p.Written = 0
-			bar.SetCurrent(0)
+			if p.progress != nil {
+				bar.SetCurrent(0)
+			}
 		} else {
 			panic(fmt.Sprintf("expected 0 bytes got %d", p.Written))
 		}
 	case http.StatusServiceUnavailable:
-		if bar.initialized.Load() {
+		if p.progress != nil && bar.initialized.Load() {
 			bar.flashErr(resp.Status)
 		} else {
-			fmt.Fprintf(p.progress, "%s%s\n", p.logger.Prefix(), resp.Status)
+			fmt.Fprintf(p.progress, "%s%s\n", prefix, resp.Status)
 		}
 		return HttpError(resp.StatusCode)
 	default:
-		fmt.Fprintf(p.progress, "%s%s\n", p.logger.Prefix(), resp.Status)
-		if bar.initialized.Load() {
+		fmt.Fprintf(p.progress, "%s%s\n", prefix, resp.Status)
+		if p.progress != nil && bar.initialized.Load() {
 			bar.Abort(true)
 		}
 		// if attempt != 0 {
@@ -174,17 +191,23 @@ func (p *Part) download(client *http.Client, req *http.Request) (err error) {
 		}
 		p.Written += int64(n)
 		if p.total() <= 0 {
-			bar.SetTotal(p.Written, false)
+			if p.progress != nil {
+				bar.SetTotal(p.Written, false)
+			}
 		} else {
 			p.totalBarIncr(n)
 		}
-		bar.EwmaIncrBy(n, dur)
+		if p.progress != nil {
+			bar.EwmaIncrBy(n, dur)
+		}
 	}
 
 	if err == io.EOF {
 		if p.total() <= 0 {
 			p.Stop = p.Written - 1 // so p.isDone() retruns true
-			bar.EnableTriggerComplete()
+			if p.progress != nil {
+				bar.EnableTriggerComplete()
+			}
 		}
 		if p.isDone() {
 			return nil
@@ -219,7 +242,7 @@ func (p Part) makeMsgHandler(msgCh chan<- message) func(message) {
 		select {
 		case msgCh <- msg:
 		default:
-			fmt.Fprintf(p.progress, "%s%s\n", p.logger.Prefix(), msg.msg)
+			fmt.Fprintf(p.progress, "%s%s\n", p.logger.Handler(), msg.msg)
 		}
 	}
 }

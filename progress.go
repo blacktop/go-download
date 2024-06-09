@@ -183,7 +183,7 @@ func (b *progressBar) init(p *Part, curTry *uint32) error {
 	} else {
 		barBuilder = barRefiller(barStyle())
 	}
-	p.logger.Printf("Setting bar total: %d", total)
+	p.logger.Debug("Setting Bar Total", "total", total)
 	bar, err := p.progress.Add(total, barBuilder.Build(), mpb.BarFillerTrim(), mpb.BarPriority(p.order),
 		mpb.BarOptional(
 			mpb.BarExtender(mpb.BarFillerFunc(
@@ -217,7 +217,7 @@ func (b *progressBar) init(p *Part, curTry *uint32) error {
 		return err
 	}
 	if p.Written != 0 {
-		p.logger.Printf("Setting bar current: %d", p.Written)
+		p.logger.Debug("Setting Bar Current", "written", p.Written)
 		bar.SetCurrent(p.Written)
 		bar.DecoratorAverageAdjust(time.Now().Add(-p.Elapsed))
 	}
