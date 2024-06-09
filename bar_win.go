@@ -9,5 +9,5 @@ func barRefiller(style mpb.BarStyleComposer) mpb.BarStyleComposer {
 }
 
 func barStyle() mpb.BarStyleComposer {
-	return mpb.BarStyle().Lbound(" ").Rbound(" ").Refiller("#").Filler("#").Tip("")
+	return mpb.BarStyle().Lbound("[").Rbound("|").Refiller("#").Filler("=").Tip(">").Padding("-")
 }

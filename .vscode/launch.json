@@ -13,6 +13,8 @@
             "args": [
                 "-V",
                 "--progress",
+                "--parts",
+                "4",
                 "https://updates.cdn-apple.com/2024SpringFCS/fullrestores/062-06652/B7EAA639-CB1A-4D5D-B4B4-11D4DCECFDE9/iPhone15,2_17.5.1_21F90_Restore.ipsw"
             ]
         }

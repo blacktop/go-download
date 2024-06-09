@@ -36,7 +36,7 @@ import (
 
 func init() {
 	rootCmd.Flags().BoolP("verbose", "V", false, "verbose output")
-	rootCmd.Flags().BoolP("progess", "b", false, "progress bar")
+	rootCmd.Flags().BoolP("progress", "b", false, "progress bar")
 	rootCmd.Flags().IntP("parts", "p", 1, "number of parts")
 }
 
@@ -88,7 +88,3 @@ func Execute() {
 		os.Exit(1)
 	}
 }
-
-// func init() {
-// 	log.SetHandler(log.Default)
-// }
