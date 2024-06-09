@@ -48,9 +48,8 @@ var rootCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
 
+		// flags
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		progress, _ := cmd.Flags().GetBool("progress")
 		parts, _ := cmd.Flags().GetInt("parts")
@@ -64,6 +63,9 @@ var rootCmd = &cobra.Command{
 		if verbose {
 			logger.SetLevel(log.DebugLevel)
 		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
 
 		mgr, err := download.New(&download.Config{
 			Context:  ctx,

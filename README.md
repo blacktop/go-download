@@ -17,15 +17,37 @@ $ go get github.com/blacktop/go-download
 ```go
 package main
 
-import "github.com/blacktop/go-download"
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"    
+
+    "github.com/blacktop/go-download"
+)
 
 func main() {
-    d, err := download.NewDownloader("URL")
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
+
+    log := slog.NewJSONHandler(os.Stdout, nil)
+
+    mgr, err := download.New(&download.Config{
+        Context:  ctx,
+        Logger:   log,
+        Progress: true,
+        Parts:    4,
+    })
     if err != nil {
-        panic(err)
+		log.Error(err.Error())
+		os.Exit(1)
     }
 
-    d.Get()
+    if err := mgr.Get(os.Args[1]); err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+    }
 }
 ```
 
