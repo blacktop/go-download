@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/blacktop/go-download"
 	"github.com/charmbracelet/log"
@@ -34,23 +35,34 @@ import (
 )
 
 func init() {
-	// rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	rootCmd.Flags().BoolP("verbose", "V", false, "verbose output")
 }
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "dl",
 	Short: "Download a file from the internet in parts",
+	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
-		handler := log.New(os.Stderr)
-		logger := slog.New(handler)
+		verbose, _ := cmd.Flags().GetBool("verbose")
+
+		logger := log.NewWithOptions(os.Stderr, log.Options{
+			ReportCaller:    true,
+			ReportTimestamp: true,
+			TimeFormat:      time.Kitchen,
+			Prefix:          "Downloading ⬇️ ",
+		})
+		if verbose {
+			logger.SetLevel(log.DebugLevel)
+		}
 
 		mgr, err := download.New(&download.Config{
-			Logger:  &logger,
 			Context: ctx,
+			Logger:  slog.New(logger),
+			Verbose: verbose,
 		})
 		if err != nil {
 			return err
