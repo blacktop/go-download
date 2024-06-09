@@ -18,11 +18,11 @@ $ go get github.com/blacktop/go-download
 package main
 
 import (
-	"context"
-	"log/slog"
-	"os"
-	"os/signal"
-	"syscall"    
+    "context"
+    "log/slog"
+    "os"
+    "os/signal"
+    "syscall"    
 
     "github.com/blacktop/go-download"
 )
