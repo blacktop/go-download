@@ -3,6 +3,7 @@ package download
 import (
 	"cmp"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -42,7 +43,8 @@ func sourceIdentity(source *url.URL) string {
 	u := *source
 	u.Fragment = ""
 	u.RawFragment = ""
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(u.String())))
+	sum := sha256.Sum256([]byte(u.String()))
+	return hex.EncodeToString(sum[:])
 }
 
 func statePath(partPath string) string { return partPath + ".json" }

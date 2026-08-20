@@ -170,7 +170,10 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	case resp.StatusCode == http.StatusPartialContent:
 		contentRange := resp.Header.Get("Content-Range")
 		s, e, total, crErr := parseContentRange(contentRange)
-		if crErr != nil || s != cursor || e != end-1 || total != w.r.total {
+		// The range must start at the cursor and describe our representation
+		// (total "*" is RFC-valid unknown). A server-revised shorter range is
+		// tolerated: its early EOF becomes a retry from the advanced cursor.
+		if crErr != nil || s != cursor || e < s || (total != -1 && total != w.r.total) {
 			return &permanentError{fmt.Errorf(
 				"wrong Content-Range %q for requested bytes %d-%d/%d",
 				contentRange, cursor, end-1, w.r.total)}
@@ -184,6 +187,9 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		w.dropNode()
 		return errRangeIgnored
 	case isRetryableStatus(resp.StatusCode):
+		// Close the body first so the connection is idle (and torn down)
+		// when dropNode abandons the pinned transport.
+		resp.Body.Close()
 		w.strikeNode()
 		w.dropNode()
 		return StatusError(resp.StatusCode)
@@ -248,15 +254,38 @@ func (o *observedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// readLoop reads body in buf-sized pieces with stall detection, feeding each
-// read to sink. It returns nil when sink reports done, io.EOF when the body
-// ended first, or the read/sink error.
+// readLoop reads a known-length body in buf-sized pieces via io.ReadFull,
+// which maximizes per-read throughput; a short final buffer surfaces as
+// io.EOF because the sink's byte accounting decides completeness.
 func (w *worker) readLoop(body io.Reader, timer *time.Timer,
 	sink func([]byte, time.Duration) (bool, error)) error {
+	return w.pump(timer, sink, func(buf []byte) (int, error) {
+		n, err := io.ReadFull(body, buf)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			err = io.EOF
+		}
+		return n, err
+	})
+}
+
+// readUnknownLoop reads a response with no declared length until a clean EOF.
+// Unlike readLoop, it must not use io.ReadFull: for an unknown-length body a
+// short final buffer is normal, while an unexpected EOF indicates truncation.
+func (w *worker) readUnknownLoop(body io.Reader, timer *time.Timer,
+	sink func([]byte, time.Duration) (bool, error)) error {
+	return w.pump(timer, sink, body.Read)
+}
+
+// pump drives read in buf-sized pieces with stall detection, feeding each
+// read to sink. It returns nil when sink reports done, or the read/sink
+// error (io.EOF when the body ended before sink was done).
+func (w *worker) pump(timer *time.Timer,
+	sink func([]byte, time.Duration) (bool, error),
+	read func([]byte) (int, error)) error {
 	for {
 		timer.Reset(w.timeout)
 		start := time.Now()
-		n, err := io.ReadFull(body, w.buf)
+		n, err := read(w.buf)
 		d := time.Since(start)
 		done, serr := sink(w.buf[:n], d)
 		if serr != nil {
@@ -267,9 +296,6 @@ func (w *worker) readLoop(body io.Reader, timer *time.Timer,
 			return nil
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return io.EOF
-			}
 			return err
 		}
 	}
@@ -307,9 +333,9 @@ func (w *worker) bumpTimeout() {
 	if w.timeout < base {
 		w.timeout = base
 	}
-	cap := max(base, maxStallTimeout)
-	if w.timeout >= cap-timeoutStep {
-		w.timeout = cap
+	ceiling := max(base, maxStallTimeout)
+	if w.timeout >= ceiling-timeoutStep {
+		w.timeout = ceiling
 	} else {
 		w.timeout += timeoutStep
 	}
@@ -432,6 +458,7 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case isRetryableStatus(resp.StatusCode):
+		resp.Body.Close()
 		w.strikeNode()
 		w.dropNode()
 		return StatusError(resp.StatusCode)
@@ -493,29 +520,5 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		return w.classify(errShortBody, actx)
 	default:
 		return w.classify(err, actx)
-	}
-}
-
-// readUnknownLoop reads a response with no declared length until a clean EOF.
-// Unlike readLoop, it must not use io.ReadFull: for an unknown-length body a
-// short final buffer is normal, while an unexpected EOF indicates truncation.
-func (w *worker) readUnknownLoop(body io.Reader, timer *time.Timer,
-	sink func([]byte, time.Duration) (bool, error)) error {
-	for {
-		timer.Reset(w.timeout)
-		start := time.Now()
-		n, err := body.Read(w.buf)
-		d := time.Since(start)
-		done, serr := sink(w.buf[:n], d)
-		if serr != nil {
-			return serr
-		}
-		if done {
-			timer.Stop()
-			return nil
-		}
-		if err != nil {
-			return err
-		}
 	}
 }

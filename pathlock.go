@@ -28,6 +28,12 @@ func acquireDestination(ctx context.Context, dest string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	// Resolve directory symlinks (e.g. /tmp vs /private/tmp) so path
+	// aliases of one destination share a lock. Best-effort: the download
+	// needs the directory to exist anyway.
+	if dir, rerr := filepath.EvalSymlinks(filepath.Dir(key)); rerr == nil {
+		key = filepath.Join(dir, filepath.Base(key))
+	}
 
 	destinationLocks.mu.Lock()
 	if destinationLocks.locks == nil {

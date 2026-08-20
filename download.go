@@ -116,9 +116,9 @@ type Downloader struct {
 	log  *slog.Logger
 
 	// A Reporter has no run identifier, so configured reporter streams must
-	// not interleave across concurrent Get calls on this Downloader.
-	reportMu  sync.Mutex
-	reporting bool
+	// not interleave across concurrent Get calls on this Downloader. Nil
+	// when no Reporter is configured; holds one token otherwise.
+	reportSem chan struct{}
 
 	// dial is the TCP dialer shared by the base and pinned transports;
 	// tests override it to fake CDN nodes.
@@ -169,14 +169,16 @@ func New(opt *Options) (*Downloader, error) {
 		}
 		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
 	}
-	reporting := o.Reporter != nil
-	if o.Reporter == nil {
+	var reportSem chan struct{}
+	if o.Reporter != nil {
+		reportSem = make(chan struct{}, 1)
+	} else {
 		o.Reporter = NopReporter{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
-	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger, reporting: reporting}
+	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger, reportSem: reportSem}
 	d.dial = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -281,9 +283,13 @@ func shouldCopySensitiveHeaders(initial, dest *url.URL) bool {
 // never holds a partial file: bytes are staged in dest+".part" and installed
 // only after verification. Interrupted downloads resume automatically.
 func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error) {
-	if d.reporting {
-		d.reportMu.Lock()
-		defer d.reportMu.Unlock()
+	if d.reportSem != nil {
+		select {
+		case d.reportSem <- struct{}{}:
+			defer func() { <-d.reportSem }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	start := time.Now()
 	res, err := d.get(ctx, url, dest)
@@ -295,9 +301,9 @@ func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error)
 }
 
 func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, error) {
-	sourceReq, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	sourceURL, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("parse url %s: %w", rawURL, err)
 	}
 	resp, err := d.elect(ctx, rawURL)
 	if err != nil {
@@ -317,7 +323,8 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	multipart := false
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		if start, end, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && start == 0 && end == 0 && t > 0 {
+		start, end, t, crErr := parseContentRange(resp.Header.Get("Content-Range"))
+		if crErr == nil && start == 0 && end == 0 && t > 0 {
 			total = t
 			multipart = true
 		}
@@ -336,7 +343,7 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	r := &run{
 		d:           d,
 		url:         finalURL,
-		sourceURL:   sourceReq.URL,
+		sourceURL:   sourceURL,
 		destPath:    destPath,
 		partPath:    destPath + ".part",
 		total:       total,
@@ -344,13 +351,13 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		lastMod:     lastMod,
 		contentType: contentType,
 	}
-	if multipart && r.validator() == "" && !d.checksumConfigured() {
+	if r.total > 0 && r.validator() == "" && !d.checksumConfigured() {
 		multipart = false
-		// The one-byte probe's total belongs to a representation we cannot
-		// bind to the following full request. Read that request to EOF rather
-		// than truncating it to a possibly stale size.
+		// The probe's total belongs to a representation we cannot bind to
+		// the following requests. Let the actual download declare its own
+		// length rather than truncating it to a possibly stale size.
 		r.total = -1
-		d.log.Debug("multipart disabled without validator or checksum", "url", finalURL)
+		d.log.Debug("probe size discarded without validator or checksum", "url", finalURL)
 	}
 
 	unlock, err := acquireDestination(ctx, destPath)
@@ -489,7 +496,7 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		ContentType:  r.contentType,
 		Resumed:      resumed,
 	}
-	if r.d.opt.ExpectedSHA256 != "" || r.d.opt.ExpectedSHA1 != "" {
+	if r.d.checksumConfigured() {
 		sum256, sum1, err := hashFile(file, r.d.opt.ExpectedSHA256 != "", r.d.opt.ExpectedSHA1 != "")
 		if err != nil {
 			return nil, err
@@ -515,28 +522,49 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close %s: %w", r.partPath, err)
 	}
-	if r.d.opt.Overwrite {
-		if err := os.Rename(r.partPath, r.destPath); err != nil {
-			return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
-		}
-	} else {
-		// Link creates the destination only if it is still absent. Unlike
-		// Rename on Unix, it can never replace a file created after the
-		// preflight check.
-		if err := os.Link(r.partPath, r.destPath); err != nil {
-			if os.IsExist(err) {
-				return nil, fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
-			}
-			return nil, fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, err)
-		}
-		if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
-			r.d.log.Debug("removing installed staging link failed", "err", err)
-		}
+	if err := r.install(); err != nil {
+		return nil, err
 	}
 	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
 		r.d.log.Debug("removing resume sidecar failed", "err", err)
 	}
 	return res, nil
+}
+
+// install moves the verified .part file to the destination. With Overwrite it
+// is a plain rename; otherwise Link creates the destination only if it is
+// still absent — unlike Rename on Unix, it can never replace a file created
+// after the preflight check. Filesystems without hard links (exFAT, some
+// network mounts) fall back to a re-checked rename.
+func (r *run) install() error {
+	if r.d.opt.Overwrite {
+		if err := os.Rename(r.partPath, r.destPath); err != nil {
+			return fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
+		}
+		return nil
+	}
+	linkErr := os.Link(r.partPath, r.destPath)
+	if os.IsExist(linkErr) {
+		return fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
+	}
+	if linkErr != nil {
+		if _, err := os.Lstat(r.destPath); err == nil {
+			return fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, linkErr)
+		}
+		if err := os.Rename(r.partPath, r.destPath); err != nil {
+			return fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, err)
+		}
+		return nil
+	}
+	if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
+		// The leftover name is a second hard link to the installed file: a
+		// later download to the same destination would truncate it in place.
+		r.d.log.Warn("stale staging link left behind; remove it manually",
+			"path", r.partPath, "err", err)
+	}
+	return nil
 }
 
 // discardStaged removes the staged .part and sidecar after failed

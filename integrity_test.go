@@ -598,7 +598,8 @@ func TestRetryableStatusDropsPinnedNode(t *testing.T) {
 	w := newWorker(0, run, sched, file, p)
 	defer w.dropNode()
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := w.attempt(t.Context(), grant.c); !errors.Is(err, StatusError(http.StatusServiceUnavailable)) {
+		err := w.attempt(t.Context(), grant.c)
+		if !errors.Is(err, StatusError(http.StatusServiceUnavailable)) {
 			t.Fatalf("bad attempt %d error = %v", attempt, err)
 		}
 		if w.node != nil || w.client != nil {
