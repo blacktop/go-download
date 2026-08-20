@@ -301,9 +301,9 @@ func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error)
 }
 
 func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, error) {
-	sourceURL, err := url.Parse(rawURL)
+	sourceURL, err := parseURL(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse url %s: %w", rawURL, err)
+		return nil, fmt.Errorf("parse url: %w", err)
 	}
 	resp, err := d.elect(ctx, rawURL)
 	if err != nil {
@@ -337,7 +337,7 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	// status); workers issue their own ranged requests.
 	resp.Body.Close()
 
-	d.log.Debug("election", "url", finalURL, "status", resp.StatusCode,
+	d.log.Debug("election", "url", redactURL(finalURL), "status", resp.StatusCode,
 		"total", total, "multipart", multipart, "dest", destPath)
 
 	r := &run{
@@ -357,7 +357,8 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		// the following requests. Let the actual download declare its own
 		// length rather than truncating it to a possibly stale size.
 		r.total = -1
-		d.log.Debug("probe size discarded without validator or checksum", "url", finalURL)
+		d.log.Debug("probe size discarded without validator or checksum",
+			"url", redactURL(finalURL))
 	}
 
 	unlock, err := acquireDestination(ctx, destPath)
@@ -405,6 +406,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 		req.Header.Set("Range", "bytes=0-0")
 		resp, err := client.Do(req)
 		if err != nil {
+			err = redactErr(err)
 			if ctx.Err() != nil {
 				return nil, err
 			}
@@ -426,7 +428,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 			return nil, StatusError(resp.StatusCode)
 		}
 	}
-	return nil, fmt.Errorf("probe %s: %w", rawURL, lastErr)
+	return nil, fmt.Errorf("probe %s: %w", redactURL(rawURL), lastErr)
 }
 
 func isRetryableStatus(code int) bool {

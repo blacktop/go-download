@@ -47,9 +47,9 @@ func deriveName(location string, header http.Header) (string, error) {
 	if name := parseContentDisposition(header.Get("Content-Disposition")); name != "" {
 		return filepath.Base(name), nil
 	}
-	u, err := url.Parse(location)
+	u, err := parseURL(location)
 	if err != nil {
-		return "", fmt.Errorf("parse location %q: %w", location, err)
+		return "", fmt.Errorf("parse location: %w", err)
 	}
 	name := u.Path
 	if name == "" {
@@ -78,7 +78,8 @@ func resolveDest(dest, location string, header http.Header) (string, error) {
 		return "", err
 	}
 	if name == "" {
-		return "", fmt.Errorf("cannot derive filename from %q: pass an explicit file path", location)
+		return "", fmt.Errorf("cannot derive filename from %q: pass an explicit file path",
+			redactURL(location))
 	}
 	return filepath.Join(dir, name), nil
 }

@@ -318,8 +318,10 @@ func (w *worker) pump(timer *time.Timer,
 }
 
 // classify sorts an attempt failure into retryable/permanent and applies the
-// node-health consequences.
+// node-health consequences. It is the single funnel for transport errors, so
+// URL redaction lives here rather than at each client.Do call site.
 func (w *worker) classify(err error, actx context.Context) error {
+	err = redactErr(err)
 	if _, ok := errors.AsType[*permanentError](err); ok {
 		return err
 	}
