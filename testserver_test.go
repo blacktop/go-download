@@ -27,6 +27,20 @@ type stats struct {
 	ranges  []string
 	conc    int
 	maxConc int
+	// served counts body bytes actually written (throttled handler only).
+	served int64
+}
+
+func (s *stats) addServed(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.served += int64(n)
+}
+
+func (s *stats) servedBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.served
 }
 
 func (s *stats) enter(r *http.Request) {
@@ -97,27 +111,29 @@ func plainHandler(data []byte, st *stats) http.Handler {
 	})
 }
 
-// throttledRangeHandler serves ranges manually, sleeping delay per written kb
-// when slow(r) is true. Used to create one crawling connection.
+// throttledRangeHandler serves data manually — 206 for ranged requests, 200
+// for plain ones — sleeping delay per written kb when slow(r) is true. Both
+// paths pace identically so single-stream and ranged clients see the same
+// per-connection throughput cap.
 func throttledRangeHandler(data []byte, etag string, st *stats,
 	delay time.Duration, kb int, slow func(r *http.Request) bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st.enter(r)
 		defer st.exit()
-		start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data)))
-		if !ok {
+		body := data
+		if start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data))); ok {
+			if etag != "" {
+				w.Header().Set("ETag", etag)
+			}
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			body = data[start : end+1]
+		} else {
 			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.WriteHeader(http.StatusOK)
-			w.Write(data)
-			return
 		}
-		if etag != "" {
-			w.Header().Set("ETag", etag)
-		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.WriteHeader(http.StatusPartialContent)
-		body := data[start : end+1]
 		step := kb << 10
 		isSlow := slow != nil && slow(r)
 		for len(body) > 0 {
@@ -125,6 +141,7 @@ func throttledRangeHandler(data []byte, etag string, st *stats,
 			if _, err := w.Write(body[:n]); err != nil {
 				return
 			}
+			st.addServed(n)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}

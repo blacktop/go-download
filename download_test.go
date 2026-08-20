@@ -454,8 +454,14 @@ func TestSHA256Verification(t *testing.T) {
 		}
 	})
 
-	t.Run("mismatch", func(t *testing.T) {
+	t.Run("mismatch retains staged bytes", func(t *testing.T) {
 		t.Parallel()
+		// Dedicated server: this subtest counts requests, and the sibling
+		// subtests share the outer one.
+		var st stats
+		srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+		t.Cleanup(srv.Close)
+
 		dest := filepath.Join(t.TempDir(), "file.bin")
 		bad := "0000000000000000000000000000000000000000000000000000000000000000"
 		d := newDL(t, &Options{ExpectedSHA256: bad, MinPartSize: 4 << 10})
@@ -467,8 +473,31 @@ func TestSHA256Verification(t *testing.T) {
 		if _, err := os.Stat(dest); !os.IsNotExist(err) {
 			t.Error("mismatched file must not be renamed into place")
 		}
-		// The staged bytes are proven bad: resuming them could never
-		// succeed, so they must be discarded.
+		// Published checksums are sometimes wrong; the bytes stay staged so
+		// a rerun with a corrected (or no) checksum finalizes without
+		// re-downloading.
+		if ce.Path != dest+".part" {
+			t.Errorf("ChecksumError.Path = %q, want %q", ce.Path, dest+".part")
+		}
+		if _, err := os.Stat(dest + ".part"); err != nil {
+			t.Fatalf("staged .part must be retained: %v", err)
+		}
+
+		// Rerun with the correct checksum: must finalize from the staged
+		// bytes without fetching content again.
+		before := len(st.rangeStarts())
+		d2 := newDL(t, &Options{ExpectedSHA256: hexSum, MinPartSize: 4 << 10})
+		res, got := mustGet(t, d2, srv.URL+"/file.bin", dest)
+		if !bytes.Equal(got, data) {
+			t.Fatal("finalized bytes differ from source")
+		}
+		if !res.Resumed {
+			t.Error("rerun should report Resumed")
+		}
+		refetches := len(st.rangeStarts()) - before
+		if refetches > 1 { // the election probe is the only allowed request
+			t.Errorf("rerun made %d content requests; want none beyond the probe", refetches)
+		}
 		assertClean(t, dest)
 	})
 }

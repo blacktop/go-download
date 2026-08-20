@@ -100,10 +100,10 @@ func loadState(path string) *stateFile {
 	return &st
 }
 
-// usable reports whether the on-disk .part file is consistent with the
-// sidecar and with the validators observed from the server right now.
+// usable reports whether the locked .part file is consistent with the sidecar
+// and with the validators observed from the server right now.
 func (st *stateFile) usable(
-	partPath, sourceID string, size int64, etag, lastModified string,
+	part *os.File, sourceID string, size int64, etag, lastModified string,
 ) bool {
 	if st.SourceID != sourceID || st.Size != size {
 		return false
@@ -117,7 +117,7 @@ func (st *stateFile) usable(
 	} else if st.LastModified == "" || st.LastModified != lastModified {
 		return false
 	}
-	fi, err := os.Stat(partPath)
+	fi, err := part.Stat()
 	if err != nil {
 		return false
 	}

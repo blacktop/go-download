@@ -16,6 +16,74 @@
 - **Safe by construction** — bytes are staged in a preallocated `.part` file written at disjoint offsets; the destination path is only installed atomically after size (and optional checksum) verification, without replacing a late-created file unless overwrite is enabled
 - **Zero dependencies** — the library is pure standard library; bring your own progress UI via the `Reporter` interface (or use the `dl` CLI)
 
+## How it works
+
+A CDN hostname usually resolves to several edge nodes with very different
+speeds. Instead of letting the OS pick one, every parallel connection is
+pinned to its own node, each node's throughput is measured continuously, and
+statistically bad nodes are abandoned for better ones:
+
+```mermaid
+flowchart TD
+    A["Resolve host → all CDN edge nodes<br/>(A + AAAA records)"] --> B["Pick a node per connection<br/>(power-of-two-choices,<br/>unexplored nodes first)"]
+    B --> C["Pin an HTTP/1.1 connection to that node<br/>and download range chunks in parallel"]
+    C --> D["Work stealing: idle connections<br/>take the tail of the slowest chunk"]
+    C --> E["Measure throughput per read<br/>(EWMA per node)"]
+    E --> F{"Node slower than 25%<br/>of the best node,<br/>after 8 MiB warmup?"}
+    F -- "no" --> C
+    F -- "yes" --> G["Cull: abort the body,<br/>keep every byte written,<br/>strike the node"]
+    H["Stall: no progress within<br/>the adaptive read timeout"] --> G
+    G --> I{"Two strikes?"}
+    I -- "yes" --> J["Ban the node for 30s"]
+    I -- "no" --> B
+    J --> B
+```
+
+Culling costs nothing: the aborted chunk resumes mid-range on the next node
+(`Range` is recomputed from the byte cursor), so no byte is ever downloaded
+twice — the download simply migrates toward whichever edge nodes are fastest
+right now.
+
+## Performance
+
+Parallel parts pay off when the bottleneck is **per connection** — per-flow
+shaping, throttled CDN edges, long fat networks. When a single TCP flow
+already saturates the path there is nothing to parallelize, so the engine
+**ramps adaptively**: it starts with one connection, measures a slow-start
+burn-in baseline, then adds connections in doubling steps only while each
+step improves aggregate throughput (a server 429 also freezes the ramp).
+On a saturated line the download transparently behaves like a single-stream
+client instead of competing with itself.
+
+The in-repo benchmarks measure both regimes against a stdlib `http.Get` +
+`io.Copy` baseline (Apple M5 Max, Go 1.26, 2026-08-20):
+
+| Scenario | `http.Get` | `go-download` | |
+|---|---|---|---|
+| Per-connection throttle, loopback (64 MiB, each connection capped ~28 MB/s) | 28 MB/s | **92–99 MB/s** (ramps to 4 parts) | **~3.5×** |
+| Unconstrained loopback (8 MiB — no bottleneck to parallelize) | ~2.5 GB/s | ~0.9 GB/s | 0.36× |
+| Real WAN, single-flow-saturated line (Hetzner `100MB.bin`, ~130 Mbit link) | ~13–15 MB/s | ~8–10 MB/s (ramp stops at 2) | ~0.7× |
+
+The constrained row is the design target and matches an independent
+measurement by [ipsw](https://github.com/blacktop/ipsw), whose engine
+benchmarks recorded 3.76× throughput on constrained paths. The other rows
+are the honest fine print: with no per-flow limit the engine's probe,
+staging, verification, fsync, and the one probed-but-kept extra connection
+cost ~20–30% on a saturated WAN link (the ramp currently only stops adding
+connections; it does not yet retire a probed flow that failed to pay).
+Loopback numbers mostly measure fixed overhead, and real-network results
+vary run to run with the line itself.
+
+Reproduce:
+
+```bash
+just bench                 # loopback pairs: unconstrained + per-connection throttle
+
+# real-network pair against a de facto speed-test file (Hetzner/thinkbroadband/Tele2):
+DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin \
+    go test -bench BenchmarkReal -benchtime 3x .
+```
+
 ## Install
 
 ```bash

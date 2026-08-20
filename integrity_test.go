@@ -172,8 +172,11 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 		if !bytes.Equal(got, data) || res.SHA256 != sum {
 			t.Fatal("checksummed multipart download failed")
 		}
-		if got := rangedWorkers.Load(); got < 2 {
-			t.Errorf("checksum-backed multipart issued only %d worker ranges", got)
+		// One ranged worker request proves multipart mode (the single-stream
+		// fallback sends no Range header at all). The exact count depends on
+		// how far the concurrency ramp gets before this small file finishes.
+		if got := rangedWorkers.Load(); got < 1 {
+			t.Errorf("checksum-backed download fell back to single-stream (%d worker ranges)", got)
 		}
 	})
 
@@ -318,7 +321,7 @@ func TestRetryableResponseBodiesCloseOnce(t *testing.T) {
 				}, nil
 			})})
 			r := &run{
-				d: d, url: "http://example.test/file.bin",
+				d: d, rep: NopReporter{}, url: "http://example.test/file.bin",
 				sourceURL: &url.URL{Scheme: "http", Host: "example.test"},
 				total:     1, etag: `"v1"`,
 			}
@@ -328,7 +331,7 @@ func TestRetryableResponseBodiesCloseOnce(t *testing.T) {
 				sched := newScheduler(1)
 				sched.addPending(0, 1, 0)
 				w.sched = sched
-				err = w.attempt(t.Context(), sched.next().c)
+				err = w.attempt(t.Context(), sched.next())
 			} else {
 				err = w.singleAttempt(t.Context())
 			}
@@ -438,7 +441,7 @@ func TestFinalNoOverwriteIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := newDL(t, nil)
-	r := &run{d: d, destPath: dest, partPath: part, total: int64(len(newData))}
+	r := &run{d: d, rep: NopReporter{}, destPath: dest, partPath: part, total: int64(len(newData))}
 	if _, err := r.verifyAndFinalize(file, false); !errors.Is(err, ErrDestExists) {
 		t.Fatalf("finalization error = %v, want ErrDestExists", err)
 	}
@@ -718,13 +721,13 @@ func TestRetryableStatusDropsPinnedNode(t *testing.T) {
 	sched.addPending(0, int64(len(data)), 0)
 	grant := sched.next()
 	run := &run{
-		d: d, url: "http://cdn.test/file.bin", sourceURL: &url.URL{Scheme: "http", Host: "cdn.test"},
+		d: d, rep: NopReporter{}, url: "http://cdn.test/file.bin", sourceURL: &url.URL{Scheme: "http", Host: "cdn.test"},
 		total: int64(len(data)), etag: `"v1"`, partPath: dest,
 	}
 	w := newWorker(0, run, sched, file, p)
 	defer w.dropNode()
 	for attempt := 1; attempt <= 2; attempt++ {
-		err := w.attempt(t.Context(), grant.c)
+		err := w.attempt(t.Context(), grant)
 		if !errors.Is(err, StatusError(http.StatusServiceUnavailable)) {
 			t.Fatalf("bad attempt %d error = %v", attempt, err)
 		}
@@ -732,7 +735,7 @@ func TestRetryableStatusDropsPinnedNode(t *testing.T) {
 			t.Fatalf("bad attempt %d retained pinned node/client", attempt)
 		}
 	}
-	if err := w.attempt(t.Context(), grant.c); err != nil {
+	if err := w.attempt(t.Context(), grant); err != nil {
 		t.Fatalf("healthy-node attempt failed: %v", err)
 	}
 	if got := badRequests.Load(); got != 2 {
@@ -747,7 +750,7 @@ func TestAdaptiveTimeoutNeverDropsConfiguredBase(t *testing.T) {
 	t.Parallel()
 	const base = 2 * time.Minute
 	d := newDL(t, &Options{Timeout: base})
-	w := newWorker(0, &run{d: d}, nil, nil, nil)
+	w := newWorker(0, &run{d: d, rep: NopReporter{}}, nil, nil, nil)
 	w.bumpTimeout()
 	if w.timeout != base {
 		t.Errorf("bumpTimeout reduced configured base: got %v, want %v", w.timeout, base)
@@ -760,7 +763,7 @@ func TestAdaptiveTimeoutNeverDropsConfiguredBase(t *testing.T) {
 
 	const huge = time.Duration(1<<63 - 1)
 	hugeDownloader := newDL(t, &Options{Timeout: huge})
-	hugeWorker := newWorker(0, &run{d: hugeDownloader}, nil, nil, nil)
+	hugeWorker := newWorker(0, &run{d: hugeDownloader, rep: NopReporter{}}, nil, nil, nil)
 	hugeWorker.bumpTimeout()
 	if hugeWorker.timeout != huge {
 		t.Errorf("bumpTimeout overflowed configured base: got %v, want %v", hugeWorker.timeout, huge)

@@ -15,8 +15,26 @@ var (
 	// and Options.Overwrite is false.
 	ErrDestExists = errors.New("destination exists")
 
+	// ErrLocked is returned when another process holds the staging lock or
+	// changed the .part pathname while this process was acquiring it.
+	ErrLocked = errors.New("staging file locked by another process")
+
+	// errFlockUnsupported marks platforms/filesystems where the advisory
+	// staging lock cannot be enforced; downloads proceed unprotected.
+	errFlockUnsupported = errors.New("staging lock unsupported")
+
 	errURLDetailsRedacted = errors.New("request failed (url details redacted)")
 )
+
+// ContentTypeError is returned when the probe response's media type matches
+// Options.RejectContentTypes. Nothing was written to disk.
+type ContentTypeError struct {
+	ContentType string // the offending Content-Type header value
+}
+
+func (e *ContentTypeError) Error() string {
+	return fmt.Sprintf("rejected content type %q", e.ContentType)
+}
 
 // StatusError is an unexpected, non-retryable HTTP status code.
 type StatusError int
@@ -25,12 +43,19 @@ func (e StatusError) Error() string {
 	return fmt.Sprintf("unexpected HTTP status: %d", int(e))
 }
 
-// ChecksumError is returned when the downloaded file does not match
-// Options.ExpectedSHA256 or Options.ExpectedSHA1.
+// ChecksumError is returned when the downloaded file does not match the
+// expected SHA-256/SHA-1. The fully-downloaded bytes are retained at Path
+// (published checksums are sometimes simply wrong). For resumable downloads
+// (multipart with a server validator) a rerun with a corrected checksum — or
+// none — finalizes from the staged file without refetching content; a rerun
+// with the same wrong checksum avoids the refetch but still rehashes the
+// staged file. Single-stream and validator-less downloads cannot reuse the
+// staged bytes and download again.
 type ChecksumError struct {
 	Algo     string // "sha256" or "sha1"
 	Expected string
 	Actual   string
+	Path     string // retained staging file
 }
 
 func (e *ChecksumError) Error() string {
@@ -38,7 +63,11 @@ func (e *ChecksumError) Error() string {
 	if algo == "" {
 		algo = "sha256"
 	}
-	return fmt.Sprintf("%s mismatch: expected %s, got %s", algo, e.Expected, e.Actual)
+	msg := fmt.Sprintf("%s mismatch: expected %s, got %s", algo, e.Expected, e.Actual)
+	if e.Path != "" {
+		msg += fmt.Sprintf(" (downloaded bytes retained at %s)", e.Path)
+	}
+	return msg
 }
 
 // SizeError is returned when the final file size does not match the size
@@ -51,6 +80,12 @@ type SizeError struct {
 func (e *SizeError) Error() string {
 	return fmt.Sprintf("size mismatch: expected %d bytes, got %d", e.Expected, e.Actual)
 }
+
+// RedactURL strips credentials from a URL so callers can safely embed it in
+// their own errors and logs: userinfo, query (signed URLs carry access keys
+// there), and fragment are removed; unparseable input is replaced wholesale.
+// This is the same redaction the package applies to its own errors.
+func RedactURL(raw string) string { return redactURL(raw) }
 
 // redactURL strips credentials from a URL before it lands in an error or a
 // log line: userinfo, query (signed URLs carry access keys there —

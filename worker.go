@@ -23,13 +23,19 @@ const (
 	decayWindow = 16
 )
 
+// maxFreeRotations bounds budget-free node rotations per chunk (culls and
+// dial failures) so a fully unreachable host still exhausts the retry
+// budget instead of rotating forever.
+const maxFreeRotations = 8
+
 var (
-	errStall          = errors.New("read stalled")
-	errCulled         = errors.New("node statistically slow, reassigning")
-	errRangeCapped    = errors.New("server capped range response")
-	errShortBody      = errors.New("server closed body before range completed")
-	errRangeIgnored   = errors.New("server ignored Range request")
-	errContentChanged = errors.New("remote content changed during download")
+	errStall           = errors.New("read stalled")
+	errCulled          = errors.New("node statistically slow, reassigning")
+	errNodeUnreachable = errors.New("node unreachable, reassigning")
+	errRangeCapped     = errors.New("server capped range response")
+	errShortBody       = errors.New("server closed body before range completed")
+	errRangeIgnored    = errors.New("server ignored Range request")
+	errContentChanged  = errors.New("remote content changed during download")
 )
 
 // permanentError marks a failure that retrying cannot fix.
@@ -54,9 +60,14 @@ type worker struct {
 	dtt     int // full buffers until the next timeout decay step
 	bo      backoff
 	buf     []byte
+	bufp    *[]byte // pool token for releaseBuf
+	// announced tracks whether the single-stream path has emitted its
+	// ChunkStart (retries emit ChunkRestart instead).
+	announced bool
 }
 
 func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *worker {
+	bp := r.d.bufs.Get().(*[]byte)
 	return &worker{
 		id:      id,
 		r:       r,
@@ -64,26 +75,35 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *work
 		file:    file,
 		picker:  p,
 		timeout: r.d.opt.Timeout,
-		buf:     make([]byte, bufSize),
+		buf:     *bp,
+		bufp:    bp,
 	}
+}
+
+// releaseBuf returns the worker's read buffer to the Downloader pool.
+// The worker must not read after this.
+func (w *worker) releaseBuf() {
+	if w.bufp == nil {
+		return
+	}
+	w.buf = nil
+	w.r.d.bufs.Put(w.bufp)
+	w.bufp = nil
 }
 
 // run pulls chunks until the scheduler has nothing left for this worker.
 func (w *worker) run(ctx context.Context) error {
+	defer w.releaseBuf()
 	defer w.dropNode()
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		g := w.sched.next()
-		if g == nil {
+		c := w.sched.next()
+		if c == nil {
 			return nil
 		}
-		if g.victim != nil {
-			w.r.d.rep.ChunkStart(g.victim.id, g.victim.off, g.victim.length, g.victim.written)
-		}
-		w.r.d.rep.ChunkStart(g.c.id, g.off, g.length, g.written)
-		if err := w.downloadChunk(ctx, g.c); err != nil {
+		if err := w.downloadChunk(ctx, c); err != nil {
 			if ctx.Err() != nil {
 				return nil // cancellation noise; the cause carries the story
 			}
@@ -97,11 +117,13 @@ func (w *worker) run(ctx context.Context) error {
 // re-downloads written bytes.
 func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 	attempt := 0
+	freeRotations := 0
+	chargedAt := w.r.progress.Load()
 	for {
 		err := w.attempt(ctx, c)
 		if err == nil {
 			w.sched.complete(c)
-			w.r.d.rep.ChunkDone(c.id)
+			w.r.rep.ChunkDone(c.id)
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -116,23 +138,48 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			w.r.d.log.Debug("continuing capped range", "worker", w.id, "chunk", c.id)
 			continue
 		}
-		if errors.Is(err, errCulled) {
-			// Abandoning a statistically slow node for a better one is
-			// progress, not failure: it costs no retry budget and needs
-			// no backoff. Culls are bounded — each one strikes the node
-			// (two strikes ban it) and the warmup gate must refill
-			// before it can be culled again.
-			w.r.d.log.Debug("reassigning chunk after cull", "worker", w.id, "chunk", c.id)
+		if (errors.Is(err, errCulled) || errors.Is(err, errNodeUnreachable)) &&
+			freeRotations < maxFreeRotations {
+			// Abandoning a statistically slow or unreachable node for a
+			// better one is progress, not failure: no retry budget, no
+			// backoff. Rotations are bounded here and by strikes/bans, so
+			// a fully dead host still falls through to charged retries.
+			freeRotations++
+			w.r.d.log.Debug("reassigning chunk", "worker", w.id, "chunk", c.id, "err", err)
 			continue
 		}
+		throttled := errors.Is(err, StatusError(http.StatusTooManyRequests))
+		if throttled {
+			// While siblings ARE progressing, waiting out the throttle is
+			// queued work rather than failure, so it costs no retry budget —
+			// a server admitting one range at a time must serialize us, not
+			// kill the download. Budget is charged only when nobody has
+			// advanced since this chunk's last charged attempt.
+			if cur := w.r.progress.Load(); cur > chargedAt {
+				chargedAt = cur
+				w.r.d.log.Debug("waiting out server throttle", "worker", w.id, "chunk", c.id)
+				if serr := sleepCtx(ctx, time.Second); serr != nil {
+					return err
+				}
+				continue
+			}
+		}
+		chargedAt = w.r.progress.Load()
 		attempt++
 		if attempt >= w.r.d.opt.MaxRetries {
 			return fmt.Errorf("chunk %d: %w: %w", c.id, ErrMaxRetry, err)
 		}
-		w.r.d.rep.ChunkRetry(c.id, attempt, err)
+		w.r.rep.ChunkRetry(c.id, attempt, err)
 		w.r.d.log.Debug("retrying chunk", "worker", w.id, "chunk", c.id,
 			"attempt", attempt, "err", err)
-		if serr := sleepCtx(ctx, w.bo.next()); serr != nil {
+		// 429s always sleep the flat politeness pause and never touch
+		// bo.next(), so throttle waits — free or charged — cannot escalate
+		// the exponential backoff that later 5xx/reset retries will use.
+		delay := time.Second
+		if !throttled {
+			delay = w.bo.next()
+		}
+		if serr := sleepCtx(ctx, delay); serr != nil {
 			return err
 		}
 	}
@@ -154,7 +201,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	defer timer.Stop()
 
 	trace := &httptrace.ClientTrace{GotConn: func(ci httptrace.GotConnInfo) {
-		w.r.d.rep.Connected(c.id, ci.Conn.RemoteAddr().String())
+		w.r.rep.Connected(c.id, ci.Conn.RemoteAddr().String())
 	}}
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(actx, trace),
 		http.MethodGet, w.r.url, nil)
@@ -188,10 +235,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		responseEnd := e + 1 // convert inclusive HTTP end to scheduler-exclusive end
 		capped := responseEnd < end
 		defer resp.Body.Close()
-		var body io.Reader = io.LimitReader(resp.Body, responseEnd-s)
-		if w.picker != nil {
-			body = &observedReader{r: body, w: w}
-		}
+		body := &observedReader{r: io.LimitReader(resp.Body, responseEnd-s), w: w}
 		err := w.readLoop(body, timer, w.chunkSink(c))
 		if err == nil {
 			return nil
@@ -212,6 +256,17 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		w.strikeNode()
 		w.dropNode()
 		return errRangeIgnored
+	case resp.StatusCode == http.StatusTooManyRequests:
+		// "Slow down" is server-wide, not this node's fault: back off via
+		// the retry path without striking (a strike-ban here would churn
+		// through every node and make the overload worse), and freeze the
+		// concurrency ramp — the server just told us the flow count is
+		// already too high.
+		_ = resp.Body.Close()
+		if w.r.ramp != nil {
+			w.r.ramp.done.Store(true)
+		}
+		return StatusError(resp.StatusCode)
 	case isRetryableStatus(resp.StatusCode):
 		_ = resp.Body.Close()
 		w.strikeNode()
@@ -228,7 +283,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 func (w *worker) chunkSink(c *chunk) func(buf []byte, d time.Duration) (bool, error) {
 	return func(buf []byte, d time.Duration) (bool, error) {
 		if len(buf) == 0 {
-			w.r.d.rep.ChunkProgress(c.id, 0, d)
+			w.r.rep.ChunkProgress(c.id, 0, d)
 			return false, nil
 		}
 		off, n, stop := w.sched.claim(c, len(buf))
@@ -237,7 +292,7 @@ func (w *worker) chunkSink(c *chunk) func(buf []byte, d time.Duration) (bool, er
 				return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}
 			}
 			c.written.Add(int64(n))
-			w.r.d.rep.ChunkProgress(c.id, n, d)
+			w.r.rep.ChunkProgress(c.id, n, d)
 		}
 		if stop {
 			return true, nil
@@ -249,10 +304,11 @@ func (w *worker) chunkSink(c *chunk) func(buf []byte, d time.Duration) (bool, er
 	}
 }
 
-// observedReader feeds per-read throughput into the node picker and aborts
-// the body with errCulled once the node proves statistically slow. Observing
-// raw reads (typically one TLS record) keeps the EWMA responsive even when
-// the node is too slow to ever fill a whole buffer.
+// observedReader feeds per-read throughput into the node picker and the
+// concurrency ramp, and aborts the body with errCulled once the node proves
+// statistically slow. Observing raw reads (typically one TLS record) keeps
+// both responsive even when the connection is too slow to ever fill a whole
+// buffer.
 type observedReader struct {
 	r io.Reader
 	w *worker
@@ -262,9 +318,15 @@ func (o *observedReader) Read(p []byte) (int, error) {
 	start := time.Now()
 	n, err := o.r.Read(p)
 	if n > 0 {
-		o.w.picker.observe(o.w.node, int64(n), time.Since(start))
+		if o.w.picker != nil {
+			o.w.picker.observe(o.w.node, int64(n), time.Since(start))
+		}
+		total := o.w.r.progress.Add(int64(n))
+		if o.w.r.ramp != nil {
+			o.w.r.ramp.note(total)
+		}
 	}
-	if err == nil && o.w.picker.shouldCull(o.w.node) {
+	if err == nil && o.w.picker != nil && o.w.picker.shouldCull(o.w.node) {
 		return n, errCulled
 	}
 	return n, err
@@ -298,6 +360,11 @@ func (w *worker) readUnknownLoop(body io.Reader, timer *time.Timer,
 func (w *worker) pump(timer *time.Timer,
 	sink func([]byte, time.Duration) (bool, error),
 	read func([]byte) (int, error)) error {
+	if len(w.buf) == 0 {
+		// A zero-length buffer would spin forever making no progress
+		// (released back to the pool, or never acquired).
+		return &permanentError{errors.New("internal: worker read buffer unavailable")}
+	}
 	for {
 		timer.Reset(w.timeout)
 		start := time.Now()
@@ -341,9 +408,24 @@ func (w *worker) classify(err error, actx context.Context) error {
 	}
 	// Connection-level failure (unreachable address, reset, TLS error):
 	// strike the pinned node and rotate so the retry can try another one.
+	// A pinned dial failure (e.g. an unroutable AAAA node on a v4-only
+	// network) fails in microseconds and should rotate for free rather
+	// than burning retry budget and backoff sleeps.
+	dialFailed := isDialError(err)
 	w.strikeNode()
 	w.dropNode()
+	if dialFailed && w.picker != nil {
+		return fmt.Errorf("%w: %w", errNodeUnreachable, err)
+	}
 	return err
+}
+
+// isDialError reports whether err failed before a connection existed.
+func isDialError(err error) bool {
+	if op, ok := errors.AsType[*net.OpError](err); ok {
+		return op.Op == "dial"
+	}
+	return false
 }
 
 func (w *worker) bumpTimeout() {
@@ -432,6 +514,7 @@ func (w *worker) strikeNode() {
 // singleStream downloads the whole body sequentially (no Range support or
 // unknown size). A retry restarts from byte zero.
 func (w *worker) singleStream(ctx context.Context) error {
+	defer w.releaseBuf()
 	for attempt := 0; ; attempt++ {
 		err := w.singleAttempt(ctx)
 		if err == nil {
@@ -446,7 +529,7 @@ func (w *worker) singleStream(ctx context.Context) error {
 		if attempt+1 >= w.r.d.opt.MaxRetries {
 			return fmt.Errorf("%w: %w", ErrMaxRetry, err)
 		}
-		w.r.d.rep.ChunkRetry(0, attempt+1, err)
+		w.r.rep.ChunkRetry(0, attempt+1, err)
 		if serr := sleepCtx(ctx, w.bo.next()); serr != nil {
 			return err
 		}
@@ -495,11 +578,17 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	if expected < 0 && resp.ContentLength >= 0 {
 		expected = resp.ContentLength
 	}
-	w.r.d.rep.ChunkStart(0, 0, expected, 0)
+	if !w.announced {
+		w.announced = true
+		w.r.rep.ChunkStart(0, 0, expected, 0)
+	} else if rs, ok := w.r.rep.(ChunkRestarter); ok {
+		// A retry discarded the previous attempt's bytes (Truncate above).
+		rs.ChunkRestart(0)
+	}
 	var written int64
 	sink := func(buf []byte, d time.Duration) (bool, error) {
 		if len(buf) == 0 {
-			w.r.d.rep.ChunkProgress(0, 0, d)
+			w.r.rep.ChunkProgress(0, 0, d)
 			// A zero-length body (empty file) is complete without ever
 			// delivering bytes.
 			return expected >= 0 && written >= expected, nil
@@ -508,7 +597,7 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 			return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}
 		}
 		written += int64(len(buf))
-		w.r.d.rep.ChunkProgress(0, len(buf), d)
+		w.r.rep.ChunkProgress(0, len(buf), d)
 		if len(buf) == len(w.buf) {
 			w.decayTimeout()
 		}
@@ -528,12 +617,12 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		if w.r.total < 0 && expected >= 0 {
 			w.r.total = expected
 		}
-		w.r.d.rep.ChunkDone(0)
+		w.r.rep.ChunkDone(0)
 		return nil
 	case errors.Is(err, io.EOF):
 		if expected < 0 {
 			w.r.total = written
-			w.r.d.rep.ChunkDone(0)
+			w.r.rep.ChunkDone(0)
 			return nil // unknown length: EOF is success
 		}
 		return w.classify(errShortBody, actx)

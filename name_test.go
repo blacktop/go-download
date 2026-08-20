@@ -2,6 +2,7 @@ package download
 
 import (
 	"net/http"
+	"path/filepath"
 	"testing"
 )
 
@@ -109,7 +110,7 @@ func TestResolveDest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := dir + "/abc"; got != want {
+		if want := filepath.Join(dir, "abc"); got != want {
 			t.Errorf("got %q want %q", got, want)
 		}
 	})

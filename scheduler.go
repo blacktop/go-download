@@ -19,24 +19,6 @@ type chunk struct {
 	written atomic.Int64
 }
 
-// grant is the race-free view of a chunk handed to a worker, including the
-// shrunken victim when the chunk was carved out of an in-flight one.
-type grant struct {
-	c       *chunk
-	off     int64
-	length  int64
-	written int64
-	victim  *regrant
-}
-
-// regrant describes a chunk whose tail was just stolen, for re-reporting.
-type regrant struct {
-	id      int
-	off     int64
-	length  int64
-	written int64
-}
-
 // scheduler hands byte ranges to workers. Fresh downloads start with a single
 // chunk covering the whole file; idle workers obtain work by splitting the
 // largest in-flight remainder. Resumed downloads seed pending with the
@@ -47,6 +29,11 @@ type scheduler struct {
 	active  map[int]*chunk
 	minSize int64
 	nextID  int
+	// onGrant and onResize, when set, are called under mu as chunks are
+	// handed out and shrunk, so Reporter events arrive in a total order:
+	// a chunk's ChunkStart always precedes any ChunkResize touching it.
+	onGrant  func(id int, off, length, written int64)
+	onResize func(id int, length int64)
 }
 
 func newScheduler(minSize int64) *scheduler {
@@ -64,18 +51,19 @@ func (s *scheduler) addPending(off, end, done int64) {
 	s.pending = append(s.pending, c)
 }
 
-// next returns the next work grant for an idle worker: a pending chunk if
-// any, otherwise the second half of the largest in-flight remainder (when
-// that remainder is at least 2*minSize). Nil means no work is left for this
-// worker.
-func (s *scheduler) next() *grant {
+// next returns the next chunk for an idle worker: a pending chunk if any,
+// otherwise the second half of the largest in-flight remainder (when that
+// remainder is at least 2*minSize). Nil means no work is left for this
+// worker. Grant and resize notifications fire under the lock, in order.
+func (s *scheduler) next() *chunk {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.pending) > 0 {
 		c := s.pending[0]
 		s.pending = s.pending[1:]
 		s.active[c.id] = c
-		return &grant{c: c, off: c.off, length: c.end - c.off, written: c.done}
+		s.grantLocked(c)
+		return c
 	}
 	var victim *chunk
 	for _, a := range s.active {
@@ -95,14 +83,16 @@ func (s *scheduler) next() *grant {
 	s.nextID++
 	victim.end = mid
 	s.active[c.id] = c
-	return &grant{
-		c: c, off: c.off, length: c.end - c.off,
-		victim: &regrant{
-			id:      victim.id,
-			off:     victim.off,
-			length:  victim.end - victim.off,
-			written: victim.done,
-		},
+	if s.onResize != nil {
+		s.onResize(victim.id, victim.end-victim.off)
+	}
+	s.grantLocked(c)
+	return c
+}
+
+func (s *scheduler) grantLocked(c *chunk) {
+	if s.onGrant != nil {
+		s.onGrant(c.id, c.off, c.end-c.off, c.written.Load())
 	}
 }
 
@@ -135,6 +125,20 @@ func (s *scheduler) complete(c *chunk) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.active, c.id)
+}
+
+// remainingBytes returns how much is still to download across all chunks.
+func (s *scheduler) remainingBytes() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	for _, c := range s.pending {
+		n += c.end - (c.off + c.done)
+	}
+	for _, c := range s.active {
+		n += c.end - (c.off + c.done)
+	}
+	return n
 }
 
 // idle reports whether no work remains anywhere.

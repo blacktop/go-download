@@ -199,12 +199,10 @@ func TestNodeCulling(t *testing.T) {
 	}
 
 	dest := filepath.Join(t.TempDir(), "file.bin")
-	start := time.Now()
 	res, err := d.Get(t.Context(), "http://cdn.test/file.bin", dest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(start)
 
 	got, err := os.ReadFile(res.Path)
 	if err != nil {
@@ -213,9 +211,11 @@ func TestNodeCulling(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("downloaded bytes differ from source")
 	}
-	// Unculled, the slow node would serve ~512 KiB at ~34 KiB/s (≈15s).
-	if elapsed > 10*time.Second {
-		t.Errorf("download took %v; culling should have abandoned the slow node", elapsed)
+	// The direct signal for culling (wall-clock is too flaky on loaded CI
+	// runners): unculled, the slow node serves its whole ~512 KiB half;
+	// culled, it is abandoned shortly after the 16 KiB warmup.
+	if served := stSlow.servedBytes(); served > int64(len(data))/4 {
+		t.Errorf("slow node served %d bytes; culling should have abandoned it early", served)
 	}
 	if len(stSlow.rangeHeaders()) == 0 {
 		t.Error("slow node was never tried: exploration is broken")

@@ -65,21 +65,6 @@ func (r *mpbReporter) Start(info download.Info) {
 func (r *mpbReporter) ChunkStart(id int, off, length, written int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if bar, ok := r.bars[id]; ok {
-		// Re-announced chunk: either its tail was stolen (shrink the bar)
-		// or a single-stream retry restarted it from written=0 (reset the
-		// bar and roll its bytes back out of the aggregate).
-		if written < r.counted[id] {
-			r.sum += written - r.counted[id]
-			r.counted[id] = written
-			bar.SetCurrent(written)
-			if r.total != nil {
-				r.total.SetCurrent(r.sum)
-			}
-		}
-		bar.SetTotal(length, false)
-		return
-	}
 	bar := r.p.AddBar(max(length, 0),
 		mpb.BarPriority(id),
 		mpb.BarRemoveOnComplete(),
@@ -98,6 +83,32 @@ func (r *mpbReporter) ChunkStart(id int, off, length, written int64) {
 	// Resumed bytes are already in sum via Info.Resumed; just record them.
 	r.counted[id] = written
 	r.bars[id] = bar
+}
+
+// ChunkResize shrinks a bar whose tail was stolen by a faster worker.
+func (r *mpbReporter) ChunkResize(id int, length int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if bar, ok := r.bars[id]; ok {
+		bar.SetTotal(length, false)
+	}
+}
+
+// ChunkRestart resets a bar whose single-stream retry started over, rolling
+// its bytes back out of the aggregate.
+func (r *mpbReporter) ChunkRestart(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	bar, ok := r.bars[id]
+	if !ok {
+		return
+	}
+	r.sum -= r.counted[id]
+	r.counted[id] = 0
+	bar.SetCurrent(0)
+	if r.total != nil {
+		r.total.SetCurrent(r.sum)
+	}
 }
 
 func (r *mpbReporter) Connected(id int, addr string) {

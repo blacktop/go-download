@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,7 +62,10 @@ type Options struct {
 	Jar http.CookieJar
 	// Transport overrides the internal HTTP/1.1 transport. Setting it
 	// disables CDN node pinning (this is the HTTP/3 escape hatch: plug in
-	// a quic-go RoundTripper here).
+	// a quic-go RoundTripper here). WARNING: an HTTP/2 transport defeats
+	// parallel parts — h2 multiplexes every range request onto a single
+	// TCP connection. For *http.Transport, force HTTP/1.1 (Protocols) and
+	// consider a large ReadBufferSize, as the internal transport does.
 	Transport http.RoundTripper
 	// TLSConfig is used by the internal transport. Ignored when Transport
 	// is set.
@@ -77,6 +82,12 @@ type Options struct {
 	// disables verification. May be combined with ExpectedSHA256; the
 	// file is read once.
 	ExpectedSHA1 string
+	// RejectContentTypes aborts a download at the probe — before any byte
+	// is staged — when the response's media type matches an entry (e.g.
+	// "text/html" for CDNs that answer dead links with an HTML error page
+	// and status 200). Entries are compared case-insensitively against the
+	// Content-Type's media type, parameters ignored.
+	RejectContentTypes []string
 	// Overwrite allows replacing an existing destination file.
 	Overwrite bool
 	// Reporter receives progress events. Nil means silent.
@@ -120,6 +131,10 @@ type Downloader struct {
 	// when no Reporter is configured; holds one token otherwise.
 	reportSem chan struct{}
 
+	// bufs recycles the large read/hash buffers across workers and Get
+	// calls; they dominate per-download allocations otherwise.
+	bufs sync.Pool
+
 	// dial is the TCP dialer shared by the base and pinned transports;
 	// tests override it to fake CDN nodes.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -157,17 +172,12 @@ func New(opt *Options) (*Downloader, error) {
 	if o.MaxRetries < 0 {
 		return nil, fmt.Errorf("invalid MaxRetries %d: must be >= 1", o.MaxRetries)
 	}
-	if o.ExpectedSHA256 != "" {
-		if _, err := hex.DecodeString(o.ExpectedSHA256); err != nil || len(o.ExpectedSHA256) != 64 {
-			return nil, fmt.Errorf("invalid ExpectedSHA256 %q: want 64 hex chars", o.ExpectedSHA256)
-		}
-		o.ExpectedSHA256 = strings.ToLower(o.ExpectedSHA256)
+	var err error
+	if o.ExpectedSHA256, err = normalizeChecksum(o.ExpectedSHA256, sha256HexLen, "ExpectedSHA256"); err != nil {
+		return nil, err
 	}
-	if o.ExpectedSHA1 != "" {
-		if _, err := hex.DecodeString(o.ExpectedSHA1); err != nil || len(o.ExpectedSHA1) != 40 {
-			return nil, fmt.Errorf("invalid ExpectedSHA1 %q: want 40 hex chars", o.ExpectedSHA1)
-		}
-		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
+	if o.ExpectedSHA1, err = normalizeChecksum(o.ExpectedSHA1, sha1HexLen, "ExpectedSHA1"); err != nil {
+		return nil, err
 	}
 	var reportSem chan struct{}
 	if o.Reporter != nil {
@@ -179,6 +189,10 @@ func New(opt *Options) (*Downloader, error) {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
 	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger, reportSem: reportSem}
+	d.bufs.New = func() any {
+		b := make([]byte, bufSize)
+		return &b
+	}
 	d.dial = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -278,29 +292,86 @@ func shouldCopySensitiveHeaders(initial, dest *url.URL) bool {
 	return len(sub) > len(parent) && sub[len(sub)-len(parent)-1] == '.'
 }
 
+// Request is one download. Zero-value fields fall back to the Downloader's
+// Options, so a single long-lived Downloader can serve a whole batch with
+// per-file reporters and checksums.
+type Request struct {
+	// URL is the resource to download.
+	URL string
+	// Dest may be an explicit file path, an existing directory, or ""
+	// (filename derived from the response).
+	Dest string
+	// Reporter receives this download's progress events, overriding
+	// Options.Reporter. Downloads with per-request reporters may run
+	// concurrently; downloads sharing the Options reporter are serialized.
+	Reporter Reporter
+	// ExpectedSHA256 / ExpectedSHA1 override the Options checksums for
+	// this download (hex; empty falls back).
+	ExpectedSHA256 string
+	ExpectedSHA1   string
+}
+
 // Get downloads url to dest. dest may be an explicit file path, an existing
 // directory, or "" (filename derived from the response). The destination
 // never holds a partial file: bytes are staged in dest+".part" and installed
 // only after verification. Interrupted downloads resume automatically.
 func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error) {
-	if d.reportSem != nil {
-		select {
-		case d.reportSem <- struct{}{}:
-			defer func() { <-d.reportSem }()
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	return d.Do(ctx, &Request{URL: url, Dest: dest})
+}
+
+// Do downloads one Request. See Get for the download semantics.
+func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
+	if req == nil {
+		return nil, errors.New("nil Request")
+	}
+	sha256sum, err := normalizeChecksum(req.ExpectedSHA256, sha256HexLen, "ExpectedSHA256")
+	if err != nil {
+		return nil, err
+	}
+	sha1sum, err := normalizeChecksum(req.ExpectedSHA1, sha1HexLen, "ExpectedSHA1")
+	if err != nil {
+		return nil, err
+	}
+	if sha256sum == "" {
+		sha256sum = d.opt.ExpectedSHA256
+	}
+	if sha1sum == "" {
+		sha1sum = d.opt.ExpectedSHA1
+	}
+	rep := req.Reporter
+	if rep == nil {
+		rep = d.rep
+		// Only downloads sharing the Options reporter must serialize.
+		if d.reportSem != nil {
+			select {
+			case d.reportSem <- struct{}{}:
+				defer func() { <-d.reportSem }()
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 	start := time.Now()
-	res, err := d.get(ctx, url, dest)
+	res, err := d.get(ctx, &resolvedRequest{
+		url: req.URL, dest: req.Dest, rep: rep,
+		sha256: sha256sum, sha1: sha1sum,
+	})
 	if res != nil {
 		res.Elapsed = time.Since(start)
 	}
-	d.rep.Done(err)
+	rep.Done(err)
 	return res, err
 }
 
-func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, error) {
+// resolvedRequest is a Request with all fallbacks applied.
+type resolvedRequest struct {
+	url, dest    string
+	rep          Reporter
+	sha256, sha1 string
+}
+
+func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, error) {
+	rawURL, dest := rq.url, rq.dest
 	sourceURL, err := parseURL(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
@@ -313,6 +384,11 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
 	contentType := resp.Header.Get("Content-Type")
+
+	if rejected(contentType, d.opt.RejectContentTypes) {
+		resp.Body.Close()
+		return nil, &ContentTypeError{ContentType: contentType}
+	}
 
 	destPath, err := resolveDest(dest, finalURL, resp.Header)
 	if err != nil {
@@ -342,6 +418,9 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 
 	r := &run{
 		d:           d,
+		rep:         rq.rep,
+		sha256:      rq.sha256,
+		sha1:        rq.sha1,
 		url:         finalURL,
 		sourceURL:   sourceURL,
 		destPath:    destPath,
@@ -351,7 +430,7 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		lastMod:     lastMod,
 		contentType: contentType,
 	}
-	if r.total > 0 && r.validator() == "" && !d.checksumConfigured() {
+	if r.total > 0 && r.validator() == "" && !r.checksumConfigured() {
 		multipart = false
 		// The probe's total belongs to a representation we cannot bind to
 		// the following requests. Let the actual download declare its own
@@ -380,8 +459,91 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	return r.single(ctx)
 }
 
-func (d *Downloader) checksumConfigured() bool {
-	return d.opt.ExpectedSHA256 != "" || d.opt.ExpectedSHA1 != ""
+const (
+	sha256HexLen = 64
+	sha1HexLen   = 40
+)
+
+// normalizeChecksum validates a hex digest of the given length and lowers it.
+func normalizeChecksum(sum string, hexLen int, field string) (string, error) {
+	if sum == "" {
+		return "", nil
+	}
+	if _, err := hex.DecodeString(sum); err != nil || len(sum) != hexLen {
+		return "", fmt.Errorf("invalid %s %q: want %d hex chars", field, sum, hexLen)
+	}
+	return strings.ToLower(sum), nil
+}
+
+// rejected reports whether contentType's media type matches any entry.
+func rejected(contentType string, reject []string) bool {
+	if len(reject) == 0 || contentType == "" {
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		// Malformed parameters must not smuggle the media type past the
+		// check: compare everything before the first ';'.
+		mediaType, _, _ = strings.Cut(contentType, ";")
+		mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	}
+	for _, r := range reject {
+		if strings.EqualFold(mediaType, strings.TrimSpace(r)) {
+			return true
+		}
+	}
+	return false
+}
+
+// CloseIdleConnections closes idle HTTP connections held by the internal
+// transport (and a user-supplied Options.Transport that implements the
+// method). Useful for long-lived Downloaders between batches.
+func (d *Downloader) CloseIdleConnections() {
+	if d.base != nil {
+		d.base.CloseIdleConnections()
+	}
+	if tr, ok := d.opt.Transport.(interface{ CloseIdleConnections() }); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
+// Discard removes dest's staged .part file and resume sidecar so the next
+// Get starts fresh. It takes the same in-process destination lock Get uses
+// and refuses (ErrLocked) when another process holds the staging lock.
+// Missing staging files are not an error.
+func Discard(ctx context.Context, dest string) error {
+	unlock, err := acquireDestination(ctx, dest)
+	if err != nil {
+		return fmt.Errorf("lock destination %s: %w", dest, err)
+	}
+	defer unlock()
+	part := dest + ".part"
+	f, err := os.OpenFile(part, os.O_RDWR, 0)
+	if os.IsNotExist(err) {
+		if err := os.Remove(statePath(part)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove sidecar: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open %s: %w", part, err)
+	}
+	defer f.Close()
+	if err := lockStaging(f); err != nil && !errors.Is(err, errFlockUnsupported) {
+		return fmt.Errorf("%w: %s", err, part)
+	}
+	if !flockSupported {
+		// No lock to hold through the removal, and platforms without flock
+		// (notably Windows) may refuse to remove an open file: close first.
+		f.Close()
+	}
+	if err := os.Remove(part); err != nil {
+		return fmt.Errorf("remove %s: %w", part, err)
+	}
+	if err := os.Remove(statePath(part)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove sidecar: %w", err)
+	}
+	return nil
 }
 
 // elect sends the probe GET (Range: bytes=0-0, one byte) that follows
@@ -498,22 +660,25 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		ContentType:  r.contentType,
 		Resumed:      resumed,
 	}
-	if r.d.checksumConfigured() {
-		sum256, sum1, err := hashFile(file, r.d.opt.ExpectedSHA256 != "", r.d.opt.ExpectedSHA1 != "")
+	if r.checksumConfigured() {
+		bp := r.d.bufs.Get().(*[]byte)
+		sum256, sum1, err := hashFile(file,
+			r.sha256 != "", r.sha1 != "", *bp)
+		r.d.bufs.Put(bp)
 		if err != nil {
 			return nil, err
 		}
-		if r.d.opt.ExpectedSHA256 != "" {
-			if sum256 != r.d.opt.ExpectedSHA256 {
-				return nil, r.discardStaged(file,
-					&ChecksumError{Algo: "sha256", Expected: r.d.opt.ExpectedSHA256, Actual: sum256})
+		if r.sha256 != "" {
+			if sum256 != r.sha256 {
+				return nil, &ChecksumError{Algo: "sha256",
+					Expected: r.sha256, Actual: sum256, Path: r.partPath}
 			}
 			res.SHA256 = sum256
 		}
-		if r.d.opt.ExpectedSHA1 != "" {
-			if sum1 != r.d.opt.ExpectedSHA1 {
-				return nil, r.discardStaged(file,
-					&ChecksumError{Algo: "sha1", Expected: r.d.opt.ExpectedSHA1, Actual: sum1})
+		if r.sha1 != "" {
+			if sum1 != r.sha1 {
+				return nil, &ChecksumError{Algo: "sha1",
+					Expected: r.sha1, Actual: sum1, Path: r.partPath}
 			}
 			res.SHA1 = sum1
 		}
@@ -521,8 +686,17 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	if err := file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync %s: %w", r.partPath, err)
 	}
-	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("close %s: %w", r.partPath, err)
+	// Where flock exists, install while the descriptor — and with it the
+	// cross-process lock — is still held: closing first would let a second
+	// process grab the .part inode in the window before it becomes the
+	// destination (renaming an open file is fine on those platforms; the
+	// caller's deferred Close releases the lock afterwards). Platforms
+	// without flock have no lock to preserve, and Windows opens files
+	// without delete sharing, so rename/remove require closing first.
+	if !flockSupported {
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("close %s: %w", r.partPath, err)
+		}
 	}
 	if err := r.install(); err != nil {
 		return nil, err
@@ -573,24 +747,8 @@ func installNoReplace(
 	return fmt.Errorf("install %s -> %s: %w", partPath, destPath, linkErr)
 }
 
-// discardStaged removes the staged .part and sidecar after failed
-// verification: the bytes are proven bad, so a resume of them could never
-// succeed. It returns cause for convenient chaining.
-func (r *run) discardStaged(file *os.File, cause error) error {
-	if err := file.Close(); err != nil {
-		r.d.log.Debug("closing bad staged file failed", "err", err)
-	}
-	if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
-		r.d.log.Debug("removing bad staged file failed", "err", err)
-	}
-	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
-		r.d.log.Debug("removing resume sidecar failed", "err", err)
-	}
-	return cause
-}
-
 // hashFile reads file once and returns the requested hex digests.
-func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err error) {
+func hashFile(file *os.File, want256, want1 bool, buf []byte) (sum256, sum1 string, err error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", "", fmt.Errorf("seek for hashing: %w", err)
 	}
@@ -604,7 +762,6 @@ func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err erro
 		h1 = sha1.New() // #nosec G401 -- verification against a published SHA-1
 		writers = append(writers, h1)
 	}
-	buf := make([]byte, bufSize)
 	if _, err := io.CopyBuffer(io.MultiWriter(writers...), file, buf); err != nil {
 		return "", "", fmt.Errorf("hash %s: %w", file.Name(), err)
 	}
@@ -620,6 +777,9 @@ func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err erro
 // run carries the state of one Get call.
 type run struct {
 	d           *Downloader
+	rep         Reporter
+	sha256      string
+	sha1        string
 	url         string
 	sourceURL   *url.URL
 	destPath    string
@@ -628,6 +788,15 @@ type run struct {
 	etag        string
 	lastMod     string
 	contentType string // from the election probe response
+	// progress counts body bytes read this run (drives the concurrency ramp).
+	progress atomic.Int64
+	// ramp is the adaptive-concurrency governor; nil when Parts is 1 or on
+	// the single-stream path.
+	ramp *rampState
+}
+
+func (r *run) checksumConfigured() bool {
+	return r.sha256 != "" || r.sha1 != ""
 }
 
 func (r *run) name() string { return filepath.Base(r.destPath) }
@@ -657,8 +826,6 @@ func (r *run) resumable() bool {
 func (r *run) multipart(ctx context.Context) (*Result, error) {
 	sched := newScheduler(r.d.opt.MinPartSize)
 	sourceID := sourceIdentity(r.sourceURL)
-	st := loadState(statePath(r.partPath))
-	resumed := st != nil && st.usable(r.partPath, sourceID, r.total, r.etag, r.lastMod)
 
 	flag := os.O_RDWR | os.O_CREATE
 	file, err := os.OpenFile(r.partPath, flag, 0o644)
@@ -666,6 +833,15 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}
 	defer file.Close()
+	if err := lockStaging(file); err != nil {
+		if !errors.Is(err, errFlockUnsupported) {
+			return nil, fmt.Errorf("%w: %s", err, r.partPath)
+		}
+		r.d.log.Debug("staging lock unavailable, proceeding unprotected",
+			"path", r.partPath, "err", err)
+	}
+	st := loadState(statePath(r.partPath))
+	resumed := st != nil && st.usable(file, sourceID, r.total, r.etag, r.lastMod)
 
 	var resumedBytes int64
 	if resumed {
@@ -686,7 +862,7 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 		Version: stateVersion, SourceID: sourceID, Size: r.total,
 		ETag: r.etag, LastModified: r.lastMod,
 	}
-	r.d.rep.Start(Info{Name: r.name(), Total: r.total, Resumed: resumedBytes})
+	r.rep.Start(Info{Name: r.name(), Total: r.total, Resumed: resumedBytes})
 
 	err = r.runWorkers(ctx, sched, file, st)
 	if err != nil {
@@ -699,7 +875,82 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 		}
 		return nil, err
 	}
-	return r.verifyAndFinalize(file, resumed)
+	res, err := r.verifyAndFinalize(file, resumed)
+	if err != nil && r.resumable() {
+		if _, ok := errors.AsType[*ChecksumError](err); ok {
+			// The bytes are complete; only the published checksum disagrees.
+			// A complete sidecar lets a rerun with a corrected checksum (or
+			// none) finalize without re-downloading.
+			st.Chunks = sched.snapshot() // empty: everything is written
+			if serr := st.save(statePath(r.partPath)); serr != nil {
+				r.d.log.Debug("saving complete-state sidecar failed", "err", serr)
+			}
+		}
+	}
+	return res, err
+}
+
+// rampImprovement is the minimum aggregate-throughput gain a newly admitted
+// batch of connections must show before the governor admits more.
+const rampImprovement = 1.15
+
+// rampState is the adaptive-concurrency governor: workers are admitted in
+// doubling steps (1→2→4→…), each step gated on a measurement window of
+// 2×MinPartSize downloaded bytes. The first extra connection is always
+// probed; every later step must have improved aggregate throughput by
+// rampImprovement, otherwise admission stops — the bottleneck is the path,
+// not the flow count — and the download transparently behaves like a
+// single-stream client. Workers trip note() as bytes land, so the ramp is
+// byte-accurate at any link speed.
+type rampState struct {
+	done     atomic.Bool // fast path for the per-read check
+	mu       sync.Mutex
+	spawn    func(int)
+	log      *slog.Logger
+	parts    int
+	window   int64
+	warmed   bool // first window recorded as slow-start burn-in baseline
+	admitted int
+	lastRate float64
+	markAt   int64
+	markTime time.Time
+}
+
+func (rs *rampState) note(total int64) {
+	if rs.done.Load() {
+		return
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.done.Load() || total-rs.markAt < rs.window {
+		return
+	}
+	rate := float64(total-rs.markAt) / max(time.Since(rs.markTime).Seconds(), 1e-9)
+	if !rs.warmed {
+		// Burn-in: the first window mostly measures TCP slow-start of the
+		// initial connection. Recording it as the baseline (instead of
+		// admitting on it) stops warm-up gains from being credited to
+		// admissions that contributed nothing.
+		rs.warmed = true
+	} else if rs.admitted > 1 && rate < rs.lastRate*rampImprovement {
+		rs.log.Debug("concurrency ramp stopped: extra connections not paying",
+			"admitted", rs.admitted, "rate", int64(rate), "previous", int64(rs.lastRate))
+		rs.done.Store(true)
+		return
+	} else {
+		add := min(rs.admitted, rs.parts-rs.admitted)
+		for i := range add {
+			rs.spawn(rs.admitted + i)
+		}
+		rs.admitted += add
+		rs.log.Debug("concurrency ramp", "admitted", rs.admitted, "rate", int64(rate))
+		if rs.admitted >= rs.parts {
+			rs.done.Store(true)
+		}
+	}
+	rs.lastRate = rate
+	rs.markAt = total
+	rs.markTime = time.Now()
 }
 
 // runWorkers drives the worker pool and the periodic sidecar flusher,
@@ -707,6 +958,10 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 func (r *run) runWorkers(
 	ctx context.Context, sched *scheduler, file *os.File, st *stateFile,
 ) error {
+	sched.onGrant = r.rep.ChunkStart
+	if rz, ok := r.rep.(ChunkResizer); ok {
+		sched.onResize = rz.ChunkResize
+	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -730,14 +985,31 @@ func (r *run) runWorkers(
 			cancel(err)
 		})
 	}
-	for i := range r.d.opt.Parts {
-		w := newWorker(i, r, sched, file, picker)
+	spawn := func(id int) {
+		w := newWorker(id, r, sched, file, picker)
 		wg.Go(func() {
 			if err := w.run(runCtx); err != nil {
 				fail(err)
 			}
 		})
 	}
+	if r.d.opt.Parts > 1 {
+		// Window: big enough to measure meaningfully, small enough that the
+		// transfer has room to reach full parallelism (~3 doubling steps in
+		// the first fifth). Sized from the REMAINING work so a resumed
+		// download near its end still ramps instead of serializing its
+		// pending chunks.
+		window := max(min(2*r.d.opt.MinPartSize, sched.remainingBytes()/16), 1)
+		r.ramp = &rampState{
+			spawn:    spawn,
+			log:      r.d.log,
+			parts:    r.d.opt.Parts,
+			window:   window,
+			admitted: 1,
+			markTime: time.Now(),
+		}
+	}
+	spawn(0)
 
 	flushDone := make(chan struct{})
 	go func() {
@@ -825,8 +1097,15 @@ func (r *run) single(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}
 	defer file.Close()
+	if err := lockStaging(file); err != nil {
+		if !errors.Is(err, errFlockUnsupported) {
+			return nil, fmt.Errorf("%w: %s", err, r.partPath)
+		}
+		r.d.log.Debug("staging lock unavailable, proceeding unprotected",
+			"path", r.partPath, "err", err)
+	}
 
-	r.d.rep.Start(Info{Name: r.name(), Total: r.total})
+	r.rep.Start(Info{Name: r.name(), Total: r.total})
 	w := newWorker(0, r, nil, file, nil)
 	if err := w.singleStream(ctx); err != nil {
 		return nil, err

@@ -99,45 +99,47 @@ func TestStateUsable(t *testing.T) {
 	if err := os.WriteFile(part, make([]byte, 1000), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	file, err := os.Open(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
 
 	st := validSidecar()
-	if !st.usable(part, st.SourceID, 1000, `"v1"`, "") {
+	if !st.usable(file, st.SourceID, 1000, `"v1"`, "") {
 		t.Error("valid state rejected")
 	}
-	if st.usable(part, strings.Repeat("b", 64), 1000, `"v1"`, "") {
+	if st.usable(file, strings.Repeat("b", 64), 1000, `"v1"`, "") {
 		t.Error("source identity mismatch accepted")
 	}
-	if st.usable(part, st.SourceID, 999, `"v1"`, "") {
+	if st.usable(file, st.SourceID, 999, `"v1"`, "") {
 		t.Error("size mismatch accepted")
 	}
-	if st.usable(part, st.SourceID, 1000, `"v2"`, "") {
+	if st.usable(file, st.SourceID, 1000, `"v2"`, "") {
 		t.Error("etag mismatch accepted")
-	}
-	if st.usable(filepath.Join(dir, "missing.part"), st.SourceID, 1000, `"v1"`, "") {
-		t.Error("missing part file accepted")
 	}
 
 	weak := validSidecar()
 	weak.ETag = `W/"v1"`
-	if weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "") {
+	if weak.usable(file, weak.SourceID, 1000, `W/"v1"`, "") {
 		t.Error("weak etag accepted as validator")
 	}
 	// A weak ETag falls back to Last-Modified, mirroring run.validator.
 	weak.LastModified = "Mon, 02 Jan 2026 03:04:05 GMT"
-	if !weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "Mon, 02 Jan 2026 03:04:05 GMT") {
+	if !weak.usable(file, weak.SourceID, 1000, `W/"v1"`, "Mon, 02 Jan 2026 03:04:05 GMT") {
 		t.Error("weak etag with matching Last-Modified rejected")
 	}
-	if weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "Tue, 03 Jan 2026 03:04:05 GMT") {
+	if weak.usable(file, weak.SourceID, 1000, `W/"v1"`, "Tue, 03 Jan 2026 03:04:05 GMT") {
 		t.Error("weak etag with changed Last-Modified accepted")
 	}
 
 	lm := validSidecar()
 	lm.ETag = ""
 	lm.LastModified = "Mon, 02 Jan 2026 03:04:05 GMT"
-	if !lm.usable(part, lm.SourceID, 1000, "", "Mon, 02 Jan 2026 03:04:05 GMT") {
+	if !lm.usable(file, lm.SourceID, 1000, "", "Mon, 02 Jan 2026 03:04:05 GMT") {
 		t.Error("matching Last-Modified rejected")
 	}
-	if lm.usable(part, lm.SourceID, 1000, "", "Tue, 03 Jan 2026 03:04:05 GMT") {
+	if lm.usable(file, lm.SourceID, 1000, "", "Tue, 03 Jan 2026 03:04:05 GMT") {
 		t.Error("changed Last-Modified accepted")
 	}
 
@@ -145,8 +147,45 @@ func TestStateUsable(t *testing.T) {
 	if err := os.Truncate(part, 500); err != nil {
 		t.Fatal(err)
 	}
-	if st.usable(part, st.SourceID, 1000, `"v1"`, "") {
+	if st.usable(file, st.SourceID, 1000, `"v1"`, "") {
 		t.Error("truncated part file accepted")
+	}
+}
+
+func TestStateUsableBindsLockedFile(t *testing.T) {
+	t.Parallel()
+	// usable validates size against the descriptor it is handed, not the
+	// pathname: a descriptor for the original full-size staging inode
+	// passes while a descriptor for a replacement inode fails, regardless
+	// of what any path points at. (Two separate files stand in for the
+	// original and replacement inodes; renaming an open file to arrange
+	// them at one path is not possible on Windows.)
+	dir := t.TempDir()
+	originalPath := filepath.Join(dir, "f.part")
+	if err := os.WriteFile(originalPath, make([]byte, 1000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	replacementPath := filepath.Join(dir, "replacement.part")
+	if err := os.WriteFile(replacementPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Open(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Close()
+	replacement, err := os.Open(replacementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+
+	st := validSidecar()
+	if !st.usable(original, st.SourceID, 1000, `"v1"`, "") {
+		t.Fatal("test setup: sidecar must describe the original descriptor")
+	}
+	if st.usable(replacement, st.SourceID, 1000, `"v1"`, "") {
+		t.Error("sidecar for replaced staging file accepted against current descriptor")
 	}
 }
 

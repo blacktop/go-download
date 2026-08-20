@@ -37,13 +37,18 @@ fmt:
 # Run the full verification suite (what CI runs)
 check: lint test build
 
+# Loopback benchmarks: stdlib baseline vs the engine, unconstrained and
+# per-connection-throttled (see README Performance)
+bench:
+    go test -run '^$' -bench 'BenchmarkGetMultipart|BenchmarkStdlibGet|BenchmarkConstrained' -benchtime 5x -count=3 .
+
 # Install the dl CLI from the working tree
 install:
     cd cmd/dl && go install .
 
-# Bump version: tag the library and CLI modules, then push
-# (Go has no version file to edit — modules version via git tags,
-# and the cmd/dl module needs its own cmd/dl/vX.Y.Z tag).
+# Bump version in two stages so cmd/dl/vX.Y.Z never ships a stale engine:
+# 1. tag + push the library, 2. pin cmd/dl to that published version
+# (go get + tidy, committed), 3. tag + push the CLI from that commit.
 # TAG defaults to the next patch (svu); pass one to override: `just bump v1.2.0`
 bump tag="":
     #!/usr/bin/env bash
@@ -59,11 +64,22 @@ bump tag="":
         echo "invalid tag '$TAG' — want semver like v1.2.3" >&2
         exit 1
     fi
-    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-        echo "tag $TAG already exists" >&2
-        exit 1
-    fi
+    for t in "$TAG" "cmd/dl/$TAG"; do
+        if git rev-parse -q --verify "refs/tags/$t" >/dev/null; then
+            echo "tag $t already exists" >&2
+            exit 1
+        fi
+    done
+    # Stage 1: publish the library.
     git tag -a "$TAG" -m "Release $TAG"
+    git push && git push origin "refs/tags/$TAG"
+    # Stage 2: pin the CLI to the version that now exists.
+    (cd cmd/dl && GOFLAGS=-mod=mod GOWORK=off go get "github.com/blacktop/go-download@$TAG" \
+        && GOWORK=off go mod tidy)
+    git add cmd/dl/go.mod cmd/dl/go.sum
+    git commit -m "chore(dl): pin go-download $TAG"
+    git push
+    # Stage 3: publish the CLI from the pinned commit.
     git tag -a "cmd/dl/$TAG" -m "Release dl $TAG"
-    git push && git push --tags
-    echo "released $TAG"
+    git push origin "refs/tags/cmd/dl/$TAG"
+    echo "released $TAG (library) and cmd/dl/$TAG (CLI)"
