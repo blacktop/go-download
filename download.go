@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -135,8 +136,14 @@ func New(opt *Options) (*Downloader, error) {
 	if o.Timeout == 0 {
 		o.Timeout = defaultTimeout
 	}
+	if o.Timeout < 0 {
+		return nil, fmt.Errorf("invalid Timeout %v: must be > 0", o.Timeout)
+	}
 	if o.MaxRetries == 0 {
 		o.MaxRetries = defaultMaxRetries
+	}
+	if o.MaxRetries < 0 {
+		return nil, fmt.Errorf("invalid MaxRetries %d: must be >= 1", o.MaxRetries)
 	}
 	if o.ExpectedSHA256 != "" {
 		if _, err := hex.DecodeString(o.ExpectedSHA256); err != nil || len(o.ExpectedSHA256) != 64 {
@@ -150,13 +157,13 @@ func New(opt *Options) (*Downloader, error) {
 		}
 		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
 	}
+	if o.Reporter == nil {
+		o.Reporter = NopReporter{}
+	}
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.DiscardHandler)
+	}
 	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger}
-	if d.rep == nil {
-		d.rep = NopReporter{}
-	}
-	if d.log == nil {
-		d.log = slog.New(slog.DiscardHandler)
-	}
 	d.dial = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -252,12 +259,15 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 
 	var total int64 = -1
 	multipart := false
-	if resp.StatusCode == http.StatusPartialContent {
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
 		if _, _, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && t > 0 {
 			total = t
 			multipart = true
 		}
-	} else if resp.ContentLength > 0 {
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		total = 0 // elect only lets a 416 through for a zero-length resource
+	case resp.ContentLength > 0:
 		total = resp.ContentLength
 	}
 	// The election response served its purpose (final URL, headers,
@@ -282,13 +292,11 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	return r.single(ctx)
 }
 
-// elect sends the probe GET (Range: bytes=0-) that follows redirects and
-// decides between multipart (206) and single-stream (200). Transient
-// failures are retried a few times.
+// elect sends the probe GET (Range: bytes=0-0, one byte) that follows
+// redirects and decides between multipart (206), single-stream (200), and
+// empty (416 on a zero-length resource). Transient failures are retried a
+// few times.
 func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, error) {
-	if _, err := url.Parse(rawURL); err != nil {
-		return nil, fmt.Errorf("parse url: %w", err)
-	}
 	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
@@ -303,7 +311,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 			return nil, fmt.Errorf("build request: %w", err)
 		}
 		d.applyHeaders(req)
-		req.Header.Set("Range", "bytes=0-")
+		req.Header.Set("Range", "bytes=0-0")
 		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -314,6 +322,10 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
+			return resp, nil
+		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && emptyContentRange(resp.Header):
+			// A range probe on a zero-length resource is unsatisfiable:
+			// the file exists and is empty.
 			return resp, nil
 		case isRetryableStatus(resp.StatusCode):
 			resp.Body.Close()
@@ -330,6 +342,12 @@ func isRetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || (code >= 500 && code < 600)
 }
 
+// emptyContentRange reports whether a 416 response declares a zero-length
+// resource ("Content-Range: bytes */0").
+func emptyContentRange(h http.Header) bool {
+	return strings.TrimSpace(h.Get("Content-Range")) == "bytes */0"
+}
+
 // parseContentRange parses "bytes start-end/total"; total may be "*" (-1).
 func parseContentRange(s string) (start, end, total int64, err error) {
 	rest, ok := strings.CutPrefix(s, "bytes ")
@@ -342,10 +360,17 @@ func parseContentRange(s string) (start, end, total int64, err error) {
 	}
 	if totalPart == "*" {
 		total = -1
-	} else if _, err := fmt.Sscanf(totalPart, "%d", &total); err != nil {
+	} else if total, err = strconv.ParseInt(totalPart, 10, 64); err != nil {
 		return 0, 0, 0, fmt.Errorf("malformed Content-Range total %q", s)
 	}
-	if _, err := fmt.Sscanf(rangePart, "%d-%d", &start, &end); err != nil {
+	startPart, endPart, ok := strings.Cut(rangePart, "-")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
+	}
+	if start, err = strconv.ParseInt(startPart, 10, 64); err != nil {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
+	}
+	if end, err = strconv.ParseInt(endPart, 10, 64); err != nil {
 		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
 	}
 	return start, end, total, nil
@@ -386,13 +411,15 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		}
 		if r.d.opt.ExpectedSHA256 != "" {
 			if sum256 != r.d.opt.ExpectedSHA256 {
-				return nil, &ChecksumError{Algo: "sha256", Expected: r.d.opt.ExpectedSHA256, Actual: sum256}
+				return nil, r.discardStaged(file,
+					&ChecksumError{Algo: "sha256", Expected: r.d.opt.ExpectedSHA256, Actual: sum256})
 			}
 			res.SHA256 = sum256
 		}
 		if r.d.opt.ExpectedSHA1 != "" {
 			if sum1 != r.d.opt.ExpectedSHA1 {
-				return nil, &ChecksumError{Algo: "sha1", Expected: r.d.opt.ExpectedSHA1, Actual: sum1}
+				return nil, r.discardStaged(file,
+					&ChecksumError{Algo: "sha1", Expected: r.d.opt.ExpectedSHA1, Actual: sum1})
 			}
 			res.SHA1 = sum1
 		}
@@ -406,8 +433,26 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	if err := os.Rename(r.partPath, r.destPath); err != nil {
 		return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
 	}
-	os.Remove(statePath(r.partPath))
+	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing resume sidecar failed", "err", err)
+	}
 	return res, nil
+}
+
+// discardStaged removes the staged .part and sidecar after failed
+// verification: the bytes are proven bad, so a resume of them could never
+// succeed. It returns cause for convenient chaining.
+func (r *run) discardStaged(file *os.File, cause error) error {
+	if err := file.Close(); err != nil {
+		r.d.log.Debug("closing bad staged file failed", "err", err)
+	}
+	if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing bad staged file failed", "err", err)
+	}
+	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing resume sidecar failed", "err", err)
+	}
+	return cause
 }
 
 // hashFile reads file once and returns the requested hex digests.
@@ -460,6 +505,13 @@ func (r *run) validator() string {
 	return r.lastMod
 }
 
+// resumable reports whether a resume sidecar is worth writing: without any
+// server validator, loadState could never prove the content unchanged and
+// would reject the sidecar anyway.
+func (r *run) resumable() bool {
+	return r.etag != "" || r.lastMod != ""
+}
+
 // multipart downloads r.url (known size, ranges honored) with parallel
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
@@ -497,10 +549,12 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 
 	err = r.runWorkers(ctx, sched, file, st)
 	if err != nil {
-		// Leave .part and sidecar in place for a future resume.
-		st.Chunks = sched.snapshot()
-		if serr := st.save(statePath(r.partPath)); serr != nil {
-			r.d.log.Debug("saving resume state failed", "err", serr)
+		if r.resumable() {
+			// Leave .part and sidecar in place for a future resume.
+			st.Chunks = sched.snapshot()
+			if serr := st.save(statePath(r.partPath)); serr != nil {
+				r.d.log.Debug("saving resume state failed", "err", serr)
+			}
 		}
 		return nil, err
 	}
@@ -545,14 +599,26 @@ func (r *run) runWorkers(ctx context.Context, sched *scheduler, file *os.File, s
 	flushDone := make(chan struct{})
 	go func() {
 		defer close(flushDone)
+		if !r.resumable() {
+			return
+		}
 		t := time.NewTicker(flushEvery)
 		defer t.Stop()
+		lastRemaining := int64(-1)
 		for {
 			select {
 			case <-runCtx.Done():
 				return
 			case <-t.C:
 				st.Chunks = sched.snapshot()
+				rem := st.remaining()
+				if rem == lastRemaining {
+					// No bytes landed since the last flush: the sidecar
+					// on disk still describes valid coverage, so skip
+					// the rewrite.
+					continue
+				}
+				lastRemaining = rem
 				if err := st.save(statePath(r.partPath)); err != nil {
 					r.d.log.Debug("flush resume state failed", "err", err)
 				}
@@ -606,12 +672,16 @@ func portOf(u *url.URL) string {
 // single downloads r.url over one sequential stream (server ignored Range or
 // size is unknown). No resume: a retry restarts from byte zero.
 func (r *run) single(ctx context.Context) (*Result, error) {
-	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	// No O_TRUNC and no eager sidecar removal: an existing multipart .part
+	// stays resumable until a single-stream attempt actually starts writing
+	// (singleAttempt truncates only after a successful response). A stale
+	// sidecar is removed by verifyAndFinalize on success and is harmless
+	// otherwise (usable() rejects it once the .part size changed).
+	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}
 	defer file.Close()
-	os.Remove(statePath(r.partPath)) // stale sidecar from an older multipart run
 
 	r.d.rep.Start(Info{Name: r.name(), Total: r.total})
 	w := newWorker(0, r, nil, file, nil)
