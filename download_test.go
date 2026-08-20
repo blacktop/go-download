@@ -3,6 +3,7 @@ package download
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -430,6 +431,56 @@ func TestSHA256Verification(t *testing.T) {
 	})
 }
 
+func TestSHA1Verification(t *testing.T) {
+	t.Parallel()
+	data := testData(64 << 10)
+	sum1 := sha1.Sum(data)
+	hexSum1 := hex.EncodeToString(sum1[:])
+	sum256 := sha256.Sum256(data)
+	hexSum256 := hex.EncodeToString(sum256[:])
+	var st stats
+	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	t.Cleanup(srv.Close)
+
+	t.Run("match", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		d := newDL(t, &Options{ExpectedSHA1: hexSum1, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
+		if res.SHA1 != hexSum1 {
+			t.Errorf("Result.SHA1 = %q, want %q", res.SHA1, hexSum1)
+		}
+	})
+
+	t.Run("both algorithms", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		d := newDL(t, &Options{ExpectedSHA1: hexSum1, ExpectedSHA256: hexSum256, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
+		if res.SHA1 != hexSum1 || res.SHA256 != hexSum256 {
+			t.Errorf("Result checksums = (%q, %q), want (%q, %q)", res.SHA1, res.SHA256, hexSum1, hexSum256)
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		bad := "0000000000000000000000000000000000000000"
+		d := newDL(t, &Options{ExpectedSHA1: bad, MinPartSize: 4 << 10})
+		_, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
+		var ce *ChecksumError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected ChecksumError, got %v", err)
+		}
+		if ce.Algo != "sha1" {
+			t.Errorf("ChecksumError.Algo = %q, want sha1", ce.Algo)
+		}
+		if _, err := os.Stat(dest); !os.IsNotExist(err) {
+			t.Error("mismatched file must not be renamed into place")
+		}
+	})
+}
+
 func TestContentRangeParsing(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -467,6 +518,9 @@ func TestOptionsValidation(t *testing.T) {
 	}
 	if _, err := New(&Options{ExpectedSHA256: "xyz"}); err == nil {
 		t.Error("bad sha256 must error")
+	}
+	if _, err := New(&Options{ExpectedSHA1: "xyz"}); err == nil {
+		t.Error("bad sha1 must error")
 	}
 	d, err := New(nil)
 	if err != nil {

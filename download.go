@@ -2,11 +2,13 @@ package download
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"net"
@@ -49,6 +51,9 @@ type Options struct {
 	MaxRetries int
 	// Headers are added to every request (User-Agent, auth, ...).
 	Headers http.Header
+	// Jar supplies cookies to every request (session auth). Nil means no
+	// cookie handling.
+	Jar http.CookieJar
 	// Transport overrides the internal HTTP/1.1 transport. Setting it
 	// disables CDN node pinning (this is the HTTP/3 escape hatch: plug in
 	// a quic-go RoundTripper here).
@@ -56,9 +61,18 @@ type Options struct {
 	// TLSConfig is used by the internal transport. Ignored when Transport
 	// is set.
 	TLSConfig *tls.Config
+	// Proxy selects a proxy per request for the internal transport (nil
+	// means http.ProxyFromEnvironment). Ignored when Transport is set.
+	// Requests that go through a proxy disable CDN node pinning.
+	Proxy func(*http.Request) (*url.URL, error)
 	// ExpectedSHA256 is the hex-encoded checksum to verify before the
 	// final rename. Empty disables verification.
 	ExpectedSHA256 string
+	// ExpectedSHA1 is the hex-encoded SHA-1 checksum to verify before the
+	// final rename (Apple's firmware APIs still publish SHA-1). Empty
+	// disables verification. May be combined with ExpectedSHA256; the
+	// file is read once.
+	ExpectedSHA1 string
 	// Overwrite allows replacing an existing destination file.
 	Overwrite bool
 	// Reporter receives progress events. Nil means silent.
@@ -82,6 +96,8 @@ type Result struct {
 	Elapsed time.Duration
 	// SHA256 is the hex checksum, set only when ExpectedSHA256 was verified.
 	SHA256 string
+	// SHA1 is the hex checksum, set only when ExpectedSHA1 was verified.
+	SHA1 string
 }
 
 // Downloader downloads files. It is safe for concurrent use.
@@ -128,6 +144,12 @@ func New(opt *Options) (*Downloader, error) {
 		}
 		o.ExpectedSHA256 = strings.ToLower(o.ExpectedSHA256)
 	}
+	if o.ExpectedSHA1 != "" {
+		if _, err := hex.DecodeString(o.ExpectedSHA1); err != nil || len(o.ExpectedSHA1) != 40 {
+			return nil, fmt.Errorf("invalid ExpectedSHA1 %q: want 40 hex chars", o.ExpectedSHA1)
+		}
+		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
+	}
 	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger}
 	if d.rep == nil {
 		d.rep = NopReporter{}
@@ -157,8 +179,12 @@ func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net
 func newTransport(o Options, dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
+	proxy := o.Proxy
+	if proxy == nil {
+		proxy = http.ProxyFromEnvironment
+	}
 	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxy,
 		DialContext:           dial,
 		Protocols:             &protocols,
 		TLSClientConfig:       o.TLSConfig,
@@ -175,6 +201,12 @@ func (d *Downloader) roundTripper() http.RoundTripper {
 		return d.opt.Transport
 	}
 	return d.base
+}
+
+// newClient wraps a transport in an http.Client carrying the configured
+// cookie jar.
+func (d *Downloader) newClient(rt http.RoundTripper) *http.Client {
+	return &http.Client{Transport: rt, Jar: d.opt.Jar}
 }
 
 func (d *Downloader) applyHeaders(req *http.Request) {
@@ -257,7 +289,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 	if _, err := url.Parse(rawURL); err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
-	client := &http.Client{Transport: d.roundTripper()}
+	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
 	for attempt := range 3 {
@@ -347,15 +379,23 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		LastModified: r.lastMod,
 		Resumed:      resumed,
 	}
-	if r.d.opt.ExpectedSHA256 != "" {
-		sum, err := hashFile(file)
+	if r.d.opt.ExpectedSHA256 != "" || r.d.opt.ExpectedSHA1 != "" {
+		sum256, sum1, err := hashFile(file, r.d.opt.ExpectedSHA256 != "", r.d.opt.ExpectedSHA1 != "")
 		if err != nil {
 			return nil, err
 		}
-		if sum != r.d.opt.ExpectedSHA256 {
-			return nil, &ChecksumError{Expected: r.d.opt.ExpectedSHA256, Actual: sum}
+		if r.d.opt.ExpectedSHA256 != "" {
+			if sum256 != r.d.opt.ExpectedSHA256 {
+				return nil, &ChecksumError{Algo: "sha256", Expected: r.d.opt.ExpectedSHA256, Actual: sum256}
+			}
+			res.SHA256 = sum256
 		}
-		res.SHA256 = sum
+		if r.d.opt.ExpectedSHA1 != "" {
+			if sum1 != r.d.opt.ExpectedSHA1 {
+				return nil, &ChecksumError{Algo: "sha1", Expected: r.d.opt.ExpectedSHA1, Actual: sum1}
+			}
+			res.SHA1 = sum1
+		}
 	}
 	if err := file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync %s: %w", r.partPath, err)
@@ -370,16 +410,32 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	return res, nil
 }
 
-func hashFile(file *os.File) (string, error) {
+// hashFile reads file once and returns the requested hex digests.
+func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("seek for hashing: %w", err)
+		return "", "", fmt.Errorf("seek for hashing: %w", err)
 	}
-	h := sha256.New()
+	var writers []io.Writer
+	var h256, h1 hash.Hash
+	if want256 {
+		h256 = sha256.New()
+		writers = append(writers, h256)
+	}
+	if want1 {
+		h1 = sha1.New() // #nosec G401 -- verification against a published SHA-1
+		writers = append(writers, h1)
+	}
 	buf := make([]byte, bufSize)
-	if _, err := io.CopyBuffer(h, file, buf); err != nil {
-		return "", fmt.Errorf("hash %s: %w", file.Name(), err)
+	if _, err := io.CopyBuffer(io.MultiWriter(writers...), file, buf); err != nil {
+		return "", "", fmt.Errorf("hash %s: %w", file.Name(), err)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if h256 != nil {
+		sum256 = hex.EncodeToString(h256.Sum(nil))
+	}
+	if h1 != nil {
+		sum1 = hex.EncodeToString(h1.Sum(nil))
+	}
+	return sum256, sum1, nil
 }
 
 // run carries the state of one Get call.

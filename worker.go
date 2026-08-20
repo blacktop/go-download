@@ -317,7 +317,7 @@ func (w *worker) ensureClient(ctx context.Context) error {
 		return nil
 	}
 	if w.picker == nil {
-		w.client = &http.Client{Transport: w.r.d.roundTripper()}
+		w.client = w.r.d.newClient(w.r.d.roundTripper())
 		return nil
 	}
 	n, err := w.picker.pick(ctx)
@@ -335,7 +335,7 @@ func (w *worker) ensureClient(ctx context.Context) error {
 		return w.r.d.dial(ctx, network, addr)
 	}
 	tr.MaxConnsPerHost = 1
-	w.client = &http.Client{Transport: tr}
+	w.client = w.r.d.newClient(tr)
 	w.r.d.log.Debug("worker pinned to node", "worker", w.id, "addr", pinned)
 	return nil
 }
