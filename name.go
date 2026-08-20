@@ -14,7 +14,9 @@ import (
 var reContentDisposition = regexp.MustCompile(`filename[^;\n=]*=(['"](.*?)['"]|[^;\n]*)`)
 
 // parseContentDisposition extracts a filename from a Content-Disposition
-// header value, handling quoted values and RFC 5987 extended encoding.
+// header value, handling quoted values and RFC 5987 extended encoding. Only
+// the RFC 5987 form is percent-encoded; plain and quoted filenames are
+// returned verbatim.
 func parseContentDisposition(input string) string {
 	group := reContentDisposition.FindStringSubmatch(input)
 	if len(group) != 3 {
@@ -25,7 +27,11 @@ func parseContentDisposition(input string) string {
 	}
 	b, a, found := strings.Cut(group[1], "''")
 	if found && strings.EqualFold(b, "utf-8") {
-		return a
+		decoded, err := url.PathUnescape(a)
+		if err != nil {
+			return ""
+		}
+		return decoded
 	}
 	if b != `""` {
 		return b
@@ -34,9 +40,11 @@ func parseContentDisposition(input string) string {
 }
 
 // deriveName resolves the output filename from the final response location
-// and headers: Content-Disposition wins, then the URL path base.
+// and headers: Content-Disposition wins, then the URL path base. u.Path is
+// already percent-decoded by url.Parse, so no further decoding happens (a
+// second pass would corrupt names containing '+' or literal '%').
 func deriveName(location string, header http.Header) (string, error) {
-	if name, err := url.QueryUnescape(parseContentDisposition(header.Get("Content-Disposition"))); err == nil && name != "" {
+	if name := parseContentDisposition(header.Get("Content-Disposition")); name != "" {
 		return filepath.Base(name), nil
 	}
 	u, err := url.Parse(location)
@@ -46,10 +54,6 @@ func deriveName(location string, header http.Header) (string, error) {
 	name := u.Path
 	if name == "" {
 		name = u.Opaque
-	}
-	name, err = url.QueryUnescape(name)
-	if err != nil {
-		return "", fmt.Errorf("unescape %q: %w", u.Path, err)
 	}
 	if base := filepath.Base(name); base != "." && base != string(filepath.Separator) && base != "/" {
 		return base, nil
@@ -61,18 +65,13 @@ func deriveName(location string, header http.Header) (string, error) {
 // dest may be empty (derived name in the current directory), an existing
 // directory (derived name inside it), or a file path used as-is.
 func resolveDest(dest, location string, header http.Header) (string, error) {
+	dir := ""
 	if dest != "" {
-		if fi, err := os.Stat(dest); err == nil && fi.IsDir() {
-			name, err := deriveName(location, header)
-			if err != nil {
-				return "", err
-			}
-			if name == "" {
-				return "", fmt.Errorf("cannot derive filename from %q: pass an explicit file path", location)
-			}
-			return filepath.Join(dest, name), nil
+		fi, err := os.Stat(dest)
+		if err != nil || !fi.IsDir() {
+			return dest, nil
 		}
-		return dest, nil
+		dir = dest
 	}
 	name, err := deriveName(location, header)
 	if err != nil {
@@ -81,5 +80,5 @@ func resolveDest(dest, location string, header http.Header) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("cannot derive filename from %q: pass an explicit file path", location)
 	}
-	return name, nil
+	return filepath.Join(dir, name), nil
 }

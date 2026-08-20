@@ -72,12 +72,10 @@ func TestPickerPrefersFasterNode(t *testing.T) {
 	}
 }
 
-// refreshUnderTest exposes refreshLocked for direct node access in tests.
+// refreshUnderTest exposes refresh for direct node access in tests.
 func (p *picker) refreshUnderTest(t *testing.T) error {
 	t.Helper()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.refreshLocked(t.Context())
+	return p.refresh(t.Context())
 }
 
 func TestPickerCullSemantics(t *testing.T) {

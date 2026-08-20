@@ -48,6 +48,13 @@ func TestDeriveName(t *testing.T) {
 		{name: "path", location: "http://example.org/abc", expected: "abc"},
 		{name: "escaped path", location: "http://example.org/abc%20d", expected: "abc d"},
 		{name: "nested path", location: "http://example.org/a/b/c.ipsw", expected: "c.ipsw"},
+		{name: "plus is not a space", location: "http://example.org/a+b.zip", expected: "a+b.zip"},
+		{
+			name:     "no double decode",
+			location: "http://example.org/file%2520name.zip",
+			expected: "file%20name.zip",
+		},
+		{name: "literal percent", location: "http://example.org/100%25off.zip", expected: "100%off.zip"},
 		{
 			name:     "content disposition wins",
 			location: "http://example.org/abc",

@@ -324,7 +324,7 @@ func TestResume(t *testing.T) {
 	fullRefetches := 0
 	for i, s := range phase2 {
 		if i == 0 {
-			continue // election probe is always bytes=0-
+			continue // election probe is always bytes=0-0
 		}
 		if s == 0 {
 			fullRefetches++
@@ -428,6 +428,9 @@ func TestSHA256Verification(t *testing.T) {
 		if _, err := os.Stat(dest); !os.IsNotExist(err) {
 			t.Error("mismatched file must not be renamed into place")
 		}
+		// The staged bytes are proven bad: resuming them could never
+		// succeed, so they must be discarded.
+		assertClean(t, dest)
 	})
 }
 
@@ -481,6 +484,38 @@ func TestSHA1Verification(t *testing.T) {
 	})
 }
 
+func TestGetEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("range server answers the probe with 416", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(rangeHandler(nil, `"v1"`, &st))
+		defer srv.Close()
+		dest := filepath.Join(t.TempDir(), "empty.bin")
+		d := newDL(t, nil)
+		res, got := mustGet(t, d, srv.URL+"/empty.bin", dest)
+		if res.Size != 0 || len(got) != 0 {
+			t.Errorf("Size = %d, body = %d bytes; want an empty file", res.Size, len(got))
+		}
+		assertClean(t, dest)
+	})
+
+	t.Run("plain server", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(plainHandler(nil, &st))
+		defer srv.Close()
+		dest := filepath.Join(t.TempDir(), "empty.bin")
+		d := newDL(t, nil)
+		res, got := mustGet(t, d, srv.URL+"/empty.bin", dest)
+		if res.Size != 0 || len(got) != 0 {
+			t.Errorf("Size = %d, body = %d bytes; want an empty file", res.Size, len(got))
+		}
+		assertClean(t, dest)
+	})
+}
+
 func TestContentRangeParsing(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -515,6 +550,12 @@ func TestOptionsValidation(t *testing.T) {
 	}
 	if _, err := New(&Options{MinPartSize: -5}); err == nil {
 		t.Error("negative MinPartSize must error")
+	}
+	if _, err := New(&Options{MaxRetries: -1}); err == nil {
+		t.Error("negative MaxRetries must error (would retry forever)")
+	}
+	if _, err := New(&Options{Timeout: -time.Second}); err == nil {
+		t.Error("negative Timeout must error (would stall instantly)")
 	}
 	if _, err := New(&Options{ExpectedSHA256: "xyz"}); err == nil {
 		t.Error("bad sha256 must error")

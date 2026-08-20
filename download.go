@@ -183,7 +183,9 @@ func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net
 // newTransport builds the internal transport: HTTP/1.1 only, because HTTP/2
 // would multiplex every parallel range request onto a single TCP connection
 // and defeat the purpose of parallel parts.
-func newTransport(o Options, dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+func newTransport(
+	o Options, dial func(context.Context, string, string) (net.Conn, error),
+) *http.Transport {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
 	proxy := o.Proxy
@@ -563,7 +565,9 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 
 // runWorkers drives the worker pool and the periodic sidecar flusher,
 // returning the first real error (or the context's cause).
-func (r *run) runWorkers(ctx context.Context, sched *scheduler, file *os.File, st *stateFile) error {
+func (r *run) runWorkers(
+	ctx context.Context, sched *scheduler, file *os.File, st *stateFile,
+) error {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 

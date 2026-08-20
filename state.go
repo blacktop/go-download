@@ -1,6 +1,7 @@
 package download
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,7 +68,7 @@ func loadState(path string) *stateFile {
 	}
 	chunks := slices.Clone(st.Chunks)
 	slices.SortFunc(chunks, func(a, b chunkState) int {
-		return int(a.Off - b.Off)
+		return cmp.Compare(a.Off, b.Off)
 	})
 	var prevEnd int64 = -1
 	for _, c := range chunks {
@@ -88,11 +89,13 @@ func (st *stateFile) usable(partPath string, size int64, etag, lastModified stri
 	if st.Size != size {
 		return false
 	}
-	if st.ETag != "" {
-		if !isStrongETag(st.ETag) || st.ETag != etag {
+	// Mirror run.validator: a strong ETag proves the content unchanged;
+	// otherwise fall back to Last-Modified (a weak ETag validates nothing).
+	if isStrongETag(st.ETag) {
+		if st.ETag != etag {
 			return false
 		}
-	} else if st.LastModified != lastModified {
+	} else if st.LastModified == "" || st.LastModified != lastModified {
 		return false
 	}
 	fi, err := os.Stat(partPath)
