@@ -15,7 +15,9 @@ type Info struct {
 
 // Reporter receives progress events. Implementations must be safe for
 // concurrent use and must not block: events are delivered synchronously from
-// download goroutines.
+// download goroutines. Concurrent Get calls on one Downloader are serialized
+// when a Reporter is configured, so one run's Start-through-Done event stream
+// never interleaves with another run's stream.
 //
 // Chunk ids are stable for the life of a chunk. A chunk that is split emits a
 // fresh ChunkStart for the newly created chunk and re-emits ChunkStart for

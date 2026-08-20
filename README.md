@@ -13,7 +13,7 @@
 - **CDN node racing** — when the host resolves to multiple edge nodes, each connection is pinned to one node, per-node throughput is measured (EWMA), and statistically slow nodes are abandoned for better ones
 - **Automatic resume** — progress is tracked in a `.part.json` sidecar; an interrupted download picks up where it left off, validated against the server's ETag/Last-Modified
 - **Stall detection** — a per-read timeout (adaptive on flaky links) aborts and retries hung connections; retries resume mid-range, never re-downloading bytes
-- **Safe by construction** — bytes are staged in a preallocated `.part` file written at disjoint offsets; the destination path is only created by an atomic rename after size (and optional SHA-256) verification
+- **Safe by construction** — bytes are staged in a preallocated `.part` file written at disjoint offsets; the destination path is only installed atomically after size (and optional checksum) verification, without replacing a late-created file unless overwrite is enabled
 - **Zero dependencies** — the library is pure standard library; bring your own progress UI via the `Reporter` interface (or use the `dl` CLI)
 
 ## Install
@@ -62,7 +62,7 @@ All knobs live on `download.Options`:
 dl, err := download.New(&download.Options{
     Parts:          8,                // parallel connections
     MinPartSize:    16 << 20,         // never split ranges below 2x this
-    ExpectedSHA256: "6ca0e5...",      // verify before the final rename
+    ExpectedSHA256: "6ca0e5...",      // verify before the final install
     Reporter:       myProgressUI,     // receive progress events
 })
 ```

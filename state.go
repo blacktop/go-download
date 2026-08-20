@@ -2,13 +2,15 @@ package download
 
 import (
 	"cmp"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"slices"
 )
 
-const stateVersion = 1
+const stateVersion = 2
 
 // chunkState is one incomplete range in the resume sidecar. [Off+Done, End)
 // still needs downloading; ranges of the file not covered by any chunkState
@@ -23,11 +25,24 @@ type chunkState struct {
 // download can resume.
 type stateFile struct {
 	Version      int          `json:"v"`
-	URL          string       `json:"url"`
+	SourceID     string       `json:"source_id"`
 	Size         int64        `json:"size"`
 	ETag         string       `json:"etag,omitempty"`
 	LastModified string       `json:"last_modified,omitempty"`
 	Chunks       []chunkState `json:"chunks"`
+}
+
+// sourceIdentity binds resume data to the caller's original resource URL,
+// rather than a possibly short-lived signed redirect target. Hashing avoids
+// persisting URL credentials or query tokens in the sidecar.
+func sourceIdentity(source *url.URL) string {
+	if source == nil {
+		return ""
+	}
+	u := *source
+	u.Fragment = ""
+	u.RawFragment = ""
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(u.String())))
 }
 
 func statePath(partPath string) string { return partPath + ".json" }
@@ -60,7 +75,7 @@ func loadState(path string) *stateFile {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil
 	}
-	if st.Version != stateVersion || st.Size <= 0 {
+	if st.Version != stateVersion || len(st.SourceID) != sha256.Size*2 || st.Size <= 0 {
 		return nil
 	}
 	if st.ETag == "" && st.LastModified == "" {
@@ -85,8 +100,10 @@ func loadState(path string) *stateFile {
 
 // usable reports whether the on-disk .part file is consistent with the
 // sidecar and with the validators observed from the server right now.
-func (st *stateFile) usable(partPath string, size int64, etag, lastModified string) bool {
-	if st.Size != size {
+func (st *stateFile) usable(
+	partPath, sourceID string, size int64, etag, lastModified string,
+) bool {
+	if st.SourceID != sourceID || st.Size != size {
 		return false
 	}
 	// Mirror run.validator: a strong ETag proves the content unchanged;

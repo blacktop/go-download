@@ -1,17 +1,19 @@
 package download
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func validSidecar() *stateFile {
 	return &stateFile{
-		Version: stateVersion,
-		URL:     "http://example.org/f",
-		Size:    1000,
-		ETag:    `"v1"`,
+		Version:  stateVersion,
+		SourceID: strings.Repeat("a", 64),
+		Size:     1000,
+		ETag:     `"v1"`,
 		Chunks: []chunkState{
 			{Off: 0, End: 500, Done: 200},
 			{Off: 500, End: 1000, Done: 0},
@@ -30,7 +32,7 @@ func TestStateRoundTrip(t *testing.T) {
 	if got == nil {
 		t.Fatal("loadState returned nil for a valid sidecar")
 	}
-	if got.Size != 1000 || got.ETag != `"v1"` || len(got.Chunks) != 2 {
+	if got.Size != 1000 || got.SourceID != st.SourceID || got.ETag != `"v1"` || len(got.Chunks) != 2 {
 		t.Errorf("round trip mismatch: %+v", got)
 	}
 	if got.remaining() != 800 {
@@ -56,6 +58,7 @@ func TestLoadStateRejectsInvalid(t *testing.T) {
 		mutate func(*stateFile)
 	}{
 		{"wrong version", func(st *stateFile) { st.Version = 99 }},
+		{"missing source identity", func(st *stateFile) { st.SourceID = "" }},
 		{"zero size", func(st *stateFile) { st.Size = 0 }},
 		{"no validator", func(st *stateFile) { st.ETag, st.LastModified = "", "" }},
 		{"overlapping chunks", func(st *stateFile) { st.Chunks[1].Off = 400 }},
@@ -98,40 +101,43 @@ func TestStateUsable(t *testing.T) {
 	}
 
 	st := validSidecar()
-	if !st.usable(part, 1000, `"v1"`, "") {
+	if !st.usable(part, st.SourceID, 1000, `"v1"`, "") {
 		t.Error("valid state rejected")
 	}
-	if st.usable(part, 999, `"v1"`, "") {
+	if st.usable(part, strings.Repeat("b", 64), 1000, `"v1"`, "") {
+		t.Error("source identity mismatch accepted")
+	}
+	if st.usable(part, st.SourceID, 999, `"v1"`, "") {
 		t.Error("size mismatch accepted")
 	}
-	if st.usable(part, 1000, `"v2"`, "") {
+	if st.usable(part, st.SourceID, 1000, `"v2"`, "") {
 		t.Error("etag mismatch accepted")
 	}
-	if st.usable(filepath.Join(dir, "missing.part"), 1000, `"v1"`, "") {
+	if st.usable(filepath.Join(dir, "missing.part"), st.SourceID, 1000, `"v1"`, "") {
 		t.Error("missing part file accepted")
 	}
 
 	weak := validSidecar()
 	weak.ETag = `W/"v1"`
-	if weak.usable(part, 1000, `W/"v1"`, "") {
+	if weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "") {
 		t.Error("weak etag accepted as validator")
 	}
 	// A weak ETag falls back to Last-Modified, mirroring run.validator.
 	weak.LastModified = "Mon, 02 Jan 2026 03:04:05 GMT"
-	if !weak.usable(part, 1000, `W/"v1"`, "Mon, 02 Jan 2026 03:04:05 GMT") {
+	if !weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "Mon, 02 Jan 2026 03:04:05 GMT") {
 		t.Error("weak etag with matching Last-Modified rejected")
 	}
-	if weak.usable(part, 1000, `W/"v1"`, "Tue, 03 Jan 2026 03:04:05 GMT") {
+	if weak.usable(part, weak.SourceID, 1000, `W/"v1"`, "Tue, 03 Jan 2026 03:04:05 GMT") {
 		t.Error("weak etag with changed Last-Modified accepted")
 	}
 
 	lm := validSidecar()
 	lm.ETag = ""
 	lm.LastModified = "Mon, 02 Jan 2026 03:04:05 GMT"
-	if !lm.usable(part, 1000, "", "Mon, 02 Jan 2026 03:04:05 GMT") {
+	if !lm.usable(part, lm.SourceID, 1000, "", "Mon, 02 Jan 2026 03:04:05 GMT") {
 		t.Error("matching Last-Modified rejected")
 	}
-	if lm.usable(part, 1000, "", "Tue, 03 Jan 2026 03:04:05 GMT") {
+	if lm.usable(part, lm.SourceID, 1000, "", "Tue, 03 Jan 2026 03:04:05 GMT") {
 		t.Error("changed Last-Modified accepted")
 	}
 
@@ -139,7 +145,32 @@ func TestStateUsable(t *testing.T) {
 	if err := os.Truncate(part, 500); err != nil {
 		t.Fatal(err)
 	}
-	if st.usable(part, 1000, `"v1"`, "") {
+	if st.usable(part, st.SourceID, 1000, `"v1"`, "") {
 		t.Error("truncated part file accepted")
+	}
+}
+
+func TestSourceIdentity(t *testing.T) {
+	t.Parallel()
+	a, err := url.Parse("https://example.org/file?token=secret#one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := url.Parse("https://example.org/file?token=secret#two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := url.Parse("https://example.org/file?token=other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceIdentity(a) != sourceIdentity(b) {
+		t.Error("fragments, which are not sent to the server, must not change source identity")
+	}
+	if sourceIdentity(a) == sourceIdentity(c) {
+		t.Error("different query resources received the same source identity")
+	}
+	if strings.Contains(sourceIdentity(a), "secret") {
+		t.Error("source identity exposed URL credentials")
 	}
 }

@@ -154,7 +154,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if err != nil {
 		return &permanentError{err}
 	}
-	w.r.d.applyHeaders(req)
+	w.r.applyHeaders(req)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", cursor, end-1))
 	if v := w.r.validator(); v != "" {
 		req.Header.Set("If-Range", v)
@@ -168,10 +168,12 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		s, _, _, crErr := parseContentRange(resp.Header.Get("Content-Range"))
-		if crErr != nil || s != cursor {
-			return &permanentError{fmt.Errorf("wrong Content-Range %q for cursor %d",
-				resp.Header.Get("Content-Range"), cursor)}
+		contentRange := resp.Header.Get("Content-Range")
+		s, e, total, crErr := parseContentRange(contentRange)
+		if crErr != nil || s != cursor || e != end-1 || total != w.r.total {
+			return &permanentError{fmt.Errorf(
+				"wrong Content-Range %q for requested bytes %d-%d/%d",
+				contentRange, cursor, end-1, w.r.total)}
 		}
 	case resp.StatusCode == http.StatusOK:
 		if w.r.validator() != "" {
@@ -183,6 +185,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		return errRangeIgnored
 	case isRetryableStatus(resp.StatusCode):
 		w.strikeNode()
+		w.dropNode()
 		return StatusError(resp.StatusCode)
 	default:
 		return &permanentError{StatusError(resp.StatusCode)}
@@ -300,13 +303,23 @@ func (w *worker) classify(err error, actx context.Context) error {
 }
 
 func (w *worker) bumpTimeout() {
-	w.timeout = min(w.timeout+timeoutStep, maxStallTimeout)
+	base := w.r.d.opt.Timeout
+	if w.timeout < base {
+		w.timeout = base
+	}
+	cap := max(base, maxStallTimeout)
+	if w.timeout >= cap-timeoutStep {
+		w.timeout = cap
+	} else {
+		w.timeout += timeoutStep
+	}
 	w.dtt = decayWindow
 }
 
 func (w *worker) decayTimeout() {
 	base := w.r.d.opt.Timeout
 	if w.timeout <= base {
+		w.timeout = base
 		return
 	}
 	if w.dtt > 0 {
@@ -410,7 +423,7 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	if err != nil {
 		return &permanentError{err}
 	}
-	w.r.d.applyHeaders(req)
+	w.r.applyHeaders(req)
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return w.classify(err, actx)
@@ -419,6 +432,8 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case isRetryableStatus(resp.StatusCode):
+		w.strikeNode()
+		w.dropNode()
 		return StatusError(resp.StatusCode)
 	default:
 		return &permanentError{StatusError(resp.StatusCode)}
@@ -430,14 +445,18 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
 	}
 
-	w.r.d.rep.ChunkStart(0, 0, w.r.total, 0)
+	expected := w.r.total
+	if expected < 0 && resp.ContentLength >= 0 {
+		expected = resp.ContentLength
+	}
+	w.r.d.rep.ChunkStart(0, 0, expected, 0)
 	var written int64
 	sink := func(buf []byte, d time.Duration) (bool, error) {
 		if len(buf) == 0 {
 			w.r.d.rep.ChunkProgress(0, 0, d)
 			// A zero-length body (empty file) is complete without ever
 			// delivering bytes.
-			return w.r.total >= 0 && written >= w.r.total, nil
+			return expected >= 0 && written >= expected, nil
 		}
 		if _, err := w.file.WriteAt(buf, written); err != nil {
 			return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}
@@ -447,20 +466,56 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		if len(buf) == len(w.buf) {
 			w.decayTimeout()
 		}
-		return w.r.total >= 0 && written >= w.r.total, nil
+		return expected >= 0 && written >= expected, nil
 	}
-	err = w.readLoop(resp.Body, timer, sink)
+	if expected < 0 {
+		// A plain Read preserves the distinction between a clean EOF and an
+		// unexpected EOF from a truncated chunked response. io.ReadFull, used
+		// for known-size bodies below, necessarily collapses both after a
+		// final short buffer.
+		err = w.readUnknownLoop(resp.Body, timer, sink)
+	} else {
+		err = w.readLoop(resp.Body, timer, sink)
+	}
 	switch {
 	case err == nil:
+		if w.r.total < 0 && expected >= 0 {
+			w.r.total = expected
+		}
 		w.r.d.rep.ChunkDone(0)
 		return nil
 	case errors.Is(err, io.EOF):
-		if w.r.total < 0 {
+		if expected < 0 {
+			w.r.total = written
 			w.r.d.rep.ChunkDone(0)
 			return nil // unknown length: EOF is success
 		}
 		return w.classify(errShortBody, actx)
 	default:
 		return w.classify(err, actx)
+	}
+}
+
+// readUnknownLoop reads a response with no declared length until a clean EOF.
+// Unlike readLoop, it must not use io.ReadFull: for an unknown-length body a
+// short final buffer is normal, while an unexpected EOF indicates truncation.
+func (w *worker) readUnknownLoop(body io.Reader, timer *time.Timer,
+	sink func([]byte, time.Duration) (bool, error)) error {
+	for {
+		timer.Reset(w.timeout)
+		start := time.Now()
+		n, err := body.Read(w.buf)
+		d := time.Since(start)
+		done, serr := sink(w.buf[:n], d)
+		if serr != nil {
+			return serr
+		}
+		if done {
+			timer.Stop()
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 }

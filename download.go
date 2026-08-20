@@ -46,11 +46,14 @@ type Options struct {
 	MinPartSize int64
 	// Timeout is the base per-read stall timeout. A connection that fails
 	// to fill a read buffer within it is aborted and retried; the timeout
-	// adapts upward (to 90s) on flaky links. Default 15s.
+	// adapts upward (to 90s when the base is lower) on flaky links and never
+	// drops below the configured base. Default 15s.
 	Timeout time.Duration
 	// MaxRetries is the per-chunk retry budget. Default 10.
 	MaxRetries int
-	// Headers are added to every request (User-Agent, auth, ...).
+	// Headers are added to every request (User-Agent, auth, ...). On a
+	// redirect, credentials follow net/http's policy: sensitive headers are
+	// not copied to an unrelated host.
 	Headers http.Header
 	// Jar supplies cookies to every request (session auth). Nil means no
 	// cookie handling.
@@ -67,10 +70,10 @@ type Options struct {
 	// Requests that go through a proxy disable CDN node pinning.
 	Proxy func(*http.Request) (*url.URL, error)
 	// ExpectedSHA256 is the hex-encoded checksum to verify before the
-	// final rename. Empty disables verification.
+	// final install. Empty disables verification.
 	ExpectedSHA256 string
 	// ExpectedSHA1 is the hex-encoded SHA-1 checksum to verify before the
-	// final rename (Apple's firmware APIs still publish SHA-1). Empty
+	// final install (Apple's firmware APIs still publish SHA-1). Empty
 	// disables verification. May be combined with ExpectedSHA256; the
 	// file is read once.
 	ExpectedSHA1 string
@@ -111,6 +114,11 @@ type Downloader struct {
 	base *http.Transport // nil when opt.Transport is set
 	rep  Reporter
 	log  *slog.Logger
+
+	// A Reporter has no run identifier, so configured reporter streams must
+	// not interleave across concurrent Get calls on this Downloader.
+	reportMu  sync.Mutex
+	reporting bool
 
 	// dial is the TCP dialer shared by the base and pinned transports;
 	// tests override it to fake CDN nodes.
@@ -161,13 +169,14 @@ func New(opt *Options) (*Downloader, error) {
 		}
 		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
 	}
+	reporting := o.Reporter != nil
 	if o.Reporter == nil {
 		o.Reporter = NopReporter{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
-	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger}
+	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger, reporting: reporting}
 	d.dial = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -222,19 +231,60 @@ func (d *Downloader) newClient(rt http.RoundTripper) *http.Client {
 	return &http.Client{Transport: rt, Jar: d.opt.Jar}
 }
 
-func (d *Downloader) applyHeaders(req *http.Request) {
+func (d *Downloader) applyHeaders(req *http.Request, source *url.URL) {
+	copySensitive := shouldCopySensitiveHeaders(source, req.URL)
 	for k, vs := range d.opt.Headers {
+		if !copySensitive && isSensitiveRequestHeader(k) {
+			continue
+		}
 		for _, v := range vs {
 			req.Header.Add(k, v)
 		}
 	}
 }
 
+// isSensitiveRequestHeader mirrors the header set protected by net/http
+// while following redirects.
+func isSensitiveRequestHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Authorization", "Www-Authenticate", "Cookie", "Cookie2",
+		"Proxy-Authorization", "Proxy-Authenticate":
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldCopySensitiveHeaders mirrors net/http's redirect policy: explicit
+// credentials may flow to the same host or one of its subdomains, but never
+// to an unrelated host. Invalid or non-hierarchical URLs fail closed.
+func shouldCopySensitiveHeaders(initial, dest *url.URL) bool {
+	if initial == nil || dest == nil {
+		return false
+	}
+	parent := strings.ToLower(initial.Hostname())
+	sub := strings.ToLower(dest.Hostname())
+	if parent == "" || sub == "" {
+		return false
+	}
+	if sub == parent {
+		return true
+	}
+	if strings.ContainsAny(sub, ":%") || !strings.HasSuffix(sub, parent) {
+		return false
+	}
+	return len(sub) > len(parent) && sub[len(sub)-len(parent)-1] == '.'
+}
+
 // Get downloads url to dest. dest may be an explicit file path, an existing
 // directory, or "" (filename derived from the response). The destination
-// never holds a partial file: bytes are staged in dest+".part" and renamed
+// never holds a partial file: bytes are staged in dest+".part" and installed
 // only after verification. Interrupted downloads resume automatically.
 func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error) {
+	if d.reporting {
+		d.reportMu.Lock()
+		defer d.reportMu.Unlock()
+	}
 	start := time.Now()
 	res, err := d.get(ctx, url, dest)
 	if res != nil {
@@ -245,6 +295,10 @@ func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error)
 }
 
 func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, error) {
+	sourceReq, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
 	resp, err := d.elect(ctx, rawURL)
 	if err != nil {
 		return nil, err
@@ -259,16 +313,11 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		resp.Body.Close()
 		return nil, err
 	}
-	if _, err := os.Stat(destPath); err == nil && !d.opt.Overwrite {
-		resp.Body.Close()
-		return nil, fmt.Errorf("%w: %s", ErrDestExists, destPath)
-	}
-
 	var total int64 = -1
 	multipart := false
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		if _, _, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && t > 0 {
+		if start, end, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && start == 0 && end == 0 && t > 0 {
 			total = t
 			multipart = true
 		}
@@ -287,6 +336,7 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	r := &run{
 		d:           d,
 		url:         finalURL,
+		sourceURL:   sourceReq.URL,
 		destPath:    destPath,
 		partPath:    destPath + ".part",
 		total:       total,
@@ -294,10 +344,36 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		lastMod:     lastMod,
 		contentType: contentType,
 	}
+	if multipart && r.validator() == "" && !d.checksumConfigured() {
+		multipart = false
+		// The one-byte probe's total belongs to a representation we cannot
+		// bind to the following full request. Read that request to EOF rather
+		// than truncating it to a possibly stale size.
+		r.total = -1
+		d.log.Debug("multipart disabled without validator or checksum", "url", finalURL)
+	}
+
+	unlock, err := acquireDestination(ctx, destPath)
+	if err != nil {
+		return nil, fmt.Errorf("lock destination %s: %w", destPath, err)
+	}
+	defer unlock()
+
+	if !d.opt.Overwrite {
+		if _, err := os.Lstat(destPath); err == nil {
+			return nil, fmt.Errorf("%w: %s", ErrDestExists, destPath)
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("stat destination %s: %w", destPath, err)
+		}
+	}
 	if multipart {
 		return r.multipart(ctx)
 	}
 	return r.single(ctx)
+}
+
+func (d *Downloader) checksumConfigured() bool {
+	return d.opt.ExpectedSHA256 != "" || d.opt.ExpectedSHA1 != ""
 }
 
 // elect sends the probe GET (Range: bytes=0-0, one byte) that follows
@@ -318,7 +394,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 		if err != nil {
 			return nil, fmt.Errorf("build request: %w", err)
 		}
-		d.applyHeaders(req)
+		d.applyHeaders(req, req.URL)
 		req.Header.Set("Range", "bytes=0-0")
 		resp, err := client.Do(req)
 		if err != nil {
@@ -395,8 +471,8 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// verifyAndFinalize checks the staged .part file (size, optional sha256),
-// syncs it, and atomically renames it into place.
+// verifyAndFinalize checks the staged .part file (size, optional checksums),
+// syncs it, and atomically installs it at the destination.
 func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	fi, err := file.Stat()
 	if err != nil {
@@ -439,8 +515,23 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close %s: %w", r.partPath, err)
 	}
-	if err := os.Rename(r.partPath, r.destPath); err != nil {
-		return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
+	if r.d.opt.Overwrite {
+		if err := os.Rename(r.partPath, r.destPath); err != nil {
+			return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
+		}
+	} else {
+		// Link creates the destination only if it is still absent. Unlike
+		// Rename on Unix, it can never replace a file created after the
+		// preflight check.
+		if err := os.Link(r.partPath, r.destPath); err != nil {
+			if os.IsExist(err) {
+				return nil, fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
+			}
+			return nil, fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, err)
+		}
+		if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
+			r.d.log.Debug("removing installed staging link failed", "err", err)
+		}
 	}
 	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
 		r.d.log.Debug("removing resume sidecar failed", "err", err)
@@ -496,6 +587,7 @@ func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err erro
 type run struct {
 	d           *Downloader
 	url         string
+	sourceURL   *url.URL
 	destPath    string
 	partPath    string
 	total       int64 // -1 when unknown
@@ -505,6 +597,10 @@ type run struct {
 }
 
 func (r *run) name() string { return filepath.Base(r.destPath) }
+
+func (r *run) applyHeaders(req *http.Request) {
+	r.d.applyHeaders(req, r.sourceURL)
+}
 
 // validator returns the If-Range value proving the content is unchanged
 // between requests: a strong ETag, else Last-Modified, else "".
@@ -519,15 +615,16 @@ func (r *run) validator() string {
 // server validator, loadState could never prove the content unchanged and
 // would reject the sidecar anyway.
 func (r *run) resumable() bool {
-	return r.etag != "" || r.lastMod != ""
+	return r.validator() != ""
 }
 
 // multipart downloads r.url (known size, ranges honored) with parallel
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
 	sched := newScheduler(r.d.opt.MinPartSize)
+	sourceID := sourceIdentity(r.sourceURL)
 	st := loadState(statePath(r.partPath))
-	resumed := st != nil && st.usable(r.partPath, r.total, r.etag, r.lastMod)
+	resumed := st != nil && st.usable(r.partPath, sourceID, r.total, r.etag, r.lastMod)
 
 	flag := os.O_RDWR | os.O_CREATE
 	file, err := os.OpenFile(r.partPath, flag, 0o644)
@@ -552,7 +649,7 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 		sched.addPending(0, r.total, 0)
 	}
 	st = &stateFile{
-		Version: stateVersion, URL: r.url, Size: r.total,
+		Version: stateVersion, SourceID: sourceID, Size: r.total,
 		ETag: r.etag, LastModified: r.lastMod,
 	}
 	r.d.rep.Start(Info{Name: r.name(), Total: r.total, Resumed: resumedBytes})
