@@ -3,7 +3,7 @@ module github.com/blacktop/go-download/cmd/dl
 go 1.26
 
 require (
-	github.com/blacktop/go-download v0.0.0
+	github.com/blacktop/go-download v0.1.0
 	github.com/charmbracelet/log v1.0.0
 	github.com/spf13/cobra v1.10.2
 	github.com/vbauerster/mpb/v8 v8.15.2
@@ -32,5 +32,3 @@ require (
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
-
-replace github.com/blacktop/go-download => ../..

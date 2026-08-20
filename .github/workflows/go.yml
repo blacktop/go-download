@@ -23,6 +23,11 @@ jobs:
       with:
         go-version: '1.26'
 
+    # cmd/dl requires a published library version; the workspace makes it
+    # build against this checkout's library instead.
+    - name: Init workspace
+      run: go work init . ./cmd/dl
+
     - name: Build
       run: go build -v ./...
 

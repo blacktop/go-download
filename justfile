@@ -2,6 +2,17 @@
 default:
     @just --list
 
+# One-time dev setup: workspace so cmd/dl builds against the in-tree library
+setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ ! -f go.work ]]; then
+        go work init . ./cmd/dl
+        echo "created go.work"
+    else
+        echo "go.work already exists"
+    fi
+
 # Build the library and the dl CLI
 build:
     go build ./...

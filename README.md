@@ -74,15 +74,18 @@ HTTP/3? Plug a QUIC `http.RoundTripper` (e.g. quic-go) into `Options.Transport` 
 The repo ships a `dl` command (separate module) with multi-bar progress:
 
 ```bash
-# go install ...@latest cannot build cmd/dl (its go.mod carries a local
-# replace directive), so build from a clone:
-git clone https://github.com/blacktop/go-download.git
-cd go-download/cmd/dl && go install .
+go install github.com/blacktop/go-download/cmd/dl@latest
 
 dl -p 8 --sha256 020a1e8... https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz
 ```
 
 Interrupted? Run the same command again — it resumes.
+
+## Development
+
+`cmd/dl` pins a published library version; run `just setup` once after
+cloning to create a `go.work` so it builds against the in-tree library.
+`just check` runs everything CI runs.
 
 ## License
 
