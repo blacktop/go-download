@@ -2,486 +2,565 @@ package download
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
-
-	"github.com/pkg/errors"
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
-	"golang.org/x/sync/errgroup"
 )
 
 const (
-	maxTimeout   = 180
-	maxRedirects = 10
-	refreshRate  = 200
+	defaultParts       = 8
+	defaultMinPartSize = int64(16 << 20)
+	defaultTimeout     = 15 * time.Second
+	defaultMaxRetries  = 10
+
+	// bufSize is the read-buffer size. TLS caps records at 16 KiB; a large
+	// user-space buffer amortizes the syscall and copy overhead.
+	bufSize = 512 << 10
+
+	flushEvery = time.Second
 )
 
-type Config struct {
-	Context  context.Context
-	Proxy    string
-	Insecure bool
-	CertPath string
-
-	Timeout time.Duration
-
+// Options configures a Downloader. The zero value (or nil) means defaults.
+type Options struct {
+	// Parts is the maximum number of parallel connections. Default 8.
+	// 1 disables parallelism (but keeps resume).
 	Parts int
-
-	//
-	Resume     bool
-	SkipAll    bool
-	ResumeAll  bool
-	RestartAll bool
-
-	Progress bool
-	Logger   *slog.Logger
-
-	IgnoreHash bool
-	Verbose    bool
+	// MinPartSize stops dynamic splitting: a remaining range is never
+	// split below 2x this size. Default 16 MiB.
+	MinPartSize int64
+	// Timeout is the base per-read stall timeout. A connection that fails
+	// to fill a read buffer within it is aborted and retried; the timeout
+	// adapts upward (to 90s) on flaky links. Default 15s.
+	Timeout time.Duration
+	// MaxRetries is the per-chunk retry budget. Default 10.
+	MaxRetries int
+	// Headers are added to every request (User-Agent, auth, ...).
+	Headers http.Header
+	// Transport overrides the internal HTTP/1.1 transport. Setting it
+	// disables CDN node pinning (this is the HTTP/3 escape hatch: plug in
+	// a quic-go RoundTripper here).
+	Transport http.RoundTripper
+	// TLSConfig is used by the internal transport. Ignored when Transport
+	// is set.
+	TLSConfig *tls.Config
+	// ExpectedSHA256 is the hex-encoded checksum to verify before the
+	// final rename. Empty disables verification.
+	ExpectedSHA256 string
+	// Overwrite allows replacing an existing destination file.
+	Overwrite bool
+	// Reporter receives progress events. Nil means silent.
+	Reporter Reporter
+	// Logger receives debug-level internals. Nil means discard.
+	Logger *slog.Logger
 }
 
-type Manager struct {
-	ctx  context.Context
-	conf *Config
-
-	client *http.Client
-
-	log *slog.Logger
-
-	progress     *mpb.Progress
-	totalBarIncr func(int)
-	totalCancel  func(bool)
-
-	URL           *url.URL
-	Hash          any
-	DestName      string
-	AcceptRanges  string
-	ContentType   string
-	ContentAge    string
-	ContentDate   string
-	ContentSha256 string
-	ContentSha1   string
-	ContentLength int64
-	Redirected    bool
-
-	Headers map[string]string
-
-	canResume bool
-
-	doneCount    uint32
-	size         int64
-	bytesResumed int64
-
+// Result describes a completed download.
+type Result struct {
+	// Path is the final destination path.
+	Path string
+	// Size is the downloaded size in bytes.
+	Size int64
+	// ETag and LastModified are the server validators, when present.
+	ETag         string
+	LastModified string
+	// Resumed reports whether a previous partial download was continued.
+	Resumed bool
+	// Elapsed is the wall-clock duration of this Get call.
 	Elapsed time.Duration
-	Parts   []*Part
+	// SHA256 is the hex checksum, set only when ExpectedSHA256 was verified.
+	SHA256 string
 }
 
-func New(conf *Config) (*Manager, error) {
-	if conf.Timeout == 0 {
-		conf.Timeout = 15 * time.Second
-	}
-	transport := DefaultTransport()
-	if conf.Parts != 0 {
-		transport = DefaultPooledTransport()
-	}
+// Downloader downloads files. It is safe for concurrent use.
+type Downloader struct {
+	opt  Options
+	base *http.Transport // nil when opt.Transport is set
+	rep  Reporter
+	log  *slog.Logger
 
-	transport.Proxy = GetProxy(conf.Proxy)
-	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: conf.Insecure}
+	// dial is the TCP dialer shared by the base and pinned transports;
+	// tests override it to fake CDN nodes.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// resolveHook overrides DNS resolution in tests.
+	resolveHook func(ctx context.Context, host string) ([]netip.Addr, error)
+}
 
-	if conf.CertPath != "" {
-		buf, err := os.ReadFile(conf.CertPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read cert file %s: %w", conf.CertPath, err)
+// New returns a Downloader. A nil opt selects all defaults.
+func New(opt *Options) (*Downloader, error) {
+	var o Options
+	if opt != nil {
+		o = *opt
+	}
+	if o.Parts == 0 {
+		o.Parts = defaultParts
+	}
+	if o.Parts < 1 {
+		return nil, fmt.Errorf("invalid Parts %d: must be >= 1", o.Parts)
+	}
+	if o.MinPartSize == 0 {
+		o.MinPartSize = defaultMinPartSize
+	}
+	if o.MinPartSize < 1 {
+		return nil, fmt.Errorf("invalid MinPartSize %d: must be >= 1", o.MinPartSize)
+	}
+	if o.Timeout == 0 {
+		o.Timeout = defaultTimeout
+	}
+	if o.MaxRetries == 0 {
+		o.MaxRetries = defaultMaxRetries
+	}
+	if o.ExpectedSHA256 != "" {
+		if _, err := hex.DecodeString(o.ExpectedSHA256); err != nil || len(o.ExpectedSHA256) != 64 {
+			return nil, fmt.Errorf("invalid ExpectedSHA256 %q: want 64 hex chars", o.ExpectedSHA256)
 		}
-		pool, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get system cert pool: %w", err)
+		o.ExpectedSHA256 = strings.ToLower(o.ExpectedSHA256)
+	}
+	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger}
+	if d.rep == nil {
+		d.rep = NopReporter{}
+	}
+	if d.log == nil {
+		d.log = slog.New(slog.DiscardHandler)
+	}
+	d.dial = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	if o.Transport == nil {
+		d.base = newTransport(o, d.dialContext)
+	}
+	return d, nil
+}
+
+// dialContext routes through d.dial so pinned transports and tests share one
+// dialer seam.
+func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return d.dial(ctx, network, addr)
+}
+
+// newTransport builds the internal transport: HTTP/1.1 only, because HTTP/2
+// would multiplex every parallel range request onto a single TCP connection
+// and defeat the purpose of parallel parts.
+func newTransport(o Options, dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dial,
+		Protocols:             &protocols,
+		TLSClientConfig:       o.TLSConfig,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ReadBufferSize:        bufSize,
+		MaxIdleConnsPerHost:   o.Parts + 1,
+		IdleConnTimeout:       90 * time.Second,
+	}
+}
+
+func (d *Downloader) roundTripper() http.RoundTripper {
+	if d.opt.Transport != nil {
+		return d.opt.Transport
+	}
+	return d.base
+}
+
+func (d *Downloader) applyHeaders(req *http.Request) {
+	for k, vs := range d.opt.Headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
 		}
-		if ok := pool.AppendCertsFromPEM(buf); !ok {
-			return nil, fmt.Errorf("failed to append cert from %s: %w", conf.CertPath, err)
-		}
-		transport.TLSClientConfig.RootCAs = pool
 	}
+}
 
-	mgr := &Manager{
-		conf: conf,
-		log:  conf.Logger,
-		client: &http.Client{
-			Transport: transport,
-		},
+// Get downloads url to dest. dest may be an explicit file path, an existing
+// directory, or "" (filename derived from the response). The destination
+// never holds a partial file: bytes are staged in dest+".part" and renamed
+// only after verification. Interrupted downloads resume automatically.
+func (d *Downloader) Get(ctx context.Context, url, dest string) (*Result, error) {
+	start := time.Now()
+	res, err := d.get(ctx, url, dest)
+	if res != nil {
+		res.Elapsed = time.Since(start)
 	}
+	d.rep.Done(err)
+	return res, err
+}
 
-	if conf.Context == nil {
-		mgr.ctx = context.Background()
-	} else {
-		mgr.ctx = conf.Context
-	}
-
-	if err := mgr.createProgress(); err != nil {
+func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, error) {
+	resp, err := d.elect(ctx, rawURL)
+	if err != nil {
 		return nil, err
 	}
+	finalURL := resp.Request.URL.String()
+	etag := resp.Header.Get("ETag")
+	lastMod := resp.Header.Get("Last-Modified")
 
-	return mgr, nil
+	destPath, err := resolveDest(dest, finalURL, resp.Header)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	if _, err := os.Stat(destPath); err == nil && !d.opt.Overwrite {
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: %s", ErrDestExists, destPath)
+	}
+
+	var total int64 = -1
+	multipart := false
+	if resp.StatusCode == http.StatusPartialContent {
+		if _, _, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && t > 0 {
+			total = t
+			multipart = true
+		}
+	} else if resp.ContentLength > 0 {
+		total = resp.ContentLength
+	}
+	// The election response served its purpose (final URL, headers,
+	// status); workers issue their own ranged requests.
+	resp.Body.Close()
+
+	d.log.Debug("election", "url", finalURL, "status", resp.StatusCode,
+		"total", total, "multipart", multipart, "dest", destPath)
+
+	r := &run{
+		d:        d,
+		url:      finalURL,
+		destPath: destPath,
+		partPath: destPath + ".part",
+		total:    total,
+		etag:     etag,
+		lastMod:  lastMod,
+	}
+	if multipart {
+		return r.multipart(ctx)
+	}
+	return r.single(ctx)
 }
 
-func (mgr *Manager) Get(url string) error {
-	// get URL info
-	if err := mgr.head(url); err != nil {
-		return fmt.Errorf("failed to get URL info: %w", err)
+// elect sends the probe GET (Range: bytes=0-) that follows redirects and
+// decides between multipart (206) and single-stream (200). Transient
+// failures are retried a few times.
+func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, error) {
+	if _, err := url.Parse(rawURL); err != nil {
+		return nil, fmt.Errorf("parse url: %w", err)
 	}
-	// get state of the download
-	if err := mgr.state(); err != nil {
-		return fmt.Errorf("failed to get download state: %w", err)
-	}
-
-	var eg errgroup.Group
-
-	ctx, cancel := context.WithCancel(mgr.ctx)
-	defer cancel()
-
-	for i, p := range mgr.Parts {
-		if p.isDone() {
-			atomic.AddUint32(&mgr.doneCount, 1)
+	client := &http.Client{Transport: d.roundTripper()}
+	var bo backoff
+	var lastErr error
+	for attempt := range 3 {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, bo.next()); err != nil {
+				return nil, err
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		d.applyHeaders(req)
+		req.Header.Set("Range", "bytes=0-")
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			lastErr = err
 			continue
 		}
-		p.ctx = ctx
-		p.order = i + 1
-		p.name = fmt.Sprintf("P%02d", p.order)
-		// p.maxTry = cmd.options.MaxRetry
-		p.single = len(mgr.Parts) == 1
-		p.progress = mgr.progress
-		p.totalBarIncr = mgr.totalBarIncr
-		p.logger = mgr.log
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			cancel()
-			return err
+		switch {
+		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
+			return resp, nil
+		case isRetryableStatus(resp.StatusCode):
+			resp.Body.Close()
+			lastErr = StatusError(resp.StatusCode)
+		default:
+			resp.Body.Close()
+			return nil, StatusError(resp.StatusCode)
 		}
-		p := p // https://golang.org/doc/faq#closures_and_goroutines
-		eg.Go(func() error {
-			defer func() {
-				// if e := recover(); e != nil {
-				// 	cancel()
-				// 	onceSessionHandle.Do(sessionHandle)
-				// 	panic(fmt.Sprintf("%s panic: %v", p.name, e)) // https://go.dev/play/p/55nmnsXyfSA
-				// }
-				switch {
-				case p.isDone():
-					atomic.AddUint32(&mgr.doneCount, 1)
-				case p.Skip:
-					mgr.totalCancel(true)
-				}
-			}()
-			return p.download(mgr.client, req, fmt.Sprintf("[%s:R%%02d] ", p.name))
-			// if err := p.download(mgr.client, req, fmt.Sprintf("[%s:R%%02d] ", p.name)); err != nil {
-			// 	return err
-			// }
+	}
+	return nil, fmt.Errorf("probe %s: %w", rawURL, lastErr)
+}
+
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || (code >= 500 && code < 600)
+}
+
+// parseContentRange parses "bytes start-end/total"; total may be "*" (-1).
+func parseContentRange(s string) (start, end, total int64, err error) {
+	rest, ok := strings.CutPrefix(s, "bytes ")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range %q", s)
+	}
+	rangePart, totalPart, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range %q", s)
+	}
+	if totalPart == "*" {
+		total = -1
+	} else if _, err := fmt.Sscanf(totalPart, "%d", &total); err != nil {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range total %q", s)
+	}
+	if _, err := fmt.Sscanf(rangePart, "%d-%d", &start, &end); err != nil {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
+	}
+	return start, end, total, nil
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// verifyAndFinalize checks the staged .part file (size, optional sha256),
+// syncs it, and atomically renames it into place.
+func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", r.partPath, err)
+	}
+	if r.total >= 0 && fi.Size() != r.total {
+		return nil, &SizeError{Expected: r.total, Actual: fi.Size()}
+	}
+	res := &Result{
+		Path:         r.destPath,
+		Size:         fi.Size(),
+		ETag:         r.etag,
+		LastModified: r.lastMod,
+		Resumed:      resumed,
+	}
+	if r.d.opt.ExpectedSHA256 != "" {
+		sum, err := hashFile(file)
+		if err != nil {
+			return nil, err
+		}
+		if sum != r.d.opt.ExpectedSHA256 {
+			return nil, &ChecksumError{Expected: r.d.opt.ExpectedSHA256, Actual: sum}
+		}
+		res.SHA256 = sum
+	}
+	if err := file.Sync(); err != nil {
+		return nil, fmt.Errorf("sync %s: %w", r.partPath, err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", r.partPath, err)
+	}
+	if err := os.Rename(r.partPath, r.destPath); err != nil {
+		return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
+	}
+	os.Remove(statePath(r.partPath))
+	return res, nil
+}
+
+func hashFile(file *os.File) (string, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("seek for hashing: %w", err)
+	}
+	h := sha256.New()
+	buf := make([]byte, bufSize)
+	if _, err := io.CopyBuffer(h, file, buf); err != nil {
+		return "", fmt.Errorf("hash %s: %w", file.Name(), err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// run carries the state of one Get call.
+type run struct {
+	d        *Downloader
+	url      string
+	destPath string
+	partPath string
+	total    int64 // -1 when unknown
+	etag     string
+	lastMod  string
+}
+
+func (r *run) name() string { return filepath.Base(r.destPath) }
+
+// validator returns the If-Range value proving the content is unchanged
+// between requests: a strong ETag, else Last-Modified, else "".
+func (r *run) validator() string {
+	if isStrongETag(r.etag) {
+		return r.etag
+	}
+	return r.lastMod
+}
+
+// multipart downloads r.url (known size, ranges honored) with parallel
+// workers, dynamic chunk splitting, and resume.
+func (r *run) multipart(ctx context.Context) (*Result, error) {
+	sched := newScheduler(r.d.opt.MinPartSize)
+	st := loadState(statePath(r.partPath))
+	resumed := st != nil && st.usable(r.partPath, r.total, r.etag, r.lastMod)
+
+	flag := os.O_RDWR | os.O_CREATE
+	file, err := os.OpenFile(r.partPath, flag, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
+	}
+	defer file.Close()
+
+	var resumedBytes int64
+	if resumed {
+		for _, c := range st.Chunks {
+			if c.Done < c.End-c.Off {
+				sched.addPending(c.Off, c.End, c.Done)
+			}
+		}
+		resumedBytes = r.total - st.remaining()
+		r.d.log.Debug("resuming", "bytes", resumedBytes, "chunks", len(st.Chunks))
+	} else {
+		if err := file.Truncate(r.total); err != nil {
+			return nil, fmt.Errorf("preallocate %s: %w", r.partPath, err)
+		}
+		sched.addPending(0, r.total, 0)
+	}
+	st = &stateFile{
+		Version: stateVersion, URL: r.url, Size: r.total,
+		ETag: r.etag, LastModified: r.lastMod,
+	}
+	r.d.rep.Start(Info{Name: r.name(), Total: r.total, Resumed: resumedBytes})
+
+	err = r.runWorkers(ctx, sched, file, st)
+	if err != nil {
+		// Leave .part and sidecar in place for a future resume.
+		st.Chunks = sched.snapshot()
+		if serr := st.save(statePath(r.partPath)); serr != nil {
+			r.d.log.Debug("saving resume state failed", "err", serr)
+		}
+		return nil, err
+	}
+	return r.verifyAndFinalize(file, resumed)
+}
+
+// runWorkers drives the worker pool and the periodic sidecar flusher,
+// returning the first real error (or the context's cause).
+func (r *run) runWorkers(ctx context.Context, sched *scheduler, file *os.File, st *stateFile) error {
+	runCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	var picker *picker
+	if r.d.pinningEnabled(r.url) {
+		u, err := url.Parse(r.url)
+		if err == nil {
+			picker = newPicker(u.Hostname(), portOf(u), r.d.log)
+			if r.d.resolveHook != nil {
+				picker.resolve = r.d.resolveHook
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var once sync.Once
+	fail := func(err error) {
+		once.Do(func() {
+			firstErr = err
+			cancel(err)
+		})
+	}
+	for i := range r.d.opt.Parts {
+		w := newWorker(i, r, sched, file, picker)
+		wg.Go(func() {
+			if err := w.run(runCtx); err != nil {
+				fail(err)
+			}
 		})
 	}
 
-	if err := eg.Wait(); err != nil {
-		return err
-	}
-
-	return mgr.concatenateParts()
-}
-
-func (mgr *Manager) state() error {
-	if mgr.resumable() {
-		if f, err := os.Stat(mgr.DestName + ".download"); !os.IsNotExist(err) {
-			mgr.size = f.Size()
-		} else {
-			if err := mgr.createParts(); err != nil {
-				return fmt.Errorf("failed to create download parts: %w", err)
-			}
-		}
-	} else {
-		if err := mgr.createParts(); err != nil {
-			return fmt.Errorf("failed to create download parts: %w", err)
-		}
-	}
-	return nil
-}
-
-func (mgr *Manager) head(url string) error {
-	mgr.log.Debug("HEAD", "url", url)
-
-	var redirected bool
-	defer func() {
-		if redirected {
-			mgr.client.CloseIdleConnections()
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	return RetryWithContext(ctx, 3, Backoff(500*time.Millisecond), func() error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-		if err != nil {
-			return err
-		}
-
-		for k, v := range mgr.Headers {
-			mgr.log.Debug("Headers", k, v)
-			req.Header.Set(k, v)
-		}
-
-		resp, err := mgr.client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode >= 400 {
-			return errors.New(resp.Status)
-		}
-
-		// if cookies := jar.Cookies(req.URL); len(cookies) != 0 {
-		// 	mgr.log.Println("CookieJar:")
-		// 	for _, cookie := range cookies {
-		// 		mgr.log.Printf("  %q", cookie)
-		// 	}
-		// }
-
-		if resp.StatusCode > 299 && resp.StatusCode < 400 {
-			redirected = true
-			loc, err := resp.Location()
-			if err != nil {
-				return err
-			}
-			url = loc.String()
-			if resp.Body != nil {
-				resp.Body.Close()
-			}
-			return errors.New("Redirected")
-		}
-
-		mgr.URL = resp.Request.URL
-		mgr.AcceptRanges = resp.Header.Get("Accept-Ranges")
-		mgr.ContentType = resp.Header.Get("Content-Type")
-		mgr.ContentAge = resp.Header.Get("Age")
-		mgr.ContentDate = resp.Header.Get("Date")
-		mgr.ContentSha256 = resp.Header.Get("x-amz-meta-digest-sha256")
-		mgr.ContentSha1 = resp.Header.Get("x-amz-meta-digest-sh1")
-		mgr.ContentLength = resp.ContentLength
-
-		if mgr.DestName == "" {
-			mgr.DestName = path.Base(req.URL.Path)
-		}
-
-		return nil
-	})
-}
-
-func (mgr *Manager) resumable() bool {
-	return strings.EqualFold(mgr.AcceptRanges, "bytes") && mgr.ContentLength > 0
-}
-
-func (mgr *Manager) written() int64 {
-	var total int64
-	for _, p := range mgr.Parts {
-		total += p.Written
-	}
-	return total
-}
-
-func (mgr *Manager) createParts() error {
-	if mgr.conf.Parts == 0 {
-		mgr.conf.Parts = 1
-	} else if !mgr.resumable() {
-		mgr.conf.Parts = 1
-	}
-
-	fragment := mgr.ContentLength / int64(mgr.conf.Parts)
-	if mgr.conf.Parts != 1 && fragment < 64 {
-		return errors.New("Too fragmented")
-	}
-
-	mgr.Parts = make([]*Part, mgr.conf.Parts)
-	mgr.Parts[0] = &Part{
-		FileName: mgr.DestName,
-	}
-
-	var stop int64
-	start := mgr.ContentLength
-	for i := mgr.conf.Parts - 1; i > 0; i-- {
-		stop = start - 1
-		start = stop - fragment
-		mgr.Parts[i] = &Part{
-			FileName: fmt.Sprintf("%s.%02d", mgr.DestName, i),
-			Start:    start,
-			Stop:     stop,
-		}
-	}
-
-	mgr.Parts[0].Stop = start - 1
-
-	return nil
-}
-
-func (mgr *Manager) createProgress() error {
-	if mgr.conf.Progress {
-		mgr.progress = mpb.NewWithContext(mgr.ctx,
-			mpb.WithOutput(os.Stdout),
-			mpb.WithDebugOutput(io.Discard),
-			mpb.WithRefreshRate(refreshRate*time.Millisecond),
-			mpb.WithWidth(64),
-		)
-		bar, err := mgr.progress.Add(mgr.ContentLength,
-			barRefiller(barStyle()).Build(),
-			mpb.BarFillerTrim(),
-			mpb.BarExtender(mpb.BarFillerFunc(
-				func(w io.Writer, _ decor.Statistics) error {
-					_, err := fmt.Fprintln(w)
-					return err
-				}), true),
-			mpb.PrependDecorators(
-				decor.Any(func(_ decor.Statistics) string {
-					return fmt.Sprintf("Total(%d/%d)", atomic.LoadUint32(&mgr.doneCount), len(mgr.Parts))
-				}, decor.WCSyncWidthR),
-				decor.OnComplete(decor.NewPercentage("%.2f", decor.WCSyncSpace), "100%"),
-			),
-			mpb.AppendDecorators(
-				decor.OnCompleteOrOnAbort(decor.AverageETA(decor.ET_STYLE_MMSS, decor.WCSyncWidth), ":"),
-				decor.AverageSpeed(decor.SizeB1024(0), "%.1f", decor.WCSyncSpace),
-				decor.Name("", decor.WCSyncSpace),
-				decor.Name("", decor.WCSyncSpace),
-			),
-		)
-		if err != nil {
-			return err
-		}
-		if written := mgr.written(); written != 0 {
-			bar.SetCurrent(written)
-			bar.SetRefill(written)
-			bar.DecoratorAverageAdjust(time.Now().Add(-mgr.Elapsed))
-		}
-		ch := make(chan int, len(mgr.Parts)-int(atomic.LoadUint32(&mgr.doneCount)))
-		ctx, cancel := context.WithCancel(mgr.ctx)
-		dropCtx, dropCancel := context.WithCancel(context.Background())
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for {
-				select {
-				case n := <-ch:
-					bar.IncrBy(n)
-				case <-dropCtx.Done():
-					cancel()
-					bar.Abort(true)
-					return
-				case <-ctx.Done():
-					dropCancel()
-					bar.Abort(false)
-					return
+	flushDone := make(chan struct{})
+	go func() {
+		defer close(flushDone)
+		t := time.NewTicker(flushEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-t.C:
+				st.Chunks = sched.snapshot()
+				if err := st.save(statePath(r.partPath)); err != nil {
+					r.d.log.Debug("flush resume state failed", "err", err)
 				}
 			}
-		}()
-		mgr.totalBarIncr = func(n int) {
-			select {
-			case ch <- n:
-			case <-done:
-			}
 		}
-		mgr.totalCancel = func(drop bool) {
-			if drop {
-				dropCancel()
-			} else {
-				cancel()
-			}
-		}
-	} else {
-		mgr.progress = nil
-		mgr.totalBarIncr = func(n int) {}    // NOP
-		mgr.totalCancel = func(drop bool) {} // NOP
+	}()
+
+	wg.Wait()
+	cancel(nil)
+	<-flushDone
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if !sched.idle() {
+		return errors.New("internal: workers exited with work remaining")
 	}
 	return nil
 }
 
-func (mgr *Manager) concatenateParts() (err error) {
-	if len(mgr.Parts) < 2 {
-		return nil
+// pinningEnabled reports whether per-node connection pinning applies: it
+// requires the internal transport and no proxy for the target URL.
+func (d *Downloader) pinningEnabled(rawURL string) bool {
+	if d.base == nil {
+		return false
 	}
-
-	if mgr.written() != mgr.ContentLength {
-		return fmt.Errorf("size mismatch: expected %d got %d", mgr.ContentLength, mgr.written())
-	}
-
-	var bar *mpb.Bar
-	if mgr.progress != nil {
-		bar, err = mgr.progress.Add(int64(len(mgr.Parts)-1),
-			barStyle().Build(),
-			mpb.BarFillerTrim(),
-			mpb.BarPriority(len(mgr.Parts)+1),
-			mpb.PrependDecorators(
-				decor.Name("Concatenating", decor.WCSyncWidthR),
-				decor.NewPercentage("%d", decor.WCSyncSpace),
-			),
-			mpb.AppendDecorators(
-				decor.OnComplete(decor.AverageETA(decor.ET_STYLE_MMSS, decor.WCSyncWidth), ":"),
-				decor.Name("", decor.WCSyncSpace),
-				decor.Name("", decor.WCSyncSpace),
-				decor.Name("", decor.WCSyncSpace),
-			),
-		)
-		if err != nil {
-			return err
-		}
-	}
-
-	fpart0, err := os.OpenFile(mgr.Parts[0].FileName, os.O_APPEND|os.O_WRONLY, 0644)
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return err
+		return false
 	}
-	defer func() {
-		if e := fpart0.Close(); err == nil {
-			err = e
-		}
-		if bar != nil {
-			bar.Abort(false) // if bar is completed bar.Abort is nop
-		}
-	}()
-
-	for i := 1; i < len(mgr.Parts); i++ {
-		if !mgr.Parts[i].Skip {
-			fparti, err := os.Open(mgr.Parts[i].FileName)
-			if err != nil {
-				return err
-			}
-			mgr.log.Info(fmt.Sprintf("concatenating: %q into %q", fparti.Name(), fpart0.Name()))
-			if _, err = io.Copy(fpart0, fparti); err != nil {
-				return err
-			}
-			if err := fparti.Close(); err != nil {
-				return err
-			}
-			if err = os.Remove(fparti.Name()); err != nil {
-				return err
-			}
-		}
-		if bar != nil {
-			bar.Increment()
+	if d.base.Proxy != nil {
+		if proxyURL, err := d.base.Proxy(req); err != nil || proxyURL != nil {
+			return false
 		}
 	}
+	return true
+}
 
-	if stat, err := fpart0.Stat(); err != nil {
-		return err
-	} else {
-		if mgr.written() != stat.Size() {
-			return fmt.Errorf("total bytes written != stat.Size()")
-		}
+func portOf(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
 	}
+	if u.Scheme == "http" {
+		return "80"
+	}
+	return "443"
+}
 
-	return nil
+// single downloads r.url over one sequential stream (server ignored Range or
+// size is unknown). No resume: a retry restarts from byte zero.
+func (r *run) single(ctx context.Context) (*Result, error) {
+	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
+	}
+	defer file.Close()
+	os.Remove(statePath(r.partPath)) // stale sidecar from an older multipart run
+
+	r.d.rep.Start(Info{Name: r.name(), Total: r.total})
+	w := newWorker(0, r, nil, file, nil)
+	if err := w.singleStream(ctx); err != nil {
+		return nil, err
+	}
+	return r.verifyAndFinalize(file, false)
 }

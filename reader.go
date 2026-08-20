@@ -1,5 +1,0 @@
-package download
-
-func NewRangeReader() {
-
-}

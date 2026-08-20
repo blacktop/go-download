@@ -1,5 +1,5 @@
 /*
-Copyright © 2024 blacktop
+Copyright © 2026 blacktop
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -23,67 +23,135 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/blacktop/go-download"
-	"github.com/charmbracelet/log"
+	charmlog "github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
 )
 
-func init() {
-	rootCmd.Flags().BoolP("verbose", "V", false, "verbose output")
-	rootCmd.Flags().BoolP("progress", "b", false, "progress bar")
-	rootCmd.Flags().IntP("parts", "p", 1, "number of parts")
+var log = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
+	ReportTimestamp: true,
+	TimeFormat:      time.Kitchen,
+})
+
+var flags struct {
+	output   string
+	parts    int
+	timeout  time.Duration
+	retries  int
+	headers  []string
+	sha256   string
+	force    bool
+	quiet    bool
+	insecure bool
+	verbose  bool
 }
 
-// rootCmd represents the base command when called without any subcommands
+func init() {
+	rootCmd.Flags().StringVarP(&flags.output, "output", "o", "", "output file or directory (default: derived from URL)")
+	rootCmd.Flags().IntVarP(&flags.parts, "parts", "p", 8, "number of parallel connections")
+	rootCmd.Flags().DurationVar(&flags.timeout, "timeout", 0, "per-read stall timeout (default 15s)")
+	rootCmd.Flags().IntVar(&flags.retries, "retries", 0, "per-chunk retry budget (default 10)")
+	rootCmd.Flags().StringArrayVarP(&flags.headers, "header", "H", nil, "extra header, 'Key: Value' (repeatable)")
+	rootCmd.Flags().StringVar(&flags.sha256, "sha256", "", "expected sha256 (hex); verified before rename")
+	rootCmd.Flags().BoolVarP(&flags.force, "force", "f", false, "overwrite existing destination")
+	rootCmd.Flags().BoolVarP(&flags.quiet, "quiet", "q", false, "no progress output")
+	rootCmd.Flags().BoolVar(&flags.insecure, "insecure", false, "skip TLS certificate verification")
+	rootCmd.Flags().BoolVarP(&flags.verbose, "verbose", "V", false, "verbose output")
+}
+
 var rootCmd = &cobra.Command{
-	Use:           "dl",
-	Short:         "Download a file from the internet in parts",
+	Use:           "dl <url>",
+	Short:         "Download a file as fast as possible: parallel parts, CDN node racing, resume",
 	Args:          cobra.ExactArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if flags.verbose {
+			log.SetLevel(charmlog.DebugLevel)
+		}
 
-		// flags
-		verbose, _ := cmd.Flags().GetBool("verbose")
-		progress, _ := cmd.Flags().GetBool("progress")
-		parts, _ := cmd.Flags().GetInt("parts")
+		headers, err := parseHeaders(flags.headers)
+		if err != nil {
+			return err
+		}
 
-		logger := log.NewWithOptions(os.Stdout, log.Options{
-			ReportCaller:    true,
-			ReportTimestamp: true,
-			TimeFormat:      time.Kitchen,
-			Prefix:          "Downloading ⬇️",
-		})
-		if verbose {
-			logger.SetLevel(log.DebugLevel)
+		opt := &download.Options{
+			Parts:          flags.parts,
+			Timeout:        flags.timeout,
+			MaxRetries:     flags.retries,
+			Headers:        headers,
+			ExpectedSHA256: flags.sha256,
+			Overwrite:      flags.force,
+			Logger:         slog.New(log),
+		}
+		if flags.insecure {
+			opt.TLSConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- user opted in
+		}
+		if !flags.quiet {
+			opt.Reporter = newMpbReporter()
+		}
+
+		dl, err := download.New(opt)
+		if err != nil {
+			return err
 		}
 
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
-		mgr, err := download.New(&download.Config{
-			Context:  ctx,
-			Logger:   slog.New(logger),
-			Progress: progress,
-			Verbose:  verbose,
-			Parts:    parts,
-		})
+		res, err := dl.Get(ctx, args[0], flags.output)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				log.Warn("interrupted — rerun the same command to resume")
+			}
 			return err
 		}
 
-		return mgr.Get(args[0])
+		speed := float64(res.Size) / max(res.Elapsed.Seconds(), 0.001) / (1 << 20)
+		summary := []any{
+			"path", res.Path,
+			"size", fmt.Sprintf("%.1f MiB", float64(res.Size)/(1<<20)),
+			"elapsed", res.Elapsed.Round(time.Millisecond),
+			"speed", fmt.Sprintf("%.1f MiB/s", speed),
+		}
+		if res.Resumed {
+			summary = append(summary, "resumed", true)
+		}
+		if res.SHA256 != "" {
+			summary = append(summary, "sha256", "verified")
+		}
+		log.Info("downloaded", summary...)
+		return nil
 	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
+func parseHeaders(raw []string) (http.Header, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	h := make(http.Header, len(raw))
+	for _, kv := range raw {
+		k, v, ok := strings.Cut(kv, ":")
+		if !ok || strings.TrimSpace(k) == "" {
+			return nil, fmt.Errorf("invalid header %q: want 'Key: Value'", kv)
+		}
+		h.Add(strings.TrimSpace(k), strings.TrimSpace(v))
+	}
+	return h, nil
+}
+
+// Execute runs the root command. Called once from main.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		log.Error(err.Error())

@@ -24,3 +24,7 @@ go.work.sum
 # Test files
 *.ipsw
 *.ipsw.*
+
+# Download staging artifacts
+*.part
+*.part.json
