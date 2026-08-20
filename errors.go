@@ -14,6 +14,8 @@ var (
 	// ErrDestExists is returned when the destination file already exists
 	// and Options.Overwrite is false.
 	ErrDestExists = errors.New("destination exists")
+
+	errURLDetailsRedacted = errors.New("request failed (url details redacted)")
 )
 
 // StatusError is an unexpected, non-retryable HTTP status code.
@@ -53,14 +55,15 @@ func (e *SizeError) Error() string {
 // redactURL strips credentials from a URL before it lands in an error or a
 // log line: userinfo, query (signed URLs carry access keys there —
 // url.URL.Redacted only hides the password), and fragment. An unparseable
-// input is replaced wholesale since it cannot be safely partitioned.
+// input, opaque URL, or non-hierarchical HTTP URL is replaced wholesale since
+// it cannot be safely partitioned.
 func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" || invalidHTTPURLShape(u) {
+		return "(redacted invalid url)"
+	}
 	if !strings.ContainsAny(raw, "@?#") {
 		return raw // nothing that can carry credentials
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "(redacted invalid url)"
 	}
 	u.User = nil
 	if u.RawQuery != "" {
@@ -70,25 +73,47 @@ func redactURL(raw string) string {
 	return u.String()
 }
 
-// redactErr rewrites the URL field of the *url.Error in err's chain (both
-// net/http transport errors and url.Parse failures carry the full URL there,
-// signed query included); we own these error values, so mutating is safe.
-// URLs frozen into inner message text are not covered, and neither are
-// messages already rendered: it must run BEFORE fmt.Errorf("%w") wrapping,
-// which formats eagerly.
+// redactErr rewrites the URL field of the *url.Error in err's chain. Some
+// net/http failures, notably malformed redirects, have already rendered a
+// peer-controlled URL into the inner error text. Replace those messages so
+// the sensitive text is not reachable through the returned error chain.
 func redactErr(err error) error {
 	if uerr, ok := errors.AsType[*url.Error](err); ok {
 		uerr.URL = redactURL(uerr.URL)
+		if uerr.Err != nil && containsUnsafeURLDetails(uerr.Err.Error()) {
+			uerr.Err = errURLDetailsRedacted
+		}
 	}
 	return err
 }
 
-// parseURL is url.Parse with a redacted failure: the returned *url.Error
-// would otherwise re-render the raw URL (credentials included) through %w.
+func containsUnsafeURLDetails(message string) bool {
+	message = strings.ToLower(message)
+	return strings.ContainsAny(message, "@?#") ||
+		strings.Contains(message, "http:") || strings.Contains(message, "https:")
+}
+
+func invalidHTTPURLShape(u *url.URL) bool {
+	if u == nil {
+		return true
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return u.Opaque != "" || u.Host == ""
+	default:
+		return false
+	}
+}
+
+// parseURL is url.Parse with a redacted failure and rejects HTTP URL shapes
+// that net/http cannot request safely.
 func parseURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, redactErr(err)
+	}
+	if invalidHTTPURLShape(u) {
+		return nil, errors.New("invalid URL: HTTP URLs must be hierarchical and include a host")
 	}
 	return u, nil
 }

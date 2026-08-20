@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -47,6 +48,16 @@ func TestRedactURL(t *testing.T) {
 			in:   "http://bad url\x7f?key=secret",
 			want: "(redacted invalid url)",
 		},
+		{
+			name: "opaque http url",
+			in:   "https:user:pass@host/path",
+			want: "(redacted invalid url)",
+		},
+		{
+			name: "hostless http url",
+			in:   "https:/path?accessKey=secret",
+			want: "(redacted invalid url)",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -55,6 +66,28 @@ func TestRedactURL(t *testing.T) {
 				t.Errorf("redactURL(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRedactErrHidesUnsafeInnerMessage(t *testing.T) {
+	t.Parallel()
+	cause := errors.New(`failed to parse Location header "https://cdn.test/%zz?accessKey=secret"`)
+	uerr := &url.Error{
+		Op:  "Get",
+		URL: "https://origin.test/start",
+		Err: cause,
+	}
+
+	got := redactErr(uerr)
+	msg := got.Error()
+	if strings.Contains(msg, "secret") {
+		t.Fatalf("redacted error still leaks inner URL details: %q", got)
+	}
+	if !strings.Contains(msg, "url details redacted") {
+		t.Fatalf("redacted error does not explain the omitted details: %q", got)
+	}
+	if errors.Is(got, cause) {
+		t.Fatal("unsafe inner error remains reachable after redaction")
 	}
 }
 
@@ -116,5 +149,50 @@ func TestGetErrorNeverLeaksUnparseableURL(t *testing.T) {
 	}
 	if msg := err.Error(); strings.Contains(msg, "secret") {
 		t.Fatalf("parse error leaks signed query params: %q", msg)
+	}
+}
+
+func TestGetErrorNeverLeaksMalformedRedirect(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "https://cdn.test/%zz?accessKey=secret")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newDL(t, nil)
+	_, err := d.Get(t.Context(), srv.URL+"/start", "")
+	if err == nil {
+		t.Fatal("expected malformed redirect error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "secret") || strings.Contains(msg, "accessKey") {
+		t.Fatalf("redirect error leaks signed query params: %q", msg)
+	}
+}
+
+func TestGetErrorNeverLeaksNonHierarchicalURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		rawURL string
+	}{
+		{name: "opaque", rawURL: "https:user:pass@host/path"},
+		{name: "missing host", rawURL: "https:/user:pass/path?accessKey=secret"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := newDL(t, nil)
+			_, err := d.Get(t.Context(), tc.rawURL, "")
+			if err == nil {
+				t.Fatal("expected invalid URL error")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, "user:pass") || strings.Contains(msg, "accessKey") ||
+				strings.Contains(msg, "host/path") {
+				t.Fatalf("invalid URL error leaks credentials: %q", msg)
+			}
+		})
 	}
 }
