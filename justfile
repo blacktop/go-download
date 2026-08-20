@@ -32,15 +32,26 @@ install:
 
 # Bump version: tag the library and CLI modules, then push
 # (Go has no version file to edit — modules version via git tags,
-# and the cmd/dl module needs its own cmd/dl/vX.Y.Z tag)
-bump:
+# and the cmd/dl module needs its own cmd/dl/vX.Y.Z tag).
+# TAG defaults to the next patch (svu); pass one to override: `just bump v1.2.0`
+bump tag="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -n "$(git status --porcelain)" ]]; then
         echo "working tree dirty — commit or stash first" >&2
         exit 1
     fi
-    TAG="$(svu patch)"
+    TAG="{{tag}}"
+    if [[ -z "$TAG" ]]; then
+        TAG="$(svu patch)"
+    elif [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+        echo "invalid tag '$TAG' — want semver like v1.2.3" >&2
+        exit 1
+    fi
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+        echo "tag $TAG already exists" >&2
+        exit 1
+    fi
     git tag -a "$TAG" -m "Release $TAG"
     git tag -a "cmd/dl/$TAG" -m "Release dl $TAG"
     git push && git push --tags
