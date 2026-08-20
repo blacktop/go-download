@@ -91,6 +91,10 @@ type Result struct {
 	// ETag and LastModified are the server validators, when present.
 	ETag         string
 	LastModified string
+	// ContentType is the Content-Type header of the initial probe
+	// response, when present. Useful for detecting servers that answer a
+	// dead link with a 200 HTML error page instead of the real file.
+	ContentType string
 	// Resumed reports whether a previous partial download was continued.
 	Resumed bool
 	// Elapsed is the wall-clock duration of this Get call.
@@ -248,6 +252,7 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	finalURL := resp.Request.URL.String()
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
+	contentType := resp.Header.Get("Content-Type")
 
 	destPath, err := resolveDest(dest, finalURL, resp.Header)
 	if err != nil {
@@ -280,13 +285,14 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 		"total", total, "multipart", multipart, "dest", destPath)
 
 	r := &run{
-		d:        d,
-		url:      finalURL,
-		destPath: destPath,
-		partPath: destPath + ".part",
-		total:    total,
-		etag:     etag,
-		lastMod:  lastMod,
+		d:           d,
+		url:         finalURL,
+		destPath:    destPath,
+		partPath:    destPath + ".part",
+		total:       total,
+		etag:        etag,
+		lastMod:     lastMod,
+		contentType: contentType,
 	}
 	if multipart {
 		return r.multipart(ctx)
@@ -404,6 +410,7 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		Size:         fi.Size(),
 		ETag:         r.etag,
 		LastModified: r.lastMod,
+		ContentType:  r.contentType,
 		Resumed:      resumed,
 	}
 	if r.d.opt.ExpectedSHA256 != "" || r.d.opt.ExpectedSHA1 != "" {
@@ -487,13 +494,14 @@ func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err erro
 
 // run carries the state of one Get call.
 type run struct {
-	d        *Downloader
-	url      string
-	destPath string
-	partPath string
-	total    int64 // -1 when unknown
-	etag     string
-	lastMod  string
+	d           *Downloader
+	url         string
+	destPath    string
+	partPath    string
+	total       int64 // -1 when unknown
+	etag        string
+	lastMod     string
+	contentType string // from the election probe response
 }
 
 func (r *run) name() string { return filepath.Base(r.destPath) }

@@ -98,6 +98,45 @@ func TestGetSingleStream(t *testing.T) {
 	assertClean(t, dest)
 }
 
+// withContentType sets a Content-Type header before delegating, overriding
+// whatever the inner handler would sniff.
+func withContentType(ct string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", ct)
+		h.ServeHTTP(w, r)
+	})
+}
+
+func TestResultContentType(t *testing.T) {
+	t.Parallel()
+	data := testData(64 << 10)
+	const ct = "application/x-apple-diskimage"
+
+	t.Run("multipart", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(withContentType(ct, rangeHandler(data, `"v1"`, &st)))
+		defer srv.Close()
+		d := newDL(t, &Options{Parts: 2, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
+		if res.ContentType != ct {
+			t.Errorf("ContentType = %q, want %q", res.ContentType, ct)
+		}
+	})
+
+	t.Run("single stream", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(withContentType("text/html; charset=UTF-8", plainHandler(data, &st)))
+		defer srv.Close()
+		d := newDL(t, nil)
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
+		if res.ContentType != "text/html; charset=UTF-8" {
+			t.Errorf("ContentType = %q, want text/html", res.ContentType)
+		}
+	})
+}
+
 func TestGetUnknownLength(t *testing.T) {
 	t.Parallel()
 	data := testData(150 << 10)
