@@ -3,6 +3,7 @@ package download
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -323,7 +324,7 @@ func TestResume(t *testing.T) {
 	fullRefetches := 0
 	for i, s := range phase2 {
 		if i == 0 {
-			continue // election probe is always bytes=0-
+			continue // election probe is always bytes=0-0
 		}
 		if s == 0 {
 			fullRefetches++
@@ -427,6 +428,91 @@ func TestSHA256Verification(t *testing.T) {
 		if _, err := os.Stat(dest); !os.IsNotExist(err) {
 			t.Error("mismatched file must not be renamed into place")
 		}
+		// The staged bytes are proven bad: resuming them could never
+		// succeed, so they must be discarded.
+		assertClean(t, dest)
+	})
+}
+
+func TestSHA1Verification(t *testing.T) {
+	t.Parallel()
+	data := testData(64 << 10)
+	sum1 := sha1.Sum(data)
+	hexSum1 := hex.EncodeToString(sum1[:])
+	sum256 := sha256.Sum256(data)
+	hexSum256 := hex.EncodeToString(sum256[:])
+	var st stats
+	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	t.Cleanup(srv.Close)
+
+	t.Run("match", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		d := newDL(t, &Options{ExpectedSHA1: hexSum1, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
+		if res.SHA1 != hexSum1 {
+			t.Errorf("Result.SHA1 = %q, want %q", res.SHA1, hexSum1)
+		}
+	})
+
+	t.Run("both algorithms", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		d := newDL(t, &Options{ExpectedSHA1: hexSum1, ExpectedSHA256: hexSum256, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
+		if res.SHA1 != hexSum1 || res.SHA256 != hexSum256 {
+			t.Errorf("Result checksums = (%q, %q), want (%q, %q)", res.SHA1, res.SHA256, hexSum1, hexSum256)
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		bad := "0000000000000000000000000000000000000000"
+		d := newDL(t, &Options{ExpectedSHA1: bad, MinPartSize: 4 << 10})
+		_, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
+		var ce *ChecksumError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected ChecksumError, got %v", err)
+		}
+		if ce.Algo != "sha1" {
+			t.Errorf("ChecksumError.Algo = %q, want sha1", ce.Algo)
+		}
+		if _, err := os.Stat(dest); !os.IsNotExist(err) {
+			t.Error("mismatched file must not be renamed into place")
+		}
+	})
+}
+
+func TestGetEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("range server answers the probe with 416", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(rangeHandler(nil, `"v1"`, &st))
+		defer srv.Close()
+		dest := filepath.Join(t.TempDir(), "empty.bin")
+		d := newDL(t, nil)
+		res, got := mustGet(t, d, srv.URL+"/empty.bin", dest)
+		if res.Size != 0 || len(got) != 0 {
+			t.Errorf("Size = %d, body = %d bytes; want an empty file", res.Size, len(got))
+		}
+		assertClean(t, dest)
+	})
+
+	t.Run("plain server", func(t *testing.T) {
+		t.Parallel()
+		var st stats
+		srv := httptest.NewServer(plainHandler(nil, &st))
+		defer srv.Close()
+		dest := filepath.Join(t.TempDir(), "empty.bin")
+		d := newDL(t, nil)
+		res, got := mustGet(t, d, srv.URL+"/empty.bin", dest)
+		if res.Size != 0 || len(got) != 0 {
+			t.Errorf("Size = %d, body = %d bytes; want an empty file", res.Size, len(got))
+		}
+		assertClean(t, dest)
 	})
 }
 
@@ -465,8 +551,17 @@ func TestOptionsValidation(t *testing.T) {
 	if _, err := New(&Options{MinPartSize: -5}); err == nil {
 		t.Error("negative MinPartSize must error")
 	}
+	if _, err := New(&Options{MaxRetries: -1}); err == nil {
+		t.Error("negative MaxRetries must error (would retry forever)")
+	}
+	if _, err := New(&Options{Timeout: -time.Second}); err == nil {
+		t.Error("negative Timeout must error (would stall instantly)")
+	}
 	if _, err := New(&Options{ExpectedSHA256: "xyz"}); err == nil {
 		t.Error("bad sha256 must error")
+	}
+	if _, err := New(&Options{ExpectedSHA1: "xyz"}); err == nil {
+		t.Error("bad sha1 must error")
 	}
 	d, err := New(nil)
 	if err != nil {

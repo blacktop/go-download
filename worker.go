@@ -95,7 +95,8 @@ func (w *worker) run(ctx context.Context) error {
 // Every attempt recomputes its Range from the claim cursor, so a retry never
 // re-downloads written bytes.
 func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
-	for attempt := 0; ; attempt++ {
+	attempt := 0
+	for {
 		err := w.attempt(ctx, c)
 		if err == nil {
 			w.sched.complete(c)
@@ -108,12 +109,22 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 		if perm, ok := errors.AsType[*permanentError](err); ok {
 			return fmt.Errorf("chunk %d: %w", c.id, perm.err)
 		}
-		if attempt+1 >= w.r.d.opt.MaxRetries {
+		if errors.Is(err, errCulled) {
+			// Abandoning a statistically slow node for a better one is
+			// progress, not failure: it costs no retry budget and needs
+			// no backoff. Culls are bounded — each one strikes the node
+			// (two strikes ban it) and the warmup gate must refill
+			// before it can be culled again.
+			w.r.d.log.Debug("reassigning chunk after cull", "worker", w.id, "chunk", c.id)
+			continue
+		}
+		attempt++
+		if attempt >= w.r.d.opt.MaxRetries {
 			return fmt.Errorf("chunk %d: %w: %w", c.id, ErrMaxRetry, err)
 		}
-		w.r.d.rep.ChunkRetry(c.id, attempt+1, err)
+		w.r.d.rep.ChunkRetry(c.id, attempt, err)
 		w.r.d.log.Debug("retrying chunk", "worker", w.id, "chunk", c.id,
-			"attempt", attempt+1, "err", err)
+			"attempt", attempt, "err", err)
 		if serr := sleepCtx(ctx, w.bo.next()); serr != nil {
 			return err
 		}
@@ -317,7 +328,7 @@ func (w *worker) ensureClient(ctx context.Context) error {
 		return nil
 	}
 	if w.picker == nil {
-		w.client = &http.Client{Transport: w.r.d.roundTripper()}
+		w.client = w.r.d.newClient(w.r.d.roundTripper())
 		return nil
 	}
 	n, err := w.picker.pick(ctx)
@@ -335,7 +346,7 @@ func (w *worker) ensureClient(ctx context.Context) error {
 		return w.r.d.dial(ctx, network, addr)
 	}
 	tr.MaxConnsPerHost = 1
-	w.client = &http.Client{Transport: tr}
+	w.client = w.r.d.newClient(tr)
 	w.r.d.log.Debug("worker pinned to node", "worker", w.id, "addr", pinned)
 	return nil
 }
@@ -389,9 +400,6 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	if err := w.ensureClient(ctx); err != nil {
 		return err
 	}
-	if err := w.file.Truncate(0); err != nil {
-		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
-	}
 
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -416,12 +424,20 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
 
+	// Truncate only after a successful response: a failed attempt must not
+	// destroy previously staged bytes (e.g. a resumable multipart .part).
+	if err := w.file.Truncate(0); err != nil {
+		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
+	}
+
 	w.r.d.rep.ChunkStart(0, 0, w.r.total, 0)
 	var written int64
 	sink := func(buf []byte, d time.Duration) (bool, error) {
 		if len(buf) == 0 {
 			w.r.d.rep.ChunkProgress(0, 0, d)
-			return false, nil
+			// A zero-length body (empty file) is complete without ever
+			// delivering bytes.
+			return w.r.total >= 0 && written >= w.r.total, nil
 		}
 		if _, err := w.file.WriteAt(buf, written); err != nil {
 			return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}

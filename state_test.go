@@ -116,6 +116,14 @@ func TestStateUsable(t *testing.T) {
 	if weak.usable(part, 1000, `W/"v1"`, "") {
 		t.Error("weak etag accepted as validator")
 	}
+	// A weak ETag falls back to Last-Modified, mirroring run.validator.
+	weak.LastModified = "Mon, 02 Jan 2026 03:04:05 GMT"
+	if !weak.usable(part, 1000, `W/"v1"`, "Mon, 02 Jan 2026 03:04:05 GMT") {
+		t.Error("weak etag with matching Last-Modified rejected")
+	}
+	if weak.usable(part, 1000, `W/"v1"`, "Tue, 03 Jan 2026 03:04:05 GMT") {
+		t.Error("weak etag with changed Last-Modified accepted")
+	}
 
 	lm := validSidecar()
 	lm.ETag = ""

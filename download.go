@@ -2,11 +2,13 @@ package download
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"net"
@@ -15,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +52,9 @@ type Options struct {
 	MaxRetries int
 	// Headers are added to every request (User-Agent, auth, ...).
 	Headers http.Header
+	// Jar supplies cookies to every request (session auth). Nil means no
+	// cookie handling.
+	Jar http.CookieJar
 	// Transport overrides the internal HTTP/1.1 transport. Setting it
 	// disables CDN node pinning (this is the HTTP/3 escape hatch: plug in
 	// a quic-go RoundTripper here).
@@ -56,9 +62,18 @@ type Options struct {
 	// TLSConfig is used by the internal transport. Ignored when Transport
 	// is set.
 	TLSConfig *tls.Config
+	// Proxy selects a proxy per request for the internal transport (nil
+	// means http.ProxyFromEnvironment). Ignored when Transport is set.
+	// Requests that go through a proxy disable CDN node pinning.
+	Proxy func(*http.Request) (*url.URL, error)
 	// ExpectedSHA256 is the hex-encoded checksum to verify before the
 	// final rename. Empty disables verification.
 	ExpectedSHA256 string
+	// ExpectedSHA1 is the hex-encoded SHA-1 checksum to verify before the
+	// final rename (Apple's firmware APIs still publish SHA-1). Empty
+	// disables verification. May be combined with ExpectedSHA256; the
+	// file is read once.
+	ExpectedSHA1 string
 	// Overwrite allows replacing an existing destination file.
 	Overwrite bool
 	// Reporter receives progress events. Nil means silent.
@@ -82,6 +97,8 @@ type Result struct {
 	Elapsed time.Duration
 	// SHA256 is the hex checksum, set only when ExpectedSHA256 was verified.
 	SHA256 string
+	// SHA1 is the hex checksum, set only when ExpectedSHA1 was verified.
+	SHA1 string
 }
 
 // Downloader downloads files. It is safe for concurrent use.
@@ -119,8 +136,14 @@ func New(opt *Options) (*Downloader, error) {
 	if o.Timeout == 0 {
 		o.Timeout = defaultTimeout
 	}
+	if o.Timeout < 0 {
+		return nil, fmt.Errorf("invalid Timeout %v: must be > 0", o.Timeout)
+	}
 	if o.MaxRetries == 0 {
 		o.MaxRetries = defaultMaxRetries
+	}
+	if o.MaxRetries < 0 {
+		return nil, fmt.Errorf("invalid MaxRetries %d: must be >= 1", o.MaxRetries)
 	}
 	if o.ExpectedSHA256 != "" {
 		if _, err := hex.DecodeString(o.ExpectedSHA256); err != nil || len(o.ExpectedSHA256) != 64 {
@@ -128,13 +151,19 @@ func New(opt *Options) (*Downloader, error) {
 		}
 		o.ExpectedSHA256 = strings.ToLower(o.ExpectedSHA256)
 	}
+	if o.ExpectedSHA1 != "" {
+		if _, err := hex.DecodeString(o.ExpectedSHA1); err != nil || len(o.ExpectedSHA1) != 40 {
+			return nil, fmt.Errorf("invalid ExpectedSHA1 %q: want 40 hex chars", o.ExpectedSHA1)
+		}
+		o.ExpectedSHA1 = strings.ToLower(o.ExpectedSHA1)
+	}
+	if o.Reporter == nil {
+		o.Reporter = NopReporter{}
+	}
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.DiscardHandler)
+	}
 	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger}
-	if d.rep == nil {
-		d.rep = NopReporter{}
-	}
-	if d.log == nil {
-		d.log = slog.New(slog.DiscardHandler)
-	}
 	d.dial = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -154,11 +183,17 @@ func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net
 // newTransport builds the internal transport: HTTP/1.1 only, because HTTP/2
 // would multiplex every parallel range request onto a single TCP connection
 // and defeat the purpose of parallel parts.
-func newTransport(o Options, dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+func newTransport(
+	o Options, dial func(context.Context, string, string) (net.Conn, error),
+) *http.Transport {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
+	proxy := o.Proxy
+	if proxy == nil {
+		proxy = http.ProxyFromEnvironment
+	}
 	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxy,
 		DialContext:           dial,
 		Protocols:             &protocols,
 		TLSClientConfig:       o.TLSConfig,
@@ -175,6 +210,12 @@ func (d *Downloader) roundTripper() http.RoundTripper {
 		return d.opt.Transport
 	}
 	return d.base
+}
+
+// newClient wraps a transport in an http.Client carrying the configured
+// cookie jar.
+func (d *Downloader) newClient(rt http.RoundTripper) *http.Client {
+	return &http.Client{Transport: rt, Jar: d.opt.Jar}
 }
 
 func (d *Downloader) applyHeaders(req *http.Request) {
@@ -220,12 +261,15 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 
 	var total int64 = -1
 	multipart := false
-	if resp.StatusCode == http.StatusPartialContent {
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
 		if _, _, t, err := parseContentRange(resp.Header.Get("Content-Range")); err == nil && t > 0 {
 			total = t
 			multipart = true
 		}
-	} else if resp.ContentLength > 0 {
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		total = 0 // elect only lets a 416 through for a zero-length resource
+	case resp.ContentLength > 0:
 		total = resp.ContentLength
 	}
 	// The election response served its purpose (final URL, headers,
@@ -250,14 +294,12 @@ func (d *Downloader) get(ctx context.Context, rawURL, dest string) (*Result, err
 	return r.single(ctx)
 }
 
-// elect sends the probe GET (Range: bytes=0-) that follows redirects and
-// decides between multipart (206) and single-stream (200). Transient
-// failures are retried a few times.
+// elect sends the probe GET (Range: bytes=0-0, one byte) that follows
+// redirects and decides between multipart (206), single-stream (200), and
+// empty (416 on a zero-length resource). Transient failures are retried a
+// few times.
 func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, error) {
-	if _, err := url.Parse(rawURL); err != nil {
-		return nil, fmt.Errorf("parse url: %w", err)
-	}
-	client := &http.Client{Transport: d.roundTripper()}
+	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
 	for attempt := range 3 {
@@ -271,7 +313,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 			return nil, fmt.Errorf("build request: %w", err)
 		}
 		d.applyHeaders(req)
-		req.Header.Set("Range", "bytes=0-")
+		req.Header.Set("Range", "bytes=0-0")
 		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -282,6 +324,10 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, 
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
+			return resp, nil
+		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && emptyContentRange(resp.Header):
+			// A range probe on a zero-length resource is unsatisfiable:
+			// the file exists and is empty.
 			return resp, nil
 		case isRetryableStatus(resp.StatusCode):
 			resp.Body.Close()
@@ -298,6 +344,12 @@ func isRetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || (code >= 500 && code < 600)
 }
 
+// emptyContentRange reports whether a 416 response declares a zero-length
+// resource ("Content-Range: bytes */0").
+func emptyContentRange(h http.Header) bool {
+	return strings.TrimSpace(h.Get("Content-Range")) == "bytes */0"
+}
+
 // parseContentRange parses "bytes start-end/total"; total may be "*" (-1).
 func parseContentRange(s string) (start, end, total int64, err error) {
 	rest, ok := strings.CutPrefix(s, "bytes ")
@@ -310,10 +362,17 @@ func parseContentRange(s string) (start, end, total int64, err error) {
 	}
 	if totalPart == "*" {
 		total = -1
-	} else if _, err := fmt.Sscanf(totalPart, "%d", &total); err != nil {
+	} else if total, err = strconv.ParseInt(totalPart, 10, 64); err != nil {
 		return 0, 0, 0, fmt.Errorf("malformed Content-Range total %q", s)
 	}
-	if _, err := fmt.Sscanf(rangePart, "%d-%d", &start, &end); err != nil {
+	startPart, endPart, ok := strings.Cut(rangePart, "-")
+	if !ok {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
+	}
+	if start, err = strconv.ParseInt(startPart, 10, 64); err != nil {
+		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
+	}
+	if end, err = strconv.ParseInt(endPart, 10, 64); err != nil {
 		return 0, 0, 0, fmt.Errorf("malformed Content-Range range %q", s)
 	}
 	return start, end, total, nil
@@ -347,15 +406,25 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 		LastModified: r.lastMod,
 		Resumed:      resumed,
 	}
-	if r.d.opt.ExpectedSHA256 != "" {
-		sum, err := hashFile(file)
+	if r.d.opt.ExpectedSHA256 != "" || r.d.opt.ExpectedSHA1 != "" {
+		sum256, sum1, err := hashFile(file, r.d.opt.ExpectedSHA256 != "", r.d.opt.ExpectedSHA1 != "")
 		if err != nil {
 			return nil, err
 		}
-		if sum != r.d.opt.ExpectedSHA256 {
-			return nil, &ChecksumError{Expected: r.d.opt.ExpectedSHA256, Actual: sum}
+		if r.d.opt.ExpectedSHA256 != "" {
+			if sum256 != r.d.opt.ExpectedSHA256 {
+				return nil, r.discardStaged(file,
+					&ChecksumError{Algo: "sha256", Expected: r.d.opt.ExpectedSHA256, Actual: sum256})
+			}
+			res.SHA256 = sum256
 		}
-		res.SHA256 = sum
+		if r.d.opt.ExpectedSHA1 != "" {
+			if sum1 != r.d.opt.ExpectedSHA1 {
+				return nil, r.discardStaged(file,
+					&ChecksumError{Algo: "sha1", Expected: r.d.opt.ExpectedSHA1, Actual: sum1})
+			}
+			res.SHA1 = sum1
+		}
 	}
 	if err := file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync %s: %w", r.partPath, err)
@@ -366,20 +435,54 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	if err := os.Rename(r.partPath, r.destPath); err != nil {
 		return nil, fmt.Errorf("rename %s -> %s: %w", r.partPath, r.destPath, err)
 	}
-	os.Remove(statePath(r.partPath))
+	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing resume sidecar failed", "err", err)
+	}
 	return res, nil
 }
 
-func hashFile(file *os.File) (string, error) {
+// discardStaged removes the staged .part and sidecar after failed
+// verification: the bytes are proven bad, so a resume of them could never
+// succeed. It returns cause for convenient chaining.
+func (r *run) discardStaged(file *os.File, cause error) error {
+	if err := file.Close(); err != nil {
+		r.d.log.Debug("closing bad staged file failed", "err", err)
+	}
+	if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing bad staged file failed", "err", err)
+	}
+	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
+		r.d.log.Debug("removing resume sidecar failed", "err", err)
+	}
+	return cause
+}
+
+// hashFile reads file once and returns the requested hex digests.
+func hashFile(file *os.File, want256, want1 bool) (sum256, sum1 string, err error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("seek for hashing: %w", err)
+		return "", "", fmt.Errorf("seek for hashing: %w", err)
 	}
-	h := sha256.New()
+	var writers []io.Writer
+	var h256, h1 hash.Hash
+	if want256 {
+		h256 = sha256.New()
+		writers = append(writers, h256)
+	}
+	if want1 {
+		h1 = sha1.New() // #nosec G401 -- verification against a published SHA-1
+		writers = append(writers, h1)
+	}
 	buf := make([]byte, bufSize)
-	if _, err := io.CopyBuffer(h, file, buf); err != nil {
-		return "", fmt.Errorf("hash %s: %w", file.Name(), err)
+	if _, err := io.CopyBuffer(io.MultiWriter(writers...), file, buf); err != nil {
+		return "", "", fmt.Errorf("hash %s: %w", file.Name(), err)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if h256 != nil {
+		sum256 = hex.EncodeToString(h256.Sum(nil))
+	}
+	if h1 != nil {
+		sum1 = hex.EncodeToString(h1.Sum(nil))
+	}
+	return sum256, sum1, nil
 }
 
 // run carries the state of one Get call.
@@ -402,6 +505,13 @@ func (r *run) validator() string {
 		return r.etag
 	}
 	return r.lastMod
+}
+
+// resumable reports whether a resume sidecar is worth writing: without any
+// server validator, loadState could never prove the content unchanged and
+// would reject the sidecar anyway.
+func (r *run) resumable() bool {
+	return r.etag != "" || r.lastMod != ""
 }
 
 // multipart downloads r.url (known size, ranges honored) with parallel
@@ -441,10 +551,12 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 
 	err = r.runWorkers(ctx, sched, file, st)
 	if err != nil {
-		// Leave .part and sidecar in place for a future resume.
-		st.Chunks = sched.snapshot()
-		if serr := st.save(statePath(r.partPath)); serr != nil {
-			r.d.log.Debug("saving resume state failed", "err", serr)
+		if r.resumable() {
+			// Leave .part and sidecar in place for a future resume.
+			st.Chunks = sched.snapshot()
+			if serr := st.save(statePath(r.partPath)); serr != nil {
+				r.d.log.Debug("saving resume state failed", "err", serr)
+			}
 		}
 		return nil, err
 	}
@@ -453,7 +565,9 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 
 // runWorkers drives the worker pool and the periodic sidecar flusher,
 // returning the first real error (or the context's cause).
-func (r *run) runWorkers(ctx context.Context, sched *scheduler, file *os.File, st *stateFile) error {
+func (r *run) runWorkers(
+	ctx context.Context, sched *scheduler, file *os.File, st *stateFile,
+) error {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -489,14 +603,26 @@ func (r *run) runWorkers(ctx context.Context, sched *scheduler, file *os.File, s
 	flushDone := make(chan struct{})
 	go func() {
 		defer close(flushDone)
+		if !r.resumable() {
+			return
+		}
 		t := time.NewTicker(flushEvery)
 		defer t.Stop()
+		lastRemaining := int64(-1)
 		for {
 			select {
 			case <-runCtx.Done():
 				return
 			case <-t.C:
 				st.Chunks = sched.snapshot()
+				rem := st.remaining()
+				if rem == lastRemaining {
+					// No bytes landed since the last flush: the sidecar
+					// on disk still describes valid coverage, so skip
+					// the rewrite.
+					continue
+				}
+				lastRemaining = rem
 				if err := st.save(statePath(r.partPath)); err != nil {
 					r.d.log.Debug("flush resume state failed", "err", err)
 				}
@@ -550,12 +676,16 @@ func portOf(u *url.URL) string {
 // single downloads r.url over one sequential stream (server ignored Range or
 // size is unknown). No resume: a retry restarts from byte zero.
 func (r *run) single(ctx context.Context) (*Result, error) {
-	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	// No O_TRUNC and no eager sidecar removal: an existing multipart .part
+	// stays resumable until a single-stream attempt actually starts writing
+	// (singleAttempt truncates only after a successful response). A stale
+	// sidecar is removed by verifyAndFinalize on success and is harmless
+	// otherwise (usable() rejects it once the .part size changed).
+	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}
 	defer file.Close()
-	os.Remove(statePath(r.partPath)) // stale sidecar from an older multipart run
 
 	r.d.rep.Start(Info{Name: r.name(), Total: r.total})
 	w := newWorker(0, r, nil, file, nil)

@@ -22,14 +22,19 @@ func (e StatusError) Error() string {
 }
 
 // ChecksumError is returned when the downloaded file does not match
-// Options.ExpectedSHA256.
+// Options.ExpectedSHA256 or Options.ExpectedSHA1.
 type ChecksumError struct {
+	Algo     string // "sha256" or "sha1"
 	Expected string
 	Actual   string
 }
 
 func (e *ChecksumError) Error() string {
-	return fmt.Sprintf("sha256 mismatch: expected %s, got %s", e.Expected, e.Actual)
+	algo := e.Algo
+	if algo == "" {
+		algo = "sha256"
+	}
+	return fmt.Sprintf("%s mismatch: expected %s, got %s", algo, e.Expected, e.Actual)
 }
 
 // SizeError is returned when the final file size does not match the size

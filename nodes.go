@@ -66,43 +66,52 @@ func newPicker(host, port string, log *slog.Logger) *picker {
 // least-bad node so progress is always possible).
 func (p *picker) pick(ctx context.Context) (*node, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.nodes) == 0 || time.Since(p.resolvedAt) > resolveMaxAge {
-		if err := p.refreshLocked(ctx); err != nil && len(p.nodes) == 0 {
+	stale := len(p.nodes) == 0 || time.Since(p.resolvedAt) > resolveMaxAge
+	empty := len(p.nodes) == 0
+	p.mu.Unlock()
+	if stale {
+		if err := p.refresh(ctx); err != nil && empty {
 			return nil, err
 		}
 	}
-	now := time.Now()
-	candidates := make([]*node, 0, len(p.nodes))
-	for _, n := range p.nodes {
-		if now.After(n.banUntil) {
-			candidates = append(candidates, n)
-		}
-	}
+
+	p.mu.Lock()
+	candidates, _ := p.eligibleLocked(time.Now())
 	if len(candidates) == 0 {
-		if err := p.refreshLocked(ctx); err != nil {
+		p.mu.Unlock()
+		if err := p.refresh(ctx); err != nil {
 			p.log.Debug("re-resolve failed, unbanning least-bad node", "err", err)
 		}
+		p.mu.Lock()
 		var best *node
-		for _, n := range p.nodes {
-			if now.After(n.banUntil) {
-				candidates = append(candidates, n)
-			} else if best == nil || n.banUntil.Before(best.banUntil) {
-				best = n
-			}
-		}
+		candidates, best = p.eligibleLocked(time.Now())
 		if len(candidates) == 0 && best != nil {
 			best.banUntil = time.Time{}
 			best.strikes = 0
 			candidates = append(candidates, best)
 		}
 	}
+	defer p.mu.Unlock()
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no usable addresses for %s", p.host)
 	}
 	chosen := pickTwo(candidates)
 	chosen.conns++
 	return chosen, nil
+}
+
+// eligibleLocked returns the unbanned nodes and, when every node is banned,
+// the one whose ban expires soonest. Callers must hold p.mu.
+func (p *picker) eligibleLocked(now time.Time) (candidates []*node, leastBad *node) {
+	candidates = make([]*node, 0, len(p.nodes))
+	for _, n := range p.nodes {
+		if now.After(n.banUntil) {
+			candidates = append(candidates, n)
+		} else if leastBad == nil || n.banUntil.Before(leastBad.banUntil) {
+			leastBad = n
+		}
+	}
+	return candidates, leastBad
 }
 
 // pickTwo implements power-of-two-choices: sample two random candidates and
@@ -144,11 +153,16 @@ func betterNode(a, b *node) *node {
 	}
 }
 
-func (p *picker) refreshLocked(ctx context.Context) error {
+// refresh re-resolves the host and merges the result into the node list.
+// The DNS lookup deliberately runs outside p.mu: observe/shouldCull take that
+// mutex on every body read, so a slow resolver must never block data flow.
+func (p *picker) refresh(ctx context.Context) error {
 	addrs, err := p.resolve(ctx, p.host)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", p.host, err)
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.resolvedAt = time.Now()
 	known := make(map[netip.Addr]*node, len(p.nodes))
 	for _, n := range p.nodes {

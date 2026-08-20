@@ -20,6 +20,12 @@ type mpbReporter struct {
 	mu    sync.Mutex
 	bars  map[int]*mpb.Bar
 	total *mpb.Bar
+	// counted tracks the bytes attributed to each chunk so a restarted
+	// chunk (single-stream retry re-announces id 0 with written=0) rolls
+	// its contribution back out of the aggregate instead of double
+	// counting.
+	counted map[int]int64
+	sum     int64
 }
 
 func newMpbReporter() *mpbReporter {
@@ -28,7 +34,8 @@ func newMpbReporter() *mpbReporter {
 			mpb.WithWidth(64),
 			mpb.WithRefreshRate(200*time.Millisecond),
 		),
-		bars: make(map[int]*mpb.Bar),
+		bars:    make(map[int]*mpb.Bar),
+		counted: make(map[int]int64),
 	}
 }
 
@@ -49,6 +56,7 @@ func (r *mpbReporter) Start(info download.Info) {
 		),
 	)
 	if info.Resumed > 0 {
+		r.sum = info.Resumed
 		r.total.SetCurrent(info.Resumed)
 		r.total.SetRefill(info.Resumed)
 	}
@@ -58,7 +66,17 @@ func (r *mpbReporter) ChunkStart(id int, off, length, written int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if bar, ok := r.bars[id]; ok {
-		// The chunk's tail was stolen: shrink the bar to its new length.
+		// Re-announced chunk: either its tail was stolen (shrink the bar)
+		// or a single-stream retry restarted it from written=0 (reset the
+		// bar and roll its bytes back out of the aggregate).
+		if written < r.counted[id] {
+			r.sum += written - r.counted[id]
+			r.counted[id] = written
+			bar.SetCurrent(written)
+			if r.total != nil {
+				r.total.SetCurrent(r.sum)
+			}
+		}
 		bar.SetTotal(length, false)
 		return
 	}
@@ -77,6 +95,8 @@ func (r *mpbReporter) ChunkStart(id int, off, length, written int64) {
 		bar.SetCurrent(written)
 		bar.SetRefill(written)
 	}
+	// Resumed bytes are already in sum via Info.Resumed; just record them.
+	r.counted[id] = written
 	r.bars[id] = bar
 }
 
@@ -87,13 +107,19 @@ func (r *mpbReporter) Connected(id int, addr string) {
 func (r *mpbReporter) ChunkProgress(id int, n int, d time.Duration) {
 	r.mu.Lock()
 	bar, ok := r.bars[id]
-	total := r.total
+	var total *mpb.Bar
+	var sum int64
+	if n > 0 {
+		r.counted[id] += int64(n)
+		r.sum += int64(n)
+		total, sum = r.total, r.sum
+	}
 	r.mu.Unlock()
 	if ok {
 		bar.EwmaIncrBy(n, d)
 	}
-	if total != nil && n > 0 {
-		total.IncrBy(n)
+	if total != nil {
+		total.SetCurrent(sum)
 	}
 }
 

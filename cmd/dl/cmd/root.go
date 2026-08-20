@@ -58,12 +58,15 @@ var flags struct {
 }
 
 func init() {
-	rootCmd.Flags().StringVarP(&flags.output, "output", "o", "", "output file or directory (default: derived from URL)")
+	rootCmd.Flags().StringVarP(&flags.output, "output", "o", "",
+		"output file or directory (default: derived from URL)")
 	rootCmd.Flags().IntVarP(&flags.parts, "parts", "p", 8, "number of parallel connections")
 	rootCmd.Flags().DurationVar(&flags.timeout, "timeout", 0, "per-read stall timeout (default 15s)")
 	rootCmd.Flags().IntVar(&flags.retries, "retries", 0, "per-chunk retry budget (default 10)")
-	rootCmd.Flags().StringArrayVarP(&flags.headers, "header", "H", nil, "extra header, 'Key: Value' (repeatable)")
-	rootCmd.Flags().StringVar(&flags.sha256, "sha256", "", "expected sha256 (hex); verified before rename")
+	rootCmd.Flags().StringArrayVarP(&flags.headers, "header", "H", nil,
+		"extra header, 'Key: Value' (repeatable)")
+	rootCmd.Flags().StringVar(&flags.sha256, "sha256", "",
+		"expected sha256 (hex); verified before rename")
 	rootCmd.Flags().BoolVarP(&flags.force, "force", "f", false, "overwrite existing destination")
 	rootCmd.Flags().BoolVarP(&flags.quiet, "quiet", "q", false, "no progress output")
 	rootCmd.Flags().BoolVar(&flags.insecure, "insecure", false, "skip TLS certificate verification")
