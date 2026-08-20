@@ -533,9 +533,8 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 
 // install moves the verified .part file to the destination. With Overwrite it
 // is a plain rename; otherwise Link creates the destination only if it is
-// still absent — unlike Rename on Unix, it can never replace a file created
-// after the preflight check. Filesystems without hard links (exFAT, some
-// network mounts) fall back to a re-checked rename.
+// still absent. Filesystems without hard links fail safely and preserve the
+// staging file because the standard library has no portable no-replace rename.
 func (r *run) install() error {
 	if r.d.opt.Overwrite {
 		if err := os.Rename(r.partPath, r.destPath); err != nil {
@@ -543,20 +542,8 @@ func (r *run) install() error {
 		}
 		return nil
 	}
-	linkErr := os.Link(r.partPath, r.destPath)
-	if os.IsExist(linkErr) {
-		return fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
-	}
-	if linkErr != nil {
-		if _, err := os.Lstat(r.destPath); err == nil {
-			return fmt.Errorf("%w: %s", ErrDestExists, r.destPath)
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, linkErr)
-		}
-		if err := os.Rename(r.partPath, r.destPath); err != nil {
-			return fmt.Errorf("install %s -> %s: %w", r.partPath, r.destPath, err)
-		}
-		return nil
+	if err := installNoReplace(r.partPath, r.destPath, os.Link); err != nil {
+		return err
 	}
 	if err := os.Remove(r.partPath); err != nil && !os.IsNotExist(err) {
 		// The leftover name is a second hard link to the installed file: a
@@ -565,6 +552,23 @@ func (r *run) install() error {
 			"path", r.partPath, "err", err)
 	}
 	return nil
+}
+
+func installNoReplace(
+	partPath, destPath string,
+	link func(string, string) error,
+) error {
+	linkErr := link(partPath, destPath)
+	if linkErr == nil {
+		return nil
+	}
+	if os.IsExist(linkErr) {
+		return fmt.Errorf("%w: %s", ErrDestExists, destPath)
+	}
+	if _, err := os.Lstat(destPath); err == nil {
+		return fmt.Errorf("%w: %s", ErrDestExists, destPath)
+	}
+	return fmt.Errorf("install %s -> %s: %w", partPath, destPath, linkErr)
 }
 
 // discardStaged removes the staged .part and sidecar after failed

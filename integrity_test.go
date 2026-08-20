@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,25 @@ func writeBareRange(w http.ResponseWriter, r *http.Request, data []byte, etag st
 	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(data[start : end+1])
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type singleCloseBody struct {
+	closes atomic.Int32
+}
+
+func (*singleCloseBody) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (b *singleCloseBody) Close() error {
+	if got := b.closes.Add(1); got != 1 {
+		panic(fmt.Sprintf("response body closed %d times", got))
+	}
+	return nil
 }
 
 func TestRedirectSensitiveHeadersNotReapplied(t *testing.T) {
@@ -244,6 +264,84 @@ func TestMultipartRejectsMismatchedContentRange(t *testing.T) {
 	}
 }
 
+func TestMultipartCappedRangesDoNotSpendRetries(t *testing.T) {
+	t.Parallel()
+	data := testData(32 << 10)
+	const capSize = int64(1 << 10)
+	var workerRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-0" {
+			writeBareRange(w, r, data, `"v1"`)
+			return
+		}
+		workerRequests.Add(1)
+		start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data)))
+		if !ok {
+			t.Errorf("worker sent malformed range %q", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		end = min(end, start+capSize-1)
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	}))
+	defer srv.Close()
+
+	d := newDL(t, &Options{Parts: 1, MinPartSize: 4 << 10, MaxRetries: 1})
+	_, got := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
+	if !bytes.Equal(got, data) {
+		t.Fatal("capped-range download differs from source")
+	}
+	if requests := workerRequests.Load(); requests <= 1 {
+		t.Fatalf("worker requests = %d, want multiple capped subranges", requests)
+	}
+}
+
+func TestRetryableResponseBodiesCloseOnce(t *testing.T) {
+	t.Parallel()
+	for _, ranged := range []bool{false, true} {
+		name := "single"
+		if ranged {
+			name = "ranged"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			body := &singleCloseBody{}
+			d := newDL(t, &Options{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     make(http.Header),
+					Body:       body,
+				}, nil
+			})})
+			r := &run{
+				d: d, url: "http://example.test/file.bin",
+				sourceURL: &url.URL{Scheme: "http", Host: "example.test"},
+				total:     1, etag: `"v1"`,
+			}
+			w := newWorker(0, r, nil, nil, nil)
+			var err error
+			if ranged {
+				sched := newScheduler(1)
+				sched.addPending(0, 1, 0)
+				w.sched = sched
+				err = w.attempt(t.Context(), sched.next().c)
+			} else {
+				err = w.singleAttempt(t.Context())
+			}
+			if !errors.Is(err, StatusError(http.StatusServiceUnavailable)) {
+				t.Fatalf("retryable response error = %v", err)
+			}
+			if got := body.closes.Load(); got != 1 {
+				t.Fatalf("response body closes = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func writePartialState(t *testing.T, dest, sourceURL string, data []byte) {
 	t.Helper()
 	part := dest + ".part"
@@ -353,6 +451,34 @@ func TestFinalNoOverwriteIsAtomic(t *testing.T) {
 	}
 	if staged, err := os.ReadFile(part); err != nil || !bytes.Equal(staged, newData) {
 		t.Fatalf("verified staging file was not preserved for recovery: data=%q err=%v", staged, err)
+	}
+}
+
+func TestNoOverwriteLinkFailurePreservesStaging(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "file.bin")
+	part := dest + ".part"
+	stagedData := []byte("verified staging data")
+	lateData := []byte("late destination data")
+	if err := os.WriteFile(part, stagedData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkErr := errors.New("hard links unsupported")
+	err := installNoReplace(part, dest, func(_, destPath string) error {
+		if err := os.WriteFile(destPath, lateData, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return linkErr
+	})
+	if !errors.Is(err, ErrDestExists) {
+		t.Fatalf("install error = %v, want ErrDestExists", err)
+	}
+	if got, readErr := os.ReadFile(dest); readErr != nil || !bytes.Equal(got, lateData) {
+		t.Fatalf("late destination changed: data=%q err=%v", got, readErr)
+	}
+	if got, readErr := os.ReadFile(part); readErr != nil || !bytes.Equal(got, stagedData) {
+		t.Fatalf("staging file changed: data=%q err=%v", got, readErr)
 	}
 }
 

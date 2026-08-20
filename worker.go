@@ -26,6 +26,7 @@ const (
 var (
 	errStall          = errors.New("read stalled")
 	errCulled         = errors.New("node statistically slow, reassigning")
+	errRangeCapped    = errors.New("server capped range response")
 	errShortBody      = errors.New("server closed body before range completed")
 	errRangeIgnored   = errors.New("server ignored Range request")
 	errContentChanged = errors.New("remote content changed during download")
@@ -109,6 +110,12 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 		if perm, ok := errors.AsType[*permanentError](err); ok {
 			return fmt.Errorf("chunk %d: %w", c.id, perm.err)
 		}
+		if errors.Is(err, errRangeCapped) {
+			// A complete server-declared subrange advanced the cursor. Continue
+			// immediately without charging progress against the retry budget.
+			w.r.d.log.Debug("continuing capped range", "worker", w.id, "chunk", c.id)
+			continue
+		}
 		if errors.Is(err, errCulled) {
 			// Abandoning a statistically slow node for a better one is
 			// progress, not failure: it costs no retry budget and needs
@@ -164,21 +171,40 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if err != nil {
 		return w.classify(err, actx)
 	}
-	defer resp.Body.Close()
-
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
 		contentRange := resp.Header.Get("Content-Range")
 		s, e, total, crErr := parseContentRange(contentRange)
 		// The range must start at the cursor and describe our representation
 		// (total "*" is RFC-valid unknown). A server-revised shorter range is
-		// tolerated: its early EOF becomes a retry from the advanced cursor.
-		if crErr != nil || s != cursor || e < s || (total != -1 && total != w.r.total) {
+		// accepted, but it may not extend beyond the requested range.
+		if crErr != nil || s != cursor || e < s || e >= end ||
+			(total != -1 && total != w.r.total) {
+			_ = resp.Body.Close()
 			return &permanentError{fmt.Errorf(
 				"wrong Content-Range %q for requested bytes %d-%d/%d",
 				contentRange, cursor, end-1, w.r.total)}
 		}
+		responseEnd := e + 1 // convert inclusive HTTP end to scheduler-exclusive end
+		capped := responseEnd < end
+		defer resp.Body.Close()
+		var body io.Reader = io.LimitReader(resp.Body, responseEnd-s)
+		if w.picker != nil {
+			body = &observedReader{r: body, w: w}
+		}
+		err := w.readLoop(body, timer, w.chunkSink(c))
+		if err == nil {
+			return nil
+		}
+		if capped && errors.Is(err, io.EOF) {
+			next, _, _ := w.sched.cursor(c)
+			if next >= responseEnd {
+				return errRangeCapped
+			}
+		}
+		return w.classify(err, actx)
 	case resp.StatusCode == http.StatusOK:
+		_ = resp.Body.Close()
 		if w.r.validator() != "" {
 			// If-Range mismatch: the remote file was replaced.
 			return &permanentError{errContentChanged}
@@ -187,24 +213,14 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		w.dropNode()
 		return errRangeIgnored
 	case isRetryableStatus(resp.StatusCode):
-		// Close the body first so the connection is idle (and torn down)
-		// when dropNode abandons the pinned transport.
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		w.strikeNode()
 		w.dropNode()
 		return StatusError(resp.StatusCode)
 	default:
+		_ = resp.Body.Close()
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
-
-	var body io.Reader = resp.Body
-	if w.picker != nil {
-		body = &observedReader{r: resp.Body, w: w}
-	}
-	if err := w.readLoop(body, timer, w.chunkSink(c)); err != nil {
-		return w.classify(err, actx)
-	}
-	return nil
 }
 
 // chunkSink writes each read at the claimed offset. Claiming before writing
@@ -454,15 +470,16 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	if err != nil {
 		return w.classify(err, actx)
 	}
-	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusOK:
+		defer resp.Body.Close()
 	case isRetryableStatus(resp.StatusCode):
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		w.strikeNode()
 		w.dropNode()
 		return StatusError(resp.StatusCode)
 	default:
+		_ = resp.Body.Close()
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
 
