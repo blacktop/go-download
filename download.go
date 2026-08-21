@@ -1516,17 +1516,18 @@ func (r *run) runWorkers(
 	}
 	if !sched.idle() {
 		sched.mu.Lock()
-		detail := fmt.Sprintf("pending=%d active=%d live=%v retiring=%v limit=%d",
-			len(sched.pending), len(sched.active), sched.live, sched.retiring, sched.limit)
+		var detail strings.Builder
+		detail.WriteString(fmt.Sprintf("pending=%d active=%d live=%v retiring=%v limit=%d",
+			len(sched.pending), len(sched.active), sched.live, sched.retiring, sched.limit))
 		for _, c := range sched.active {
-			detail += fmt.Sprintf(" active[%d]{owner=%d off=%d done=%d end=%d}",
-				c.id, c.owner, c.off, c.done, c.end)
+			detail.WriteString(fmt.Sprintf(" active[%d]{owner=%d off=%d done=%d end=%d}",
+				c.id, c.owner, c.off, c.done, c.end))
 		}
 		for _, c := range sched.pending {
-			detail += fmt.Sprintf(" pending[%d]{off=%d done=%d end=%d}", c.id, c.off, c.done, c.end)
+			detail.WriteString(fmt.Sprintf(" pending[%d]{off=%d done=%d end=%d}", c.id, c.off, c.done, c.end))
 		}
 		sched.mu.Unlock()
-		return fmt.Errorf("internal: workers exited with work remaining (%s)", detail)
+		return fmt.Errorf("internal: workers exited with work remaining (%s)", detail.String())
 	}
 	return nil
 }
