@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -167,6 +168,10 @@ type Downloader struct {
 	// bufs recycles the large read/hash buffers across workers and Get
 	// calls; they dominate per-download allocations otherwise.
 	bufs sync.Pool
+
+	// rampRuns issues non-sensitive correlation ids for ramp decision
+	// telemetry; concurrent Get calls on one Downloader interleave logs.
+	rampRuns atomic.Uint64
 
 	// dial is the TCP dialer shared by the base and pinned transports;
 	// tests override it to fake CDN nodes.
@@ -1019,15 +1024,93 @@ type rampState struct {
 	// prevAdmitted is the flow count before the most recent batch, recorded
 	// at admission time (batches are clamped: Parts=6 admits 1→2→4→6).
 	prevAdmitted int
-	// admissionBaseline is the steady rate of the window preceding the most
-	// recent admission; settling windows never overwrite it.
-	admissionBaseline float64
+	// admissionBaseline is the steady sample preceding the most recent
+	// admission; settling windows never overwrite it.
+	admissionBaseline rampSample
 	sampleBytes       int64
 	sampleTime        time.Duration
 	sampleCount       int
 	markAt            int64
 	markTime          time.Time
+
+	// Decision telemetry (observability only; no policy consumes it).
+	// enabled is fixed at run creation so the normal disabled path avoids
+	// record construction, readiness locking, and allocations entirely.
+	enabled bool
+	// runID correlates a run's records; seq orders them. pending is the
+	// record built under mu for note() to emit after unlocking — emission
+	// must never hold mu, because the unclaimed-bytes snapshot takes the
+	// scheduler lock.
+	runID   uint64
+	seq     int
+	pending *rampDecision
+	// unclaimed snapshots the scheduler's UNCLAIMED ASSIGNMENT bytes
+	// (pending chunks plus unclaimed active tails); it excludes
+	// claimed-but-unwritten bytes, so it is a floor on remaining work, not
+	// exact remaining completion work. Called only outside mu.
+	unclaimed func() int64
+	// ready records each admitted batch worker's spawn-to-first-body-byte
+	// latency ("A" in the runway model: concurrent readiness, NOT an
+	// additive completion-time cost). Reset at each admission.
+	ready map[int]time.Duration
+	// emitMu/emitCond/nextEmit serialize record emission in seq order:
+	// after an admission unlocks mu, another worker can cross a later
+	// decision window and reach emission first, which would write records
+	// out of order. Guarded lazily under emitMu; never nests inside mu.
+	emitMu   sync.Mutex
+	emitCond *sync.Cond
+	nextEmit int
 }
+
+// rampDecision is one immutable governor decision record. Field semantics
+// are part of the evidence schema (rampDecisionSchema). The judged transition
+// owns baseline/rate/q/readiness; an admit action may also create a distinct
+// transition. Keeping those identities separate is essential for later-batch
+// decisions: when 1→2 pays and the governor admits 2→4, the observed q still
+// belongs to 1→2. Readiness is concurrent setup latency ("A" in the runway
+// model), never an additive completion-time cost.
+type rampDecision struct {
+	seq      int
+	action   string // "admit" | "freeze" | "demote" | "keep-final"
+	reason   string
+	ceiling  int
+	baseline rampSample
+	measured rampSample
+	q        float64
+	qValid   bool
+
+	judged  rampBatch
+	created rampBatch
+
+	settleMin time.Duration
+	window    int64
+	readyLat  []time.Duration // judged-batch readiness latencies, sorted
+}
+
+type rampBatch struct {
+	prior, admitted int
+	clamped, final  bool
+}
+
+type rampSample struct {
+	bytes   int64
+	elapsed time.Duration
+}
+
+func (s rampSample) rate() float64 {
+	return float64(s.bytes) / max(s.elapsed.Seconds(), 1e-9)
+}
+
+func (b rampBatch) size() int { return max(b.admitted-b.prior, 0) }
+
+func (b rampBatch) transition() string {
+	if b.size() == 0 || b.prior == 0 {
+		return ""
+	}
+	return strconv.Itoa(b.prior) + "->" + strconv.Itoa(b.admitted)
+}
+
+const rampDecisionSchema = 2
 
 func (rs *rampState) note(total int64) {
 	if rs.done.Load() {
@@ -1035,13 +1118,175 @@ func (rs *rampState) note(total int64) {
 	}
 	rs.mu.Lock()
 	spawnFrom, spawnN, demoteTo := rs.noteLocked(total, rs.now())
+	rec := rs.pending
+	rs.pending = nil
 	rs.mu.Unlock()
+	unclaimed := int64(-1)
+	if rec != nil && rs.log.Enabled(context.Background(), slog.LevelDebug) && rs.unclaimed != nil {
+		// Snapshot before applying the decision's side effects. In particular,
+		// a demotion must not move remainders before the evidence is captured.
+		unclaimed = rs.unclaimed()
+	}
 	for i := range spawnN {
 		rs.spawn(spawnFrom + i)
 	}
 	if demoteTo > 0 {
 		rs.demote(demoteTo)
 	}
+	if rec != nil {
+		rs.emitOrdered(rec, unclaimed)
+	}
+}
+
+// emitOrdered writes rec only once every earlier-sequenced record has been
+// written, so the JSONL stream is strictly seq-ordered even when a fast
+// transfer crosses the next decision window while this caller is still
+// running the previous decision's side effects. The wait is brief and
+// bounded: the predecessor is already past its decision and its spawn/
+// demote side effects never block.
+func (rs *rampState) emitOrdered(rec *rampDecision, unclaimed int64) {
+	rs.emitMu.Lock()
+	defer rs.emitMu.Unlock()
+	if rs.emitCond == nil {
+		rs.emitCond = sync.NewCond(&rs.emitMu)
+	}
+	if rs.nextEmit == 0 {
+		rs.nextEmit = 1
+	}
+	for rs.nextEmit != rec.seq {
+		rs.emitCond.Wait()
+	}
+	rs.emit(rec, unclaimed)
+	rs.nextEmit++
+	rs.emitCond.Broadcast()
+}
+
+// noteWorkerReady records worker id's spawn-to-first-body-byte latency when
+// it belongs to the batch under judgment. Called once per worker lifetime.
+func (rs *rampState) noteWorkerReady(id int, spawnedAt time.Time) {
+	if !rs.enabled || spawnedAt.IsZero() {
+		return
+	}
+	now := rs.now()
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	// admittedAt zero means no batch was ever admitted: the initial worker
+	// is not a batch and has no admission to be measured against.
+	if rs.admittedAt.IsZero() || id < rs.prevAdmitted || id >= rs.admitted {
+		return
+	}
+	if _, dup := rs.ready[id]; dup {
+		return
+	}
+	if rs.ready == nil {
+		rs.ready = make(map[int]time.Duration)
+	}
+	rs.ready[id] = max(now.Sub(spawnedAt), 0)
+}
+
+// recordLocked completes rec with governor-owned fields (sequence,
+// baseline, windows, and judged-batch readiness latencies) and stores it as
+// the pending record for note() to emit after mu is released.
+func (rs *rampState) recordLocked(rec rampDecision) {
+	if !rs.enabled {
+		return
+	}
+	rs.seq++
+	rec.seq = rs.seq
+	rec.ceiling = rs.parts
+	rec.baseline = rs.admissionBaseline
+	rec.settleMin = rs.settleMin
+	rec.window = rs.window
+	rec.readyLat = make([]time.Duration, 0, len(rs.ready))
+	for _, d := range rs.ready {
+		rec.readyLat = append(rec.readyLat, d)
+	}
+	slices.Sort(rec.readyLat)
+	rs.pending = &rec
+}
+
+// emit logs one decision record. It runs strictly outside rs.mu; unclaimed
+// was snapshotted before the decision side effects without nesting locks.
+func (rs *rampState) emit(rec *rampDecision, unclaimed int64) {
+	if !rs.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	// H estimates how long the remaining assignment would take if the newly
+	// created batch were refused, so its denominator is the current measured
+	// rate at the decision, not the older judged batch's baseline.
+	hEst := -1.0
+	rate := rec.measured.rate()
+	if unclaimed >= 0 && rate > 0 {
+		hEst = float64(unclaimed) / rate
+	}
+	var readyMin, readyMed, readyMax time.Duration = -1, -1, -1
+	if n := len(rec.readyLat); n > 0 {
+		readyMin, readyMed, readyMax = rec.readyLat[0], rec.readyLat[n/2], rec.readyLat[n-1]
+	}
+	rs.log.Debug("ramp decision",
+		"schema", rampDecisionSchema,
+		"run", rs.runID,
+		"seq", rec.seq,
+		"action", rec.action,
+		"reason", rec.reason,
+		"judged_transition", rec.judged.transition(),
+		"judged_prior", rec.judged.prior,
+		"judged_admitted", rec.judged.admitted,
+		"judged_batch_size", rec.judged.size(),
+		"judged_clamped", rec.judged.clamped,
+		"judged_final", rec.judged.final,
+		"created_transition", rec.created.transition(),
+		"created_prior", rec.created.prior,
+		"created_admitted", rec.created.admitted,
+		"created_batch_size", rec.created.size(),
+		"created_clamped", rec.created.clamped,
+		"created_final", rec.created.final,
+		"ceiling", rec.ceiling,
+		"baseline_bytes", rec.baseline.bytes,
+		"baseline_us", rec.baseline.elapsed.Microseconds(),
+		"baseline_bps", int64(rec.baseline.rate()),
+		"measured_bytes", rec.measured.bytes,
+		"measured_us", rec.measured.elapsed.Microseconds(),
+		"rate_bps", int64(rate),
+		"q", rec.q,
+		"q_valid", rec.qValid,
+		"window_bytes", rec.window,
+		"measure_windows", rampMeasureWindows,
+		"settle_floor_ms", rec.settleMin.Milliseconds(),
+		"unclaimed_bytes", unclaimed,
+		"h_est_s", hEst,
+		"ready_min_us", durMicros(readyMin),
+		"ready_med_us", durMicros(readyMed),
+		"ready_max_us", durMicros(readyMax),
+		"ready_workers", len(rec.readyLat),
+		"batch_workers", rec.judged.size(),
+	)
+}
+
+// unclaimedNetworkFloor returns the telemetry snapshot of remaining NETWORK
+// work. The scheduler's unclaimed assignment alone overstates it: note()
+// fires from the body read before the sink advances the claim cursor, so a
+// just-received buffer still counts as unclaimed even though its transfer
+// has completed — up to a full buffer of phantom runway per decision, and a
+// falsely positive runway near completion. Clamping by bytes not yet
+// received this run (initial remaining minus run progress) excludes those
+// buffered bytes; progress may overcount bytes a retirement later
+// discarded, which only lowers the floor further. The result stays a
+// conservative floor, never exact remaining completion work.
+func unclaimedNetworkFloor(sched *scheduler, progress *atomic.Int64) func() int64 {
+	startRemaining := sched.remainingBytes()
+	return func() int64 {
+		return max(min(sched.remainingBytes(), startRemaining-progress.Load()), 0)
+	}
+}
+
+// durMicros renders a readiness latency for logging; -1 means unrecorded.
+// Microseconds keep loopback latencies distinguishable from zero.
+func durMicros(d time.Duration) int64 {
+	if d < 0 {
+		return -1
+	}
+	return d.Microseconds()
 }
 
 // noteLocked advances the ramp state machine by at most one window and
@@ -1068,14 +1313,13 @@ func (rs *rampState) noteLocked(total int64, now time.Time) (spawnFrom, spawnN, 
 		}
 	case rs.admitted == 1 && rs.admitted < rs.parts:
 		// Record the pre-admission steady window and probe the first batch.
-		rate := float64(bytes) / max(elapsed.Seconds(), 1e-9)
-		return rs.admitLocked(rate, now)
+		return rs.admitLocked(rampSample{bytes: bytes, elapsed: elapsed}, now)
 	default:
-		rate, ready := rs.measureLocked(bytes, elapsed)
+		sample, ready := rs.measureLocked(bytes, elapsed)
 		if !ready {
 			return 0, 0, 0
 		}
-		return rs.decideLocked(rate, now)
+		return rs.decideLocked(sample, now)
 	}
 	return 0, 0, 0
 }
@@ -1083,52 +1327,89 @@ func (rs *rampState) noteLocked(total int64, now time.Time) (spawnFrom, spawnN, 
 // measureLocked returns one aggregate rate over consecutive equal-byte
 // windows. Summing bytes and duration avoids averaging per-window rates, which
 // would overweight a short, fast sample.
-func (rs *rampState) measureLocked(bytes int64, elapsed time.Duration) (float64, bool) {
+func (rs *rampState) measureLocked(bytes int64, elapsed time.Duration) (rampSample, bool) {
 	rs.sampleBytes += bytes
 	rs.sampleTime += elapsed
 	rs.sampleCount++
 	if rs.sampleCount < rampMeasureWindows {
-		return 0, false
+		return rampSample{}, false
 	}
-	rate := float64(rs.sampleBytes) / max(rs.sampleTime.Seconds(), 1e-9)
+	sample := rampSample{bytes: rs.sampleBytes, elapsed: rs.sampleTime}
 	rs.sampleBytes = 0
 	rs.sampleTime = 0
 	rs.sampleCount = 0
-	return rate, true
+	return sample, true
 }
 
-func (rs *rampState) decideLocked(rate float64, now time.Time) (spawnFrom, spawnN, demoteTo int) {
+func (rs *rampState) decideLocked(sample rampSample, now time.Time) (spawnFrom, spawnN, demoteTo int) {
+	rate := sample.rate()
+	baseline := rs.admissionBaseline.rate()
+	q := rate / max(baseline, 1e-9)
+	judged := rs.admitted - rs.prevAdmitted
+	judgedClamped := judged < rs.prevAdmitted
+	judgedFinal := rs.admitted == rs.parts
 	switch {
-	case rate < rs.admissionBaseline*rampDemote:
-		rs.log.Debug("concurrency ramp: batch not paying, demoting",
-			"admitted", rs.admitted, "keep", rs.prevAdmitted,
-			"rate", int64(rate), "baseline", int64(rs.admissionBaseline))
+	case rate < baseline*rampDemote:
+		rs.recordLocked(rampDecision{
+			action: "demote", reason: "batch-not-paying",
+			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
+				clamped: judgedClamped, final: judgedFinal},
+			measured: sample, q: q, qValid: true,
+		})
 		rs.done.Store(true)
 		return 0, 0, rs.prevAdmitted
-	case rate < rs.admissionBaseline*rampImprovement:
-		rs.log.Debug("concurrency ramp: marginal gain, freezing",
-			"admitted", rs.admitted, "rate", int64(rate),
-			"baseline", int64(rs.admissionBaseline))
+	case rate < baseline*rampImprovement:
+		rs.recordLocked(rampDecision{
+			action: "freeze", reason: "marginal-gain",
+			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
+				clamped: judgedClamped, final: judgedFinal},
+			measured: sample, q: q, qValid: true,
+		})
 		rs.done.Store(true)
 	case rs.admitted < rs.parts:
-		return rs.admitLocked(rate, now)
+		return rs.admitLocked(sample, now)
 	default:
-		// Final batch evaluated and clearly paying.
+		rs.recordLocked(rampDecision{
+			action: "keep-final", reason: "final-batch-paying",
+			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
+				clamped: judgedClamped, final: true},
+			measured: sample, q: q, qValid: true,
+		})
 		rs.done.Store(true)
 	}
 	return 0, 0, 0
 }
 
-func (rs *rampState) admitLocked(baseline float64, now time.Time) (spawnFrom, spawnN, demoteTo int) {
-	rs.admissionBaseline = baseline
+func (rs *rampState) admitLocked(sample rampSample, now time.Time) (spawnFrom, spawnN, demoteTo int) {
+	reason, q, qValid := "first-batch-probe", 0.0, false
+	judgedPrior, judgedAdmitted := 0, 0
+	judgedClamped, judgedFinal := false, false
+	if rs.admissionBaseline.bytes > 0 {
+		reason = "clear-gain"
+		q = sample.rate() / max(rs.admissionBaseline.rate(), 1e-9)
+		qValid = true
+		judgedPrior, judgedAdmitted = rs.prevAdmitted, rs.admitted
+		judged := judgedAdmitted - judgedPrior
+		judgedClamped = judged < judgedPrior
+		judgedFinal = judgedAdmitted == rs.parts
+	}
+	prior := rs.admitted
+	add := min(rs.admitted, rs.parts-rs.admitted)
+	rs.recordLocked(rampDecision{
+		action: "admit", reason: reason,
+		judged: rampBatch{prior: judgedPrior, admitted: judgedAdmitted,
+			clamped: judgedClamped, final: judgedFinal},
+		created: rampBatch{prior: prior, admitted: prior + add,
+			clamped: add < prior, final: prior+add == rs.parts},
+		measured: sample, q: q, qValid: qValid,
+	})
+	rs.admissionBaseline = sample
 	rs.admittedAt = now
 	rs.prevAdmitted = rs.admitted
-	add := min(rs.admitted, rs.parts-rs.admitted)
 	spawnFrom = rs.admitted
 	rs.admitted += add
 	rs.settling = true
-	rs.log.Debug("concurrency ramp: admitting",
-		"admitted", rs.admitted, "baseline", int64(baseline))
+	clear(rs.ready)
 	return spawnFrom, add, 0
 }
 
@@ -1177,6 +1458,12 @@ func (r *run) runWorkers(
 		ctl.cancels[id] = wcancel
 		ctl.mu.Unlock()
 		w := newWorker(id, r, sched, file, picker)
+		if r.ramp != nil && r.ramp.enabled {
+			// Timestamp immediately before goroutine submission so readiness
+			// includes scheduling, dial/TLS, request, and response latency, but
+			// excludes decision-log emission and worker construction.
+			w.spawnedAt = r.ramp.now()
+		}
 		wg.Go(func() {
 			defer func() {
 				ctl.mu.Lock()
@@ -1201,12 +1488,17 @@ func (r *run) runWorkers(
 		}
 	}
 	if r.d.opt.Parts > 1 {
-		// Window: big enough to measure meaningfully, small enough that the
-		// transfer has room to reach full parallelism (~3 doubling steps in
-		// the first fifth). Sized from the REMAINING work so a resumed
-		// download near its end still ramps instead of serializing its
-		// pending chunks.
+		// Window: big enough to measure meaningfully while leaving room to
+		// evaluate several doubling steps. At the remaining/16 branch, the
+		// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
+		// the fixed 2*MinPartSize cap makes it earlier on larger objects.
+		// Size from REMAINING work so a near-complete resume still ramps.
 		window := max(min(2*r.d.opt.MinPartSize, sched.remainingBytes()/16), 1)
+		telemetryEnabled := r.d.log.Enabled(context.Background(), slog.LevelDebug)
+		var runID uint64
+		if telemetryEnabled {
+			runID = r.d.rampRuns.Add(1)
+		}
 		r.ramp = &rampState{
 			spawn:     spawn,
 			demote:    retire,
@@ -1217,6 +1509,9 @@ func (r *run) runWorkers(
 			settleMin: settleFloorFor(r.electDur),
 			admitted:  1,
 			markTime:  time.Now(),
+			enabled:   telemetryEnabled,
+			runID:     runID,
+			unclaimed: unclaimedNetworkFloor(sched, &r.progress),
 		}
 	}
 	spawn(0)

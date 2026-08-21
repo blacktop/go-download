@@ -72,6 +72,10 @@ type worker struct {
 	// announced tracks whether the single-stream path has emitted its
 	// ChunkStart (retries emit ChunkRestart instead).
 	announced bool
+	// sawBody tracks the worker's first received body byte for ramp
+	// readiness telemetry (spawn-to-first-byte latency).
+	sawBody   bool
+	spawnedAt time.Time
 	// sleep is the retry/backoff sleeper; tests replace it with a
 	// channel-coordinated fake to prove cancellation without wall-clock
 	// assertions. Internal seam only.
@@ -412,6 +416,12 @@ func (o *observedReader) Read(p []byte) (int, error) {
 		}
 		total := o.w.r.progress.Add(int64(n))
 		if o.w.r.ramp != nil {
+			if o.w.r.ramp.enabled && !o.w.sawBody {
+				// First body byte this worker ever received: its
+				// spawn-to-first-byte readiness latency (telemetry only).
+				o.w.sawBody = true
+				o.w.r.ramp.noteWorkerReady(o.w.id, o.w.spawnedAt)
+			}
 			o.w.r.ramp.note(total)
 		}
 	}

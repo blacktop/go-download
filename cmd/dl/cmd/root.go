@@ -44,6 +44,67 @@ var log = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
 	TimeFormat:      time.Kitchen,
 })
 
+// rampDecisionLogHandler keeps the evidence file limited to the stable ramp
+// schema. Other debug records may contain local paths or endpoint metadata.
+type rampDecisionLogHandler struct{ slog.Handler }
+
+func (h rampDecisionLogHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if rec.Message != "ramp decision" {
+		return nil
+	}
+	return h.Handler.Handle(ctx, rec)
+}
+
+func (h rampDecisionLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return rampDecisionLogHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h rampDecisionLogHandler) WithGroup(name string) slog.Handler {
+	return rampDecisionLogHandler{Handler: h.Handler.WithGroup(name)}
+}
+
+// fanoutLogHandler delivers each record to every handler that wants it, so
+// the JSON evidence sink never replaces the human --verbose diagnostics.
+type fanoutLogHandler struct{ handlers []slog.Handler }
+
+func (f fanoutLogHandler) Enabled(ctx context.Context, lvl slog.Level) bool {
+	for _, h := range f.handlers {
+		if h.Enabled(ctx, lvl) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f fanoutLogHandler) Handle(ctx context.Context, rec slog.Record) error {
+	var firstErr error
+	for _, h := range f.handlers {
+		if !h.Enabled(ctx, rec.Level) {
+			continue
+		}
+		if err := h.Handle(ctx, rec.Clone()); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (f fanoutLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	next := make([]slog.Handler, len(f.handlers))
+	for i, h := range f.handlers {
+		next[i] = h.WithAttrs(attrs)
+	}
+	return fanoutLogHandler{handlers: next}
+}
+
+func (f fanoutLogHandler) WithGroup(name string) slog.Handler {
+	next := make([]slog.Handler, len(f.handlers))
+	for i, h := range f.handlers {
+		next[i] = h.WithGroup(name)
+	}
+	return fanoutLogHandler{handlers: next}
+}
+
 var flags struct {
 	output   string
 	parts    int
@@ -89,6 +150,24 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 
+		logger := slog.New(log)
+		// DL_LOG_JSON routes ramp decision records to a private JSONL evidence
+		// file; the human CLI rendering is never a parser contract. The sink
+		// fans out beside the human logger so --verbose diagnostics still
+		// reach stderr when both are requested.
+		if path := os.Getenv("DL_LOG_JSON"); path != "" {
+			f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if ferr != nil {
+				return fmt.Errorf("DL_LOG_JSON: %w", ferr)
+			}
+			defer f.Close()
+			logger = slog.New(fanoutLogHandler{handlers: []slog.Handler{
+				log,
+				rampDecisionLogHandler{Handler: slog.NewJSONHandler(f,
+					&slog.HandlerOptions{Level: slog.LevelDebug})},
+			}})
+		}
+
 		opt := &download.Options{
 			Parts:          flags.parts,
 			Timeout:        flags.timeout,
@@ -96,7 +175,7 @@ var rootCmd = &cobra.Command{
 			Headers:        headers,
 			ExpectedSHA256: flags.sha256,
 			Overwrite:      flags.force,
-			Logger:         slog.New(log),
+			Logger:         logger,
 		}
 		if flags.insecure {
 			opt.TLSConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- user opted in

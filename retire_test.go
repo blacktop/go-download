@@ -613,7 +613,8 @@ func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10})
+	logger, cap := newDecisionCapture(t, "constrained-parts4")
+	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10, Logger: logger})
 	dest := filepath.Join(t.TempDir(), "file.bin")
 	start := time.Now()
 	if _, err := d.Get(t.Context(), srv.URL+"/file.bin", dest); err != nil {
@@ -630,6 +631,13 @@ func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	// cannot produce a span this long.
 	if sustained := flows.longestAt(4); sustained < wall/4 {
 		t.Fatalf("longest 4-flow span %v of %v total: flows were not retained", sustained, wall)
+	}
+	// Decision-record view of the same retention claim: the constrained
+	// regime must never emit a demote record.
+	for _, rec := range cap.decisions(t) {
+		if rec["action"] == "demote" {
+			t.Fatalf("constrained run emitted a demote record: %v", rec)
+		}
 	}
 }
 
