@@ -303,3 +303,33 @@ func BenchmarkSizeSweepMultipart(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSmallFileDefault guards the chosen small-file policy: at default
+// options an object under 2x MinPartSize cannot split, so the multipart
+// engine runs one flow with no extra dials and measured within noise of the
+// sequential path while retaining resume (corrected size-crossover
+// experiment, 2026-08-21). A wall-time or allocation regression here means
+// the small-file lifecycle grew real overhead.
+func BenchmarkSmallFileDefault(b *testing.B) {
+	data := testData(4 << 20)
+	var st stats
+	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	b.Cleanup(srv.Close)
+
+	dir := b.TempDir()
+	d, err := New(&Options{Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		dest := filepath.Join(dir, "bench.bin")
+		if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Remove(dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
