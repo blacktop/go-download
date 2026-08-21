@@ -593,11 +593,15 @@ func TestRetirementDoesNotMaskWriteFailure(t *testing.T) {
 // parallelism. The probe is exempt from flow accounting.
 func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	t.Parallel()
-	data := testData(16 << 20)
+	data := testData(8 << 20)
 	flows := &flowLog{}
 	var st stats
+	// 20ms per 64KiB (~3.2 MB/s per connection): slow enough that the
+	// per-flow cap stays sleep-dominated even on a starved 2-vCPU CI
+	// runner under the race detector — if CPU dominates, extra flows
+	// genuinely stop paying and the ramp correctly refuses to reach 4.
 	inner := throttledRangeHandler(data, `"v1"`, &st,
-		8*time.Millisecond, 64, func(*http.Request) bool { return true })
+		20*time.Millisecond, 64, func(*http.Request) bool { return true })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Range") == "bytes=0-0" {
 			inner.ServeHTTP(w, r)

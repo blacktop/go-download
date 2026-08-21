@@ -53,7 +53,11 @@ func TestGetMultipart(t *testing.T) {
 	t.Parallel()
 	data := testData(1 << 20)
 	var st stats
-	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	// Mildly paced (~32 MB/s per connection): at raw loopback speed the
+	// whole file can drain before a second worker's goroutine is even
+	// scheduled on a starved runner, leaving nothing parallel to observe.
+	srv := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &st,
+		2*time.Millisecond, 64, func(*http.Request) bool { return true }))
 	defer srv.Close()
 
 	dest := filepath.Join(t.TempDir(), "file.bin")

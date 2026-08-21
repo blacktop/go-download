@@ -168,7 +168,21 @@ func TestNodeCulling(t *testing.T) {
 	t.Cleanup(func() { cullWarmupBytes = oldWarmup })
 
 	var stFast, stSlow stats
-	fast := httptest.NewServer(rangeHandler(data, `"v1"`, &stFast))
+	// Forfeit probe reuse (Connection: close on the election) so worker 0
+	// draws a pinned node like every other worker: this test is the pinned
+	// exploration/culling oracle, and the shared lease deliberately skips
+	// one exploration draw (the plan promises no particular node for it).
+	// The fast node is mildly paced (~32 MB/s — still ~1000× the slow
+	// node) so the transfer cannot drain at loopback speed before the
+	// second worker has even dialed.
+	inner := throttledRangeHandler(data, `"v1"`, &stFast,
+		2*time.Millisecond, 64, func(*http.Request) bool { return true })
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Connection", "close")
+		}
+		inner.ServeHTTP(w, r)
+	}))
 	defer fast.Close()
 	slow := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &stSlow,
 		30*time.Millisecond, 1, func(*http.Request) bool { return true }))
