@@ -613,7 +613,7 @@ func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	logger, cap := newDecisionCapture(t, "constrained-parts4")
+	logger, cap := newDecisionCapture()
 	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10, Logger: logger})
 	dest := filepath.Join(t.TempDir(), "file.bin")
 	start := time.Now()

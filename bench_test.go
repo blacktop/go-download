@@ -1,7 +1,6 @@
 package download
 
 import (
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -248,59 +247,6 @@ func BenchmarkSharedCapMultipart(b *testing.B) {
 		if err := os.Remove(dest); err != nil {
 			b.Fatal(err)
 		}
-	}
-}
-
-// The size-sweep pair characterizes fixed lifecycle overhead versus object
-// size on an unconstrained loopback: where the probe, staging, ramp, and
-// finalization costs stop dominating and parallel reads start paying.
-// Evidence input for the runway-economics review; no acceptance ratio.
-func BenchmarkSizeSweepStdlib(b *testing.B) {
-	for _, mib := range []int{1, 4, 16, 64} {
-		b.Run(fmt.Sprintf("%dMiB", mib), func(b *testing.B) {
-			data := testData(mib << 20)
-			var st stats
-			srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
-			b.Cleanup(srv.Close)
-			dir := b.TempDir()
-			b.SetBytes(int64(len(data)))
-			for b.Loop() {
-				dest := filepath.Join(dir, "bench.bin")
-				if err := stdlibDownload(srv.URL+"/file.bin", dest); err != nil {
-					b.Fatal(err)
-				}
-				if err := os.Remove(dest); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-func BenchmarkSizeSweepMultipart(b *testing.B) {
-	for _, mib := range []int{1, 4, 16, 64} {
-		b.Run(fmt.Sprintf("%dMiB", mib), func(b *testing.B) {
-			data := testData(mib << 20)
-			var st stats
-			srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
-			b.Cleanup(srv.Close)
-			dir := b.TempDir()
-			d, err := New(&Options{Parts: 4, MinPartSize: 1 << 20,
-				Logger: slog.New(slog.DiscardHandler)})
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.SetBytes(int64(len(data)))
-			for b.Loop() {
-				dest := filepath.Join(dir, "bench.bin")
-				if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
-					b.Fatal(err)
-				}
-				if err := os.Remove(dest); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
 	}
 }
 

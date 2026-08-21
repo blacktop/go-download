@@ -1038,20 +1038,13 @@ type rampState struct {
 	// record construction, readiness locking, and allocations entirely.
 	enabled bool
 	// runID correlates a run's records; seq orders them. pending is the
-	// record built under mu for note() to emit after unlocking — emission
-	// must never hold mu, because the unclaimed-bytes snapshot takes the
-	// scheduler lock.
+	// record built under mu for note() to emit after unlocking.
 	runID   uint64
 	seq     int
 	pending *rampDecision
-	// unclaimed snapshots the scheduler's UNCLAIMED ASSIGNMENT bytes
-	// (pending chunks plus unclaimed active tails); it excludes
-	// claimed-but-unwritten bytes, so it is a floor on remaining work, not
-	// exact remaining completion work. Called only outside mu.
-	unclaimed func() int64
 	// ready records each admitted batch worker's spawn-to-first-body-byte
-	// latency ("A" in the runway model: concurrent readiness, NOT an
-	// additive completion-time cost). Reset at each admission.
+	// latency. The values are concurrent, not additive completion-time costs.
+	// Reset at each admission.
 	ready map[int]time.Duration
 	// emitMu/emitCond/nextEmit serialize record emission in seq order:
 	// after an admission unlocks mu, another worker can cross a later
@@ -1067,8 +1060,8 @@ type rampState struct {
 // owns baseline/rate/q/readiness; an admit action may also create a distinct
 // transition. Keeping those identities separate is essential for later-batch
 // decisions: when 1→2 pays and the governor admits 2→4, the observed q still
-// belongs to 1→2. Readiness is concurrent setup latency ("A" in the runway
-// model), never an additive completion-time cost.
+// belongs to 1→2. Readiness is concurrent setup latency, never an additive
+// completion-time cost.
 type rampDecision struct {
 	seq      int
 	action   string // "admit" | "freeze" | "demote" | "keep-final"
@@ -1110,7 +1103,7 @@ func (b rampBatch) transition() string {
 	return strconv.Itoa(b.prior) + "->" + strconv.Itoa(b.admitted)
 }
 
-const rampDecisionSchema = 2
+const rampDecisionSchema = 3
 
 func (rs *rampState) note(total int64) {
 	if rs.done.Load() {
@@ -1121,12 +1114,6 @@ func (rs *rampState) note(total int64) {
 	rec := rs.pending
 	rs.pending = nil
 	rs.mu.Unlock()
-	unclaimed := int64(-1)
-	if rec != nil && rs.log.Enabled(context.Background(), slog.LevelDebug) && rs.unclaimed != nil {
-		// Snapshot before applying the decision's side effects. In particular,
-		// a demotion must not move remainders before the evidence is captured.
-		unclaimed = rs.unclaimed()
-	}
 	for i := range spawnN {
 		rs.spawn(spawnFrom + i)
 	}
@@ -1134,7 +1121,7 @@ func (rs *rampState) note(total int64) {
 		rs.demote(demoteTo)
 	}
 	if rec != nil {
-		rs.emitOrdered(rec, unclaimed)
+		rs.emitOrdered(rec)
 	}
 }
 
@@ -1144,7 +1131,7 @@ func (rs *rampState) note(total int64) {
 // running the previous decision's side effects. The wait is brief and
 // bounded: the predecessor is already past its decision and its spawn/
 // demote side effects never block.
-func (rs *rampState) emitOrdered(rec *rampDecision, unclaimed int64) {
+func (rs *rampState) emitOrdered(rec *rampDecision) {
 	rs.emitMu.Lock()
 	defer rs.emitMu.Unlock()
 	if rs.emitCond == nil {
@@ -1156,7 +1143,7 @@ func (rs *rampState) emitOrdered(rec *rampDecision, unclaimed int64) {
 	for rs.nextEmit != rec.seq {
 		rs.emitCond.Wait()
 	}
-	rs.emit(rec, unclaimed)
+	rs.emit(rec)
 	rs.nextEmit++
 	rs.emitCond.Broadcast()
 }
@@ -1205,20 +1192,12 @@ func (rs *rampState) recordLocked(rec rampDecision) {
 	rs.pending = &rec
 }
 
-// emit logs one decision record. It runs strictly outside rs.mu; unclaimed
-// was snapshotted before the decision side effects without nesting locks.
-func (rs *rampState) emit(rec *rampDecision, unclaimed int64) {
+// emit logs one decision record. It runs strictly outside rs.mu.
+func (rs *rampState) emit(rec *rampDecision) {
 	if !rs.log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
-	// H estimates how long the remaining assignment would take if the newly
-	// created batch were refused, so its denominator is the current measured
-	// rate at the decision, not the older judged batch's baseline.
-	hEst := -1.0
 	rate := rec.measured.rate()
-	if unclaimed >= 0 && rate > 0 {
-		hEst = float64(unclaimed) / rate
-	}
 	var readyMin, readyMed, readyMax time.Duration = -1, -1, -1
 	if n := len(rec.readyLat); n > 0 {
 		readyMin, readyMed, readyMax = rec.readyLat[0], rec.readyLat[n/2], rec.readyLat[n-1]
@@ -1253,31 +1232,12 @@ func (rs *rampState) emit(rec *rampDecision, unclaimed int64) {
 		"window_bytes", rec.window,
 		"measure_windows", rampMeasureWindows,
 		"settle_floor_ms", rec.settleMin.Milliseconds(),
-		"unclaimed_bytes", unclaimed,
-		"h_est_s", hEst,
 		"ready_min_us", durMicros(readyMin),
 		"ready_med_us", durMicros(readyMed),
 		"ready_max_us", durMicros(readyMax),
 		"ready_workers", len(rec.readyLat),
 		"batch_workers", rec.judged.size(),
 	)
-}
-
-// unclaimedNetworkFloor returns the telemetry snapshot of remaining NETWORK
-// work. The scheduler's unclaimed assignment alone overstates it: note()
-// fires from the body read before the sink advances the claim cursor, so a
-// just-received buffer still counts as unclaimed even though its transfer
-// has completed — up to a full buffer of phantom runway per decision, and a
-// falsely positive runway near completion. Clamping by bytes not yet
-// received this run (initial remaining minus run progress) excludes those
-// buffered bytes; progress may overcount bytes a retirement later
-// discarded, which only lowers the floor further. The result stays a
-// conservative floor, never exact remaining completion work.
-func unclaimedNetworkFloor(sched *scheduler, progress *atomic.Int64) func() int64 {
-	startRemaining := sched.remainingBytes()
-	return func() int64 {
-		return max(min(sched.remainingBytes(), startRemaining-progress.Load()), 0)
-	}
 }
 
 // durMicros renders a readiness latency for logging; -1 means unrecorded.
@@ -1511,7 +1471,6 @@ func (r *run) runWorkers(
 			markTime:  time.Now(),
 			enabled:   telemetryEnabled,
 			runID:     runID,
-			unclaimed: unclaimedNetworkFloor(sched, &r.progress),
 		}
 	}
 	spawn(0)
