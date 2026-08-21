@@ -47,10 +47,14 @@ type Reporter interface {
 	Done(err error)
 }
 
-// ChunkResizer is an optional Reporter extension. ChunkResize fires when a
-// faster worker steals the tail of chunk id: the chunk now covers length
-// bytes (its offset never changes). It is delivered under an internal
-// scheduler lock, totally ordered against the stealing chunk's ChunkStart.
+// ChunkResizer is an optional Reporter extension. ChunkResize fires when
+// chunk id shrinks to cover length bytes (its offset never changes): either
+// a faster worker stole its tail, or the concurrency governor retired its
+// worker and requeued the unclaimed remainder. Retirement may shrink a chunk
+// as far as the bytes already claimed — length can be zero — but never below
+// bytes already reported through ChunkProgress. It is delivered under an
+// internal scheduler lock, totally ordered against any successor chunk's
+// ChunkStart.
 type ChunkResizer interface {
 	ChunkResize(id int, length int64)
 }

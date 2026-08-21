@@ -1,16 +1,19 @@
 package download
 
 import (
+	"slices"
 	"sync"
 	"sync/atomic"
 )
 
 // chunk is a half-open byte range [off, end) of the target file. end may
-// shrink while the chunk is in flight when another worker steals its tail.
+// shrink while the chunk is in flight when another worker steals its tail or
+// its owner is retired.
 type chunk struct {
-	id  int
-	off int64
-	end int64 // guarded by scheduler.mu
+	id    int
+	owner int // worker currently granted this chunk; guarded by scheduler.mu
+	off   int64
+	end   int64 // guarded by scheduler.mu
 	// done is the claim cursor: bytes handed to the owner for writing,
 	// guarded by scheduler.mu.
 	done int64
@@ -22,11 +25,26 @@ type chunk struct {
 // scheduler hands byte ranges to workers. Fresh downloads start with a single
 // chunk covering the whole file; idle workers obtain work by splitting the
 // largest in-flight remainder. Resumed downloads seed pending with the
-// incomplete chunks from the sidecar.
+// incomplete chunks from the sidecar. The ramp can retire excess workers via
+// demote: their unclaimed remainders move to pending and the flow limit
+// refuses them on their next visit.
+//
+// Locking: mu is a leaf lock, with one sanctioned exception — the onGrant and
+// onResize Reporter callbacks execute under it so grant/resize events reach
+// the Reporter in a total order. No other lock may be held on that path.
 type scheduler struct {
 	mu      sync.Mutex
 	pending []*chunk
 	active  map[int]*chunk
+	// live holds workers between registration (first next call) and their
+	// deregistration; retiring marks workers demote selected for exit.
+	// A worker's register/refuse/grant/drain decision happens in ONE
+	// critical section — liveness is never split across calls.
+	live     map[int]struct{}
+	retiring map[int]struct{}
+	// limit caps concurrently granted (non-retiring) workers. 0 means
+	// unlimited; it is only ever lowered, and never below 1.
+	limit   int
 	minSize int64
 	nextID  int
 	// onGrant and onResize, when set, are called under mu as chunks are
@@ -37,7 +55,12 @@ type scheduler struct {
 }
 
 func newScheduler(minSize int64) *scheduler {
-	return &scheduler{active: make(map[int]*chunk), minSize: minSize}
+	return &scheduler{
+		active:   make(map[int]*chunk),
+		live:     make(map[int]struct{}),
+		retiring: make(map[int]struct{}),
+		minSize:  minSize,
+	}
 }
 
 // addPending registers a not-yet-owned chunk. done bytes at the front of the
@@ -51,16 +74,27 @@ func (s *scheduler) addPending(off, end, done int64) {
 	s.pending = append(s.pending, c)
 }
 
-// next returns the next chunk for an idle worker: a pending chunk if any,
-// otherwise the second half of the largest in-flight remainder (when that
-// remainder is at least 2*minSize). Nil means no work is left for this
-// worker. Grant and resize notifications fire under the lock, in order.
-func (s *scheduler) next() *chunk {
+// next returns the next chunk for worker workerID, or nil when the worker
+// must exit. Registration, retirement checks, limit refusal, granting, and
+// drain deregistration all happen in one critical section, so "live" always
+// means "will call next again or is inside downloadChunk".
+func (s *scheduler) next(workerID int) *chunk {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.live[workerID] = struct{}{}
+	if _, ok := s.retiring[workerID]; ok {
+		s.deregisterLocked(workerID)
+		return nil
+	}
+	if s.limit > 0 && s.nonRetiringLiveLocked() > s.limit {
+		// Refusing this caller leaves at least limit >= 1 live workers.
+		s.deregisterLocked(workerID)
+		return nil
+	}
 	if len(s.pending) > 0 {
 		c := s.pending[0]
 		s.pending = s.pending[1:]
+		c.owner = workerID
 		s.active[c.id] = c
 		s.grantLocked(c)
 		return c
@@ -71,29 +105,99 @@ func (s *scheduler) next() *chunk {
 			victim = a
 		}
 	}
-	if victim == nil {
-		return nil
+	if victim != nil {
+		if remaining := victim.end - (victim.off + victim.done); remaining >= 2*s.minSize {
+			mid := victim.off + victim.done + remaining/2
+			c := &chunk{id: s.nextID, owner: workerID, off: mid, end: victim.end}
+			s.nextID++
+			victim.end = mid
+			s.active[c.id] = c
+			if s.onResize != nil {
+				s.onResize(victim.id, victim.end-victim.off)
+			}
+			s.grantLocked(c)
+			return c
+		}
 	}
-	remaining := victim.end - (victim.off + victim.done)
-	if remaining < 2*s.minSize {
-		return nil
-	}
-	mid := victim.off + victim.done + remaining/2
-	c := &chunk{id: s.nextID, off: mid, end: victim.end}
-	s.nextID++
-	victim.end = mid
-	s.active[c.id] = c
-	if s.onResize != nil {
-		s.onResize(victim.id, victim.end-victim.off)
-	}
-	s.grantLocked(c)
-	return c
+	s.deregisterLocked(workerID)
+	return nil
 }
 
-func (s *scheduler) grantLocked(c *chunk) {
-	if s.onGrant != nil {
-		s.onGrant(c.id, c.off, c.end-c.off, c.written.Load())
+// exit deregisters workerID; idempotent. Only for abnormal unwinds (error or
+// context cancellation) — normal exits deregister inside next.
+func (s *scheduler) exit(workerID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deregisterLocked(workerID)
+}
+
+func (s *scheduler) deregisterLocked(workerID int) {
+	delete(s.live, workerID)
+	delete(s.retiring, workerID)
+}
+
+func (s *scheduler) nonRetiringLiveLocked() int {
+	n := len(s.live)
+	for id := range s.retiring {
+		if _, ok := s.live[id]; ok {
+			n--
+		}
 	}
+	return n
+}
+
+// demote caps concurrent flows at keep and selects exactly the excess
+// non-retiring live workers as retirement victims (preferring higher ids,
+// never the last keep survivors). Each victim's unclaimed remainder moves to
+// a fresh pending chunk and its active chunk shrinks to the claim cursor, so
+// the remainder is re-granted to a survivor while the victim finishes within
+// one buffer. Returns the victim ids for wakeup cancellation; assignment
+// coverage (remainingBytes) is conserved exactly.
+func (s *scheduler) demote(keep int) []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keep = max(keep, 1)
+	if s.limit == 0 || keep < s.limit {
+		s.limit = keep
+	}
+	excess := s.nonRetiringLiveLocked() - keep
+	if excess <= 0 {
+		return nil
+	}
+	victims := make([]int, 0, excess)
+	for len(victims) < excess {
+		best := -1
+		for id := range s.live {
+			if _, ok := s.retiring[id]; ok {
+				continue
+			}
+			if !slices.Contains(victims, id) && id > best {
+				best = id
+			}
+		}
+		if best < 0 {
+			break
+		}
+		victims = append(victims, best)
+		s.retiring[best] = struct{}{}
+	}
+	for _, c := range s.active {
+		if _, ok := s.retiring[c.owner]; !ok {
+			continue
+		}
+		cursor := c.off + c.done
+		if cursor >= c.end {
+			continue // already drained; nothing to move
+		}
+		moved := &chunk{id: s.nextID, off: cursor, end: c.end}
+		s.nextID++
+		c.end = cursor
+		s.pending = append(s.pending, moved)
+		if s.onResize != nil {
+			s.onResize(c.id, c.end-c.off)
+		}
+	}
+	return victims
 }
 
 // claim reserves up to n bytes of c for writing. It returns the absolute file
@@ -161,4 +265,10 @@ func (s *scheduler) snapshot() []chunkState {
 		out = append(out, chunkState{Off: c.off, End: c.end, Done: min(c.written.Load(), c.end-c.off)})
 	}
 	return out
+}
+
+func (s *scheduler) grantLocked(c *chunk) {
+	if s.onGrant != nil {
+		s.onGrant(c.id, c.off, c.end-c.off, c.written.Load())
+	}
 }

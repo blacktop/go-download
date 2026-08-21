@@ -196,3 +196,56 @@ func BenchmarkRealMultipart(b *testing.B) {
 	}
 	b.SetBytes(size)
 }
+
+// The shared-cap pair models the saturated access link: one limiter caps the
+// AGGREGATE rate across all connections, so extra flows cannot add
+// throughput and the engine should converge to a single flow.
+
+const (
+	sharedCapSize = 32 << 20
+	sharedCapRate = 32 << 20 // bytes/sec, aggregate
+)
+
+func BenchmarkSharedCapStdlib(b *testing.B) {
+	data := testData(sharedCapSize)
+	var st stats
+	srv := httptest.NewServer(sharedCapHandler(data, `"v1"`, &st,
+		newSharedLimiter(sharedCapRate), nil))
+	b.Cleanup(srv.Close)
+
+	dir := b.TempDir()
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		dest := filepath.Join(dir, "bench.bin")
+		if err := stdlibDownload(srv.URL+"/file.bin", dest); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Remove(dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSharedCapMultipart(b *testing.B) {
+	data := testData(sharedCapSize)
+	var st stats
+	srv := httptest.NewServer(sharedCapHandler(data, `"v1"`, &st,
+		newSharedLimiter(sharedCapRate), nil))
+	b.Cleanup(srv.Close)
+
+	dir := b.TempDir()
+	d, err := New(&Options{Parts: 4, MinPartSize: 1 << 20, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		dest := filepath.Join(dir, "bench.bin")
+		if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Remove(dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

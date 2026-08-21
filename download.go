@@ -36,7 +36,40 @@ const (
 	bufSize = 512 << 10
 
 	flushEvery = time.Second
+
+	// probeDrainTimeout bounds the optional one-byte election-body drain
+	// that makes the probe connection reusable; a slow or malicious body
+	// merely forfeits reuse, never delays the download beyond this.
+	probeDrainTimeout = 250 * time.Millisecond
 )
+
+// drainProbe reads exactly the declared single byte of a valid probe body
+// and closes it, under a hard time budget enforced by a timer that closes
+// the body to unblock the read. Returns true only when both the read and
+// the ordinary close succeed in time — the connection is then back in the
+// transport pool. A second Close from a raced timer callback is safe on
+// net/http response bodies.
+func drainProbe(body io.ReadCloser, budget time.Duration) bool {
+	timer := time.AfterFunc(budget, func() { body.Close() })
+	var b [2]byte
+	n, err := body.Read(b[:])
+	ok := n == 1
+	if ok && err == nil {
+		m, err2 := body.Read(b[:])
+		ok = m == 0 && errors.Is(err2, io.EOF)
+	} else if ok {
+		ok = errors.Is(err, io.EOF)
+	}
+	if !timer.Stop() {
+		// The budget expired: the callback closed (or is closing) the
+		// body; the connection cannot be trusted back into the pool.
+		return false
+	}
+	if cerr := body.Close(); cerr != nil {
+		return false
+	}
+	return ok
+}
 
 // Options configures a Downloader. The zero value (or nil) means defaults.
 type Options struct {
@@ -140,6 +173,9 @@ type Downloader struct {
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// resolveHook overrides DNS resolution in tests.
 	resolveHook func(ctx context.Context, host string) ([]netip.Addr, error)
+	// sleepHook replaces every worker's retry/backoff sleeper in tests
+	// (channel-coordinated fakes instead of wall-clock assertions).
+	sleepHook func(ctx context.Context, d time.Duration) error
 }
 
 // New returns a Downloader. A nil opt selects all defaults.
@@ -206,8 +242,16 @@ func New(opt *Options) (*Downloader, error) {
 // dialContext routes through d.dial so pinned transports and tests share one
 // dialer seam.
 func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx.Value(sharedLeaseContextKey{}) != nil {
+		return nil, errSharedLeaseMiss
+	}
 	return d.dial(ctx, network, addr)
 }
+
+// sharedLeaseContextKey marks worker 0's one reuse-only base-pool attempt.
+// Transport.getConn retains request-context values in its detached dial
+// context, so a pool miss fails closed without opening a new connection.
+type sharedLeaseContextKey struct{}
 
 // newTransport builds the internal transport: HTTP/1.1 only, because HTTP/2
 // would multiplex every parallel range request onto a single TCP connection
@@ -376,10 +420,12 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
+	electStart := time.Now()
 	resp, err := d.elect(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
+	electDur := time.Since(electStart)
 	finalURL := resp.Request.URL.String()
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
@@ -410,8 +456,16 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		total = resp.ContentLength
 	}
 	// The election response served its purpose (final URL, headers,
-	// status); workers issue their own ranged requests.
-	resp.Body.Close()
+	// status); workers issue their own ranged requests. A valid one-byte
+	// multipart probe through the internal transport is drained (bounded)
+	// so its connection returns to the pool for reuse; anything else keeps
+	// today's immediate close.
+	probeReusable := false
+	if d.base != nil && multipart && resp.ContentLength == 1 && !resp.Close {
+		probeReusable = drainProbe(resp.Body, min(probeDrainTimeout, d.opt.Timeout))
+	} else {
+		resp.Body.Close()
+	}
 
 	d.log.Debug("election", "url", redactURL(finalURL), "status", resp.StatusCode,
 		"total", total, "multipart", multipart, "dest", destPath)
@@ -429,7 +483,9 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		etag:        etag,
 		lastMod:     lastMod,
 		contentType: contentType,
+		electDur:    electDur,
 	}
+	r.probeReusable = probeReusable
 	if r.total > 0 && r.validator() == "" && !r.checksumConfigured() {
 		multipart = false
 		// The probe's total belongs to a representation we cannot bind to
@@ -788,6 +844,14 @@ type run struct {
 	etag        string
 	lastMod     string
 	contentType string // from the election probe response
+	// electDur is the election round-trip wall time: the best available
+	// proxy for what a fresh connection on this path costs (DNS, dial, TLS,
+	// TTFB). It scales the ramp's settling floor.
+	electDur time.Duration
+	// probeReusable records that the election body was fully consumed and
+	// closed through the internal transport, so its connection is back in
+	// the base pool (Step 1 of probe reuse leases it to worker 0).
+	probeReusable bool
 	// progress counts body bytes read this run (drives the concurrency ramp).
 	progress atomic.Int64
 	// ramp is the adaptive-concurrency governor; nil when Parts is 1 or on
@@ -891,29 +955,78 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 }
 
 // rampImprovement is the minimum aggregate-throughput gain a newly admitted
-// batch of connections must show before the governor admits more.
-const rampImprovement = 1.15
+// batch of connections must show before the governor admits more; below
+// rampDemote the batch is judged not to be paying at all and is retired.
+const (
+	rampImprovement = 1.15
+	rampDemote      = 1.02
+	// Two equal-byte decision windows damp short limiter/scheduler timing noise
+	// without delaying the first probe batch or adding a public tuning surface.
+	rampMeasureWindows = 2
+	// A just-admitted batch must get wall time to dial before it is judged:
+	// byte windows alone can elapse before a spawned worker has even
+	// connected (instant on fast links), which would demote a flow that
+	// never got to contribute. The needed time is the path's connect cost,
+	// so each run scales its settle floor from the measured election
+	// round-trip, clamped to [rampSettleFloor, rampSettleCap]. The floor
+	// only guards a degenerate near-zero measurement — settling always
+	// spans at least one full byte window on top of it.
+	rampSettleFloor = time.Millisecond
+	rampSettleCap   = 200 * time.Millisecond
+)
+
+// settleFloorFor derives a run's settling wall floor from its election
+// round-trip: twice the observed cost of a fresh request on this path,
+// clamped so a degenerate measurement can neither erase the floor nor
+// stretch it past the fixed cap.
+func settleFloorFor(electDur time.Duration) time.Duration {
+	return min(max(2*electDur, rampSettleFloor), rampSettleCap)
+}
 
 // rampState is the adaptive-concurrency governor: workers are admitted in
-// doubling steps (1→2→4→…), each step gated on a measurement window of
-// 2×MinPartSize downloaded bytes. The first extra connection is always
-// probed; every later step must have improved aggregate throughput by
-// rampImprovement, otherwise admission stops — the bottleneck is the path,
-// not the flow count — and the download transparently behaves like a
-// single-stream client. Workers trip note() as bytes land, so the ramp is
-// byte-accurate at any link speed.
+// doubling steps (1→2→4→…). The first window is slow-start burn-in; each
+// admission is preceded by a baseline window and followed by one full
+// settling window (dial/TLS startup must not be read as "not paying"), then
+// a stabilized decision measurement judged against that baseline:
+//
+//	rate <  1.02×baseline → demote back to prevAdmitted, done
+//	rate <  1.15×baseline → freeze and keep the admitted flows, done
+//	rate >= 1.15×baseline → admit the next clamped batch
+//
+// Reaching Parts stops spawning but the final batch is still evaluated — a
+// flat final batch demotes like any other. Workers trip note() as bytes
+// land, so the ramp is byte-accurate at any link speed.
 type rampState struct {
-	done     atomic.Bool // fast path for the per-read check
-	mu       sync.Mutex
+	done atomic.Bool // fast path for the per-read check
+	mu   sync.Mutex
+	// spawn and demote are side effects executed by note AFTER rs.mu is
+	// released; rs.mu never nests with the scheduler or controller locks.
 	spawn    func(int)
+	demote   func(keep int)
 	log      *slog.Logger
+	now      func() time.Time // injected in tests
 	parts    int
 	window   int64
-	warmed   bool // first window recorded as slow-start burn-in baseline
-	admitted int
-	lastRate float64
-	markAt   int64
-	markTime time.Time
+	warmed   bool // burn-in window consumed
+	settling bool // one no-decision window after each admission
+	// settleMin is the wall-time floor settling must span, derived from the
+	// election round-trip at run start (see rampSettleFloor/rampSettleCap).
+	settleMin time.Duration
+	admitted  int
+	// admittedAt is when the most recent batch was admitted; settling does
+	// not complete before settleMin has elapsed since then.
+	admittedAt time.Time
+	// prevAdmitted is the flow count before the most recent batch, recorded
+	// at admission time (batches are clamped: Parts=6 admits 1→2→4→6).
+	prevAdmitted int
+	// admissionBaseline is the steady rate of the window preceding the most
+	// recent admission; settling windows never overwrite it.
+	admissionBaseline float64
+	sampleBytes       int64
+	sampleTime        time.Duration
+	sampleCount       int
+	markAt            int64
+	markTime          time.Time
 }
 
 func (rs *rampState) note(total int64) {
@@ -921,36 +1034,102 @@ func (rs *rampState) note(total int64) {
 		return
 	}
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
+	spawnFrom, spawnN, demoteTo := rs.noteLocked(total, rs.now())
+	rs.mu.Unlock()
+	for i := range spawnN {
+		rs.spawn(spawnFrom + i)
+	}
+	if demoteTo > 0 {
+		rs.demote(demoteTo)
+	}
+}
+
+// noteLocked advances the ramp state machine by at most one window and
+// returns the side effects to run after the lock is released: workers to
+// spawn and/or a flow count to demote to. Pure given (total, now).
+func (rs *rampState) noteLocked(total int64, now time.Time) (spawnFrom, spawnN, demoteTo int) {
 	if rs.done.Load() || total-rs.markAt < rs.window {
-		return
+		return 0, 0, 0
 	}
-	rate := float64(total-rs.markAt) / max(time.Since(rs.markTime).Seconds(), 1e-9)
-	if !rs.warmed {
-		// Burn-in: the first window mostly measures TCP slow-start of the
-		// initial connection. Recording it as the baseline (instead of
-		// admitting on it) stops warm-up gains from being credited to
-		// admissions that contributed nothing.
-		rs.warmed = true
-	} else if rs.admitted > 1 && rate < rs.lastRate*rampImprovement {
-		rs.log.Debug("concurrency ramp stopped: extra connections not paying",
-			"admitted", rs.admitted, "rate", int64(rate), "previous", int64(rs.lastRate))
-		rs.done.Store(true)
-		return
-	} else {
-		add := min(rs.admitted, rs.parts-rs.admitted)
-		for i := range add {
-			rs.spawn(rs.admitted + i)
-		}
-		rs.admitted += add
-		rs.log.Debug("concurrency ramp", "admitted", rs.admitted, "rate", int64(rate))
-		if rs.admitted >= rs.parts {
-			rs.done.Store(true)
-		}
-	}
-	rs.lastRate = rate
+	bytes := total - rs.markAt
+	elapsed := now.Sub(rs.markTime)
 	rs.markAt = total
-	rs.markTime = time.Now()
+	rs.markTime = now
+	switch {
+	case !rs.warmed:
+		// Burn-in: mostly TCP slow-start of the first connection.
+		rs.warmed = true
+	case rs.settling:
+		// The just-admitted batch is still dialing/ramping; consume windows
+		// without deciding and without touching the baseline, and do not
+		// finish settling before the batch had wall time to connect.
+		if now.Sub(rs.admittedAt) >= rs.settleMin {
+			rs.settling = false
+		}
+	case rs.admitted == 1 && rs.admitted < rs.parts:
+		// Record the pre-admission steady window and probe the first batch.
+		rate := float64(bytes) / max(elapsed.Seconds(), 1e-9)
+		return rs.admitLocked(rate, now)
+	default:
+		rate, ready := rs.measureLocked(bytes, elapsed)
+		if !ready {
+			return 0, 0, 0
+		}
+		return rs.decideLocked(rate, now)
+	}
+	return 0, 0, 0
+}
+
+// measureLocked returns one aggregate rate over consecutive equal-byte
+// windows. Summing bytes and duration avoids averaging per-window rates, which
+// would overweight a short, fast sample.
+func (rs *rampState) measureLocked(bytes int64, elapsed time.Duration) (float64, bool) {
+	rs.sampleBytes += bytes
+	rs.sampleTime += elapsed
+	rs.sampleCount++
+	if rs.sampleCount < rampMeasureWindows {
+		return 0, false
+	}
+	rate := float64(rs.sampleBytes) / max(rs.sampleTime.Seconds(), 1e-9)
+	rs.sampleBytes = 0
+	rs.sampleTime = 0
+	rs.sampleCount = 0
+	return rate, true
+}
+
+func (rs *rampState) decideLocked(rate float64, now time.Time) (spawnFrom, spawnN, demoteTo int) {
+	switch {
+	case rate < rs.admissionBaseline*rampDemote:
+		rs.log.Debug("concurrency ramp: batch not paying, demoting",
+			"admitted", rs.admitted, "keep", rs.prevAdmitted,
+			"rate", int64(rate), "baseline", int64(rs.admissionBaseline))
+		rs.done.Store(true)
+		return 0, 0, rs.prevAdmitted
+	case rate < rs.admissionBaseline*rampImprovement:
+		rs.log.Debug("concurrency ramp: marginal gain, freezing",
+			"admitted", rs.admitted, "rate", int64(rate),
+			"baseline", int64(rs.admissionBaseline))
+		rs.done.Store(true)
+	case rs.admitted < rs.parts:
+		return rs.admitLocked(rate, now)
+	default:
+		// Final batch evaluated and clearly paying.
+		rs.done.Store(true)
+	}
+	return 0, 0, 0
+}
+
+func (rs *rampState) admitLocked(baseline float64, now time.Time) (spawnFrom, spawnN, demoteTo int) {
+	rs.admissionBaseline = baseline
+	rs.admittedAt = now
+	rs.prevAdmitted = rs.admitted
+	add := min(rs.admitted, rs.parts-rs.admitted)
+	spawnFrom = rs.admitted
+	rs.admitted += add
+	rs.settling = true
+	rs.log.Debug("concurrency ramp: admitting",
+		"admitted", rs.admitted, "baseline", int64(baseline))
+	return spawnFrom, add, 0
 }
 
 // runWorkers drives the worker pool and the periodic sidecar flusher,
@@ -985,13 +1164,41 @@ func (r *run) runWorkers(
 			cancel(err)
 		})
 	}
+	// ctl holds each worker's cancel so retirement can wake it out of
+	// reads, dials, and sleeps. Never hold ctl.mu while cancelling or while
+	// calling scheduler/Reporter code.
+	ctl := struct {
+		mu      sync.Mutex
+		cancels map[int]context.CancelCauseFunc
+	}{cancels: make(map[int]context.CancelCauseFunc)}
 	spawn := func(id int) {
+		wctx, wcancel := context.WithCancelCause(runCtx)
+		ctl.mu.Lock()
+		ctl.cancels[id] = wcancel
+		ctl.mu.Unlock()
 		w := newWorker(id, r, sched, file, picker)
 		wg.Go(func() {
-			if err := w.run(runCtx); err != nil {
+			defer func() {
+				ctl.mu.Lock()
+				delete(ctl.cancels, id)
+				ctl.mu.Unlock()
+				wcancel(nil)
+			}()
+			if err := w.run(wctx); err != nil {
 				fail(err)
 			}
 		})
+	}
+	retire := func(keep int) {
+		victims := sched.demote(keep)
+		for _, id := range victims {
+			ctl.mu.Lock()
+			wcancel := ctl.cancels[id]
+			ctl.mu.Unlock()
+			if wcancel != nil {
+				wcancel(errWorkerRetired)
+			}
+		}
 	}
 	if r.d.opt.Parts > 1 {
 		// Window: big enough to measure meaningfully, small enough that the
@@ -1001,12 +1208,15 @@ func (r *run) runWorkers(
 		// pending chunks.
 		window := max(min(2*r.d.opt.MinPartSize, sched.remainingBytes()/16), 1)
 		r.ramp = &rampState{
-			spawn:    spawn,
-			log:      r.d.log,
-			parts:    r.d.opt.Parts,
-			window:   window,
-			admitted: 1,
-			markTime: time.Now(),
+			spawn:     spawn,
+			demote:    retire,
+			log:       r.d.log,
+			now:       time.Now,
+			parts:     r.d.opt.Parts,
+			window:    window,
+			settleMin: settleFloorFor(r.electDur),
+			admitted:  1,
+			markTime:  time.Now(),
 		}
 	}
 	spawn(0)
@@ -1051,7 +1261,18 @@ func (r *run) runWorkers(
 		return err
 	}
 	if !sched.idle() {
-		return errors.New("internal: workers exited with work remaining")
+		sched.mu.Lock()
+		detail := fmt.Sprintf("pending=%d active=%d live=%v retiring=%v limit=%d",
+			len(sched.pending), len(sched.active), sched.live, sched.retiring, sched.limit)
+		for _, c := range sched.active {
+			detail += fmt.Sprintf(" active[%d]{owner=%d off=%d done=%d end=%d}",
+				c.id, c.owner, c.off, c.done, c.end)
+		}
+		for _, c := range sched.pending {
+			detail += fmt.Sprintf(" pending[%d]{off=%d done=%d end=%d}", c.id, c.off, c.done, c.end)
+		}
+		sched.mu.Unlock()
+		return fmt.Errorf("internal: workers exited with work remaining (%s)", detail)
 	}
 	return nil
 }

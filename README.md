@@ -60,17 +60,18 @@ The in-repo benchmarks measure both regimes against a stdlib `http.Get` +
 
 | Scenario | `http.Get` | `go-download` | |
 |---|---|---|---|
-| Per-connection throttle, loopback (64 MiB, each connection capped ~28 MB/s) | 28 MB/s | **92–99 MB/s** (ramps to 4 parts) | **~3.5×** |
-| Unconstrained loopback (8 MiB — no bottleneck to parallelize) | ~2.5 GB/s | ~0.9 GB/s | 0.36× |
-| Real WAN, single-flow-saturated line (Hetzner `100MB.bin`, ~130 Mbit link) | ~13–15 MB/s | ~8–10 MB/s (ramp stops at 2) | ~0.7× |
+| Per-connection throttle, loopback (64 MiB, each connection capped ~28 MB/s) | ~27 MB/s | **77–87 MB/s** (ramps to 4 parts) | **~3.1×** |
+| Unconstrained loopback (8 MiB — no bottleneck to parallelize) | ~2.5–3.1 GB/s | ~1.0–1.1 GB/s | ~0.36× |
+| Real WAN, single-flow-saturated line (Hetzner `100MB.bin`, paired vs `curl --http1.1`) | 1.4–7.1 MB/s (line varied) | retires back to 1 connection | **1.03× median** over 10 interleaved rounds |
 
 The constrained row is the design target and matches an independent
 measurement by [ipsw](https://github.com/blacktop/ipsw), whose engine
 benchmarks recorded 3.76× throughput on constrained paths. The other rows
-are the honest fine print: with no per-flow limit the engine's probe,
-staging, verification, fsync, and the one probed-but-kept extra connection
-cost ~20–30% on a saturated WAN link (the ramp currently only stops adding
-connections; it does not yet retire a probed flow that failed to pay).
+are the honest fine print: with no per-flow limit there is nothing to
+parallelize, so the ramp retires probed flows that failed to pay back to
+the last winning count (a single connection on a saturated line) and the
+first worker reuses the probe's connection. The end-to-end result still
+includes the probe round-trip, staging, verification, and fsync costs.
 Loopback numbers mostly measure fixed overhead, and real-network results
 vary run to run with the line itself.
 

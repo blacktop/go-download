@@ -180,3 +180,151 @@ func parseFullRange(h string, size int64) (start, end int64, ok bool) {
 	}
 	return start, min(end, size-1), true
 }
+
+// sharedLimiter caps the AGGREGATE byte rate across every connection that
+// acquires from it — modeling a saturated access link, where adding flows
+// cannot add throughput (contrast: throttledRangeHandler caps each flow).
+type sharedLimiter struct {
+	mu      sync.Mutex
+	next    time.Time
+	perByte time.Duration
+}
+
+func newSharedLimiter(bytesPerSec int64) *sharedLimiter {
+	return &sharedLimiter{perByte: time.Duration(int64(time.Second) / bytesPerSec)}
+}
+
+// acquire blocks until n bytes may be sent without exceeding the shared rate.
+func (l *sharedLimiter) acquire(n int) {
+	l.mu.Lock()
+	now := time.Now()
+	if l.next.Before(now) {
+		l.next = now
+	}
+	wait := l.next.Sub(now)
+	l.next = l.next.Add(time.Duration(n) * l.perByte)
+	l.mu.Unlock()
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+// flowLog records ranged-body concurrency transitions with timestamps so a
+// test can read the steady-state flow count near the end of a transfer.
+type flowLog struct {
+	mu     sync.Mutex
+	conc   int
+	events []flowEvent
+}
+
+type flowEvent struct {
+	at   time.Time
+	conc int
+}
+
+func (f *flowLog) enter() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.conc++
+	f.events = append(f.events, flowEvent{time.Now(), f.conc})
+}
+
+func (f *flowLog) exit() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.conc--
+	f.events = append(f.events, flowEvent{time.Now(), f.conc})
+}
+
+// maxConcBetween returns the maximum concurrency in force during [a, b]:
+// the last event at or before a seeds the running value.
+func (f *flowLog) maxConcBetween(a, b time.Time) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur, peak := 0, 0
+	for _, e := range f.events {
+		if e.at.Before(a) {
+			cur = e.conc
+			continue
+		}
+		if e.at.After(b) {
+			break
+		}
+		peak = max(peak, cur, e.conc)
+		cur = e.conc
+	}
+	return max(peak, cur)
+}
+
+// sharedCapHandler serves ranged (206) and plain (200) requests, pacing all
+// body bytes through one shared limiter; the one-byte election probe is
+// exempt so it cannot skew flow accounting or the measured rate.
+func sharedCapHandler(data []byte, etag string, st *stats, lim *sharedLimiter, flows *flowLog) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st.enter(r)
+		defer st.exit()
+		if r.Header.Get("Range") == "bytes=0-0" {
+			if etag != "" {
+				w.Header().Set("ETag", etag)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data[:1])
+			return
+		}
+		body := data
+		if start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data))); ok {
+			if etag != "" {
+				w.Header().Set("ETag", etag)
+			}
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			body = data[start : end+1]
+		} else {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+		}
+		if flows != nil {
+			flows.enter()
+			defer flows.exit()
+		}
+		for len(body) > 0 {
+			n := min(16<<10, len(body))
+			lim.acquire(n)
+			if _, err := w.Write(body[:n]); err != nil {
+				return
+			}
+			st.addServed(n)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			body = body[n:]
+		}
+	})
+}
+
+// longestAt returns the longest continuous wall-time span during which the
+// in-force concurrency was at least n.
+func (f *flowLog) longestAt(n int) time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var longest time.Duration
+	var since time.Time
+	active := false
+	for _, e := range f.events {
+		switch {
+		case e.conc >= n && !active:
+			active, since = true, e.at
+		case e.conc < n && active:
+			active = false
+			longest = max(longest, e.at.Sub(since))
+		}
+	}
+	if active && len(f.events) > 0 {
+		longest = max(longest, f.events[len(f.events)-1].at.Sub(since))
+	}
+	return longest
+}

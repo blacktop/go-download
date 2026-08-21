@@ -331,7 +331,7 @@ func TestRetryableResponseBodiesCloseOnce(t *testing.T) {
 				sched := newScheduler(1)
 				sched.addPending(0, 1, 0)
 				w.sched = sched
-				err = w.attempt(t.Context(), sched.next())
+				err = w.attempt(t.Context(), sched.next(0))
 			} else {
 				err = w.singleAttempt(t.Context())
 			}
@@ -719,7 +719,7 @@ func TestRetryableStatusDropsPinnedNode(t *testing.T) {
 	}
 	sched := newScheduler(4 << 10)
 	sched.addPending(0, int64(len(data)), 0)
-	grant := sched.next()
+	grant := sched.next(0)
 	run := &run{
 		d: d, rep: NopReporter{}, url: "http://cdn.test/file.bin", sourceURL: &url.URL{Scheme: "http", Host: "cdn.test"},
 		total: int64(len(data)), etag: `"v1"`, partPath: dest,

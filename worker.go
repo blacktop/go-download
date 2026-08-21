@@ -32,6 +32,11 @@ var (
 	errStall           = errors.New("read stalled")
 	errCulled          = errors.New("node statistically slow, reassigning")
 	errNodeUnreachable = errors.New("node unreachable, reassigning")
+	// errWorkerRetired is the cancellation cause used to wake and gracefully
+	// stop a worker the ramp demoted; it must never surface as a download
+	// failure.
+	errWorkerRetired   = errors.New("worker retired by concurrency governor")
+	errSharedLeaseMiss = errors.New("reusable probe connection unavailable")
 	errRangeCapped     = errors.New("server capped range response")
 	errShortBody       = errors.New("server closed body before range completed")
 	errRangeIgnored    = errors.New("server ignored Range request")
@@ -54,21 +59,28 @@ type worker struct {
 	file   *os.File
 	picker *picker // nil when pinning is disabled
 
-	node    *node
-	client  *http.Client
-	timeout time.Duration
-	dtt     int // full buffers until the next timeout decay step
-	bo      backoff
-	buf     []byte
-	bufp    *[]byte // pool token for releaseBuf
+	node   *node
+	client *http.Client
+	// sharedClient is worker 0's one-attempt lease on the base transport. It
+	// must be detached without closing the base pool after that attempt.
+	sharedClient bool
+	timeout      time.Duration
+	dtt          int // full buffers until the next timeout decay step
+	bo           backoff
+	buf          []byte
+	bufp         *[]byte // pool token for releaseBuf
 	// announced tracks whether the single-stream path has emitted its
 	// ChunkStart (retries emit ChunkRestart instead).
 	announced bool
+	// sleep is the retry/backoff sleeper; tests replace it with a
+	// channel-coordinated fake to prove cancellation without wall-clock
+	// assertions. Internal seam only.
+	sleep func(ctx context.Context, d time.Duration) error
 }
 
 func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *worker {
 	bp := r.d.bufs.Get().(*[]byte)
-	return &worker{
+	w := &worker{
 		id:      id,
 		r:       r,
 		sched:   sched,
@@ -77,7 +89,16 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *work
 		timeout: r.d.opt.Timeout,
 		buf:     *bp,
 		bufp:    bp,
+		sleep:   sleepCtx,
 	}
+	if r.d.sleepHook != nil {
+		w.sleep = r.d.sleepHook
+	}
+	if id == 0 && p != nil && r.probeReusable {
+		w.client = r.d.newClient(r.d.base)
+		w.sharedClient = true
+	}
+	return w
 }
 
 // releaseBuf returns the worker's read buffer to the Downloader pool.
@@ -95,21 +116,54 @@ func (w *worker) releaseBuf() {
 func (w *worker) run(ctx context.Context) error {
 	defer w.releaseBuf()
 	defer w.dropNode()
+	defer w.sched.exit(w.id)
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		c := w.sched.next()
+		c := w.sched.next(w.id)
 		if c == nil {
 			return nil
 		}
 		if err := w.downloadChunk(ctx, c); err != nil {
+			if context.Cause(ctx) == errWorkerRetired { //nolint:errorlint // exact internal sentinel
+				// Genuine permanent failures (integrity, protocol, writes, and
+				// the retirement invariant) must reach fail when retirement races
+				// them. Other cancellation causes retain caller/parent precedence.
+				if genuineUnderRetirement(err) {
+					return err
+				}
+				// Universal retirement net: the governor shrank this chunk
+				// to its claim cursor under the scheduler lock before
+				// cancelling, so whatever error escaped downloadChunk
+				// (cancellation can land between any two instructions
+				// there), the chunk is drained and every claimed byte was
+				// written — complete it and exit cleanly.
+				off, _, todo := w.sched.cursor(c)
+				if !todo && c.written.Load() == off-c.off {
+					w.sched.complete(c)
+					w.r.rep.ChunkDone(c.id)
+					return nil
+				}
+				// Structurally unreachable; fail loudly, never strand.
+				return &permanentError{fmt.Errorf(
+					"internal: retired worker %d left chunk %d incomplete", w.id, c.id)}
+			}
 			if ctx.Err() != nil {
 				return nil // cancellation noise; the cause carries the story
 			}
 			return err
 		}
 	}
+}
+
+// genuineUnderRetirement decides error precedence when retirement races a
+// failure: permanent errors (integrity, protocol, content-change, writes,
+// and the retirement invariant itself) must still reach the pool's fail
+// path; anything else is retirement noise the graceful net may absorb.
+func genuineUnderRetirement(err error) bool {
+	_, genuine := errors.AsType[*permanentError](err)
+	return genuine
 }
 
 // downloadChunk retries a chunk until done or the retry budget is spent.
@@ -126,11 +180,27 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			w.r.rep.ChunkDone(c.id)
 			return nil
 		}
-		if ctx.Err() != nil {
-			return err
+		if errors.Is(err, errSharedLeaseMiss) {
+			if ctx.Err() != nil {
+				return err
+			}
+			// The base pool had no acceptable reused connection. attempt detached
+			// the shared client, so retry immediately through normal pinned
+			// selection without a strike, backoff, or retry-budget charge.
+			continue
 		}
 		if perm, ok := errors.AsType[*permanentError](err); ok {
-			return fmt.Errorf("chunk %d: %w", c.id, perm.err)
+			// Genuine permanent/integrity/write failures always win a race
+			// with retirement and keep today's first-error behavior. Wrap
+			// the marker itself so run() can distinguish genuine failures
+			// from cancellation noise.
+			return fmt.Errorf("chunk %d: %w", c.id, perm)
+		}
+		if ctx.Err() != nil {
+			// Retirement handling lives in run()'s universal net: the
+			// cancel can land between any two instructions here, so no
+			// in-loop check can be complete.
+			return err
 		}
 		if errors.Is(err, errRangeCapped) {
 			// A complete server-declared subrange advanced the cursor. Continue
@@ -158,7 +228,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			if cur := w.r.progress.Load(); cur > chargedAt {
 				chargedAt = cur
 				w.r.d.log.Debug("waiting out server throttle", "worker", w.id, "chunk", c.id)
-				if serr := sleepCtx(ctx, time.Second); serr != nil {
+				if serr := w.sleep(ctx, time.Second); serr != nil {
 					return err
 				}
 				continue
@@ -179,7 +249,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 		if !throttled {
 			delay = w.bo.next()
 		}
-		if serr := sleepCtx(ctx, delay); serr != nil {
+		if serr := w.sleep(ctx, delay); serr != nil {
 			return err
 		}
 	}
@@ -194,6 +264,10 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if err := w.ensureClient(ctx); err != nil {
 		return err
 	}
+	sharedAttempt := w.sharedClient
+	if sharedAttempt {
+		defer w.detachSharedClient()
+	}
 
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -201,9 +275,17 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	defer timer.Stop()
 
 	trace := &httptrace.ClientTrace{GotConn: func(ci httptrace.GotConnInfo) {
+		if sharedAttempt && !ci.Reused {
+			cancel(errSharedLeaseMiss)
+			return
+		}
 		w.r.rep.Connected(c.id, ci.Conn.RemoteAddr().String())
 	}}
-	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(actx, trace),
+	reqCtx := httptrace.WithClientTrace(actx, trace)
+	if sharedAttempt {
+		reqCtx = context.WithValue(reqCtx, sharedLeaseContextKey{}, struct{}{})
+	}
+	req, err := http.NewRequestWithContext(reqCtx,
 		http.MethodGet, w.r.url, nil)
 	if err != nil {
 		return &permanentError{err}
@@ -216,7 +298,14 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
+		if context.Cause(actx) == errSharedLeaseMiss || errors.Is(err, errSharedLeaseMiss) { //nolint:errorlint // exact internal sentinel
+			return errSharedLeaseMiss
+		}
 		return w.classify(err, actx)
+	}
+	if context.Cause(actx) == errSharedLeaseMiss { //nolint:errorlint // exact internal sentinel
+		_ = resp.Body.Close()
+		return errSharedLeaseMiss
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
@@ -494,6 +583,10 @@ func (w *worker) ensureClient(ctx context.Context) error {
 // (possibly different) one. A no-op when pinning is disabled: the shared
 // client must not be torn down.
 func (w *worker) dropNode() {
+	if w.sharedClient {
+		w.detachSharedClient()
+		return
+	}
 	if w.picker == nil || w.node == nil {
 		return
 	}
@@ -503,6 +596,14 @@ func (w *worker) dropNode() {
 	w.client = nil
 	w.picker.release(w.node)
 	w.node = nil
+}
+
+func (w *worker) detachSharedClient() {
+	if !w.sharedClient {
+		return
+	}
+	w.client = nil
+	w.sharedClient = false
 }
 
 func (w *worker) strikeNode() {
@@ -530,7 +631,7 @@ func (w *worker) singleStream(ctx context.Context) error {
 			return fmt.Errorf("%w: %w", ErrMaxRetry, err)
 		}
 		w.r.rep.ChunkRetry(0, attempt+1, err)
-		if serr := sleepCtx(ctx, w.bo.next()); serr != nil {
+		if serr := w.sleep(ctx, w.bo.next()); serr != nil {
 			return err
 		}
 	}
