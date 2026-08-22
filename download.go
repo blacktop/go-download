@@ -14,11 +14,10 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/netip"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,50 +31,18 @@ const (
 	defaultTimeout     = 15 * time.Second
 	defaultMaxRetries  = 10
 
-	// bufSize is the read-buffer size. TLS caps records at 16 KiB; a large
-	// user-space buffer amortizes the syscall and copy overhead.
+	// bufSize is the worker read-buffer size. TLS caps records at 16 KiB; a
+	// large user-space buffer amortizes the syscall and copy overhead.
 	bufSize = 512 << 10
 
 	flushEvery = time.Second
-
-	// probeDrainTimeout bounds the optional one-byte election-body drain
-	// that makes the probe connection reusable; a slow or malicious body
-	// merely forfeits reuse, never delays the download beyond this.
-	probeDrainTimeout = 250 * time.Millisecond
 )
-
-// drainProbe reads exactly the declared single byte of a valid probe body
-// and closes it, under a hard time budget enforced by a timer that closes
-// the body to unblock the read. Returns true only when both the read and
-// the ordinary close succeed in time — the connection is then back in the
-// transport pool. A second Close from a raced timer callback is safe on
-// net/http response bodies.
-func drainProbe(body io.ReadCloser, budget time.Duration) bool {
-	timer := time.AfterFunc(budget, func() { body.Close() })
-	var b [2]byte
-	n, err := body.Read(b[:])
-	ok := n == 1
-	if ok && err == nil {
-		m, err2 := body.Read(b[:])
-		ok = m == 0 && errors.Is(err2, io.EOF)
-	} else if ok {
-		ok = errors.Is(err, io.EOF)
-	}
-	if !timer.Stop() {
-		// The budget expired: the callback closed (or is closing) the
-		// body; the connection cannot be trusted back into the pool.
-		return false
-	}
-	if cerr := body.Close(); cerr != nil {
-		return false
-	}
-	return ok
-}
 
 // Options configures a Downloader. The zero value (or nil) means defaults.
 type Options struct {
-	// Parts is the maximum number of parallel connections. Default 8.
-	// 1 disables parallelism (but keeps resume).
+	// Parts is the maximum number of parallel connections. Adaptive expansion
+	// starts only when the remaining work contains at least one MinPartSize per
+	// configured part. Default 8. 1 disables parallelism (but keeps resume).
 	Parts int
 	// MinPartSize stops dynamic splitting: a remaining range is never
 	// split below 2x this size. Default 16 MiB.
@@ -94,19 +61,17 @@ type Options struct {
 	// Jar supplies cookies to every request (session auth). Nil means no
 	// cookie handling.
 	Jar http.CookieJar
-	// Transport overrides the internal HTTP/1.1 transport. Setting it
-	// disables CDN node pinning (this is the HTTP/3 escape hatch: plug in
-	// a quic-go RoundTripper here). WARNING: an HTTP/2 transport defeats
+	// Transport overrides the internal HTTP/1.1 transport (this is the HTTP/3
+	// escape hatch: plug in a quic-go RoundTripper here). WARNING: an HTTP/2 transport defeats
 	// parallel parts — h2 multiplexes every range request onto a single
 	// TCP connection. For *http.Transport, force HTTP/1.1 (Protocols) and
-	// consider a large ReadBufferSize, as the internal transport does.
+	// choose its connection and header buffer sizes for the workload.
 	Transport http.RoundTripper
 	// TLSConfig is used by the internal transport. Ignored when Transport
 	// is set.
 	TLSConfig *tls.Config
-	// Proxy selects a proxy per request for the internal transport (nil
-	// means http.ProxyFromEnvironment). Ignored when Transport is set.
-	// Requests that go through a proxy disable CDN node pinning.
+	// Proxy selects a proxy per request for the internal transport (nil means
+	// http.ProxyFromEnvironment). Ignored when Transport is set.
 	Proxy func(*http.Request) (*url.URL, error)
 	// ExpectedSHA256 is the hex-encoded checksum to verify before the
 	// final install. Empty disables verification.
@@ -116,7 +81,7 @@ type Options struct {
 	// disables verification. May be combined with ExpectedSHA256; the
 	// file is read once.
 	ExpectedSHA1 string
-	// RejectContentTypes aborts a download at the probe — before any byte
+	// RejectContentTypes aborts a download at the initial response — before any byte
 	// is staged — when the response's media type matches an entry (e.g.
 	// "text/html" for CDNs that answer dead links with an HTML error page
 	// and status 200). Entries are compared case-insensitively against the
@@ -139,7 +104,7 @@ type Result struct {
 	// ETag and LastModified are the server validators, when present.
 	ETag         string
 	LastModified string
-	// ContentType is the Content-Type header of the initial probe
+	// ContentType is the Content-Type header of the initial
 	// response, when present. Useful for detecting servers that answer a
 	// dead link with a 200 HTML error page instead of the real file.
 	ContentType string
@@ -169,15 +134,8 @@ type Downloader struct {
 	// calls; they dominate per-download allocations otherwise.
 	bufs sync.Pool
 
-	// rampRuns issues non-sensitive correlation ids for ramp decision
-	// telemetry; concurrent Get calls on one Downloader interleave logs.
-	rampRuns atomic.Uint64
-
-	// dial is the TCP dialer shared by the base and pinned transports;
-	// tests override it to fake CDN nodes.
+	// dial is the internal transport's TCP dialer; tests override it.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	// resolveHook overrides DNS resolution in tests.
-	resolveHook func(ctx context.Context, host string) ([]netip.Addr, error)
 	// sleepHook replaces every worker's retry/backoff sleeper in tests
 	// (channel-coordinated fakes instead of wall-clock assertions).
 	sleepHook func(ctx context.Context, d time.Duration) error
@@ -244,19 +202,10 @@ func New(opt *Options) (*Downloader, error) {
 	return d, nil
 }
 
-// dialContext routes through d.dial so pinned transports and tests share one
-// dialer seam.
+// dialContext routes internal transport dials through the test seam.
 func (d *Downloader) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if ctx.Value(sharedLeaseContextKey{}) != nil {
-		return nil, errSharedLeaseMiss
-	}
 	return d.dial(ctx, network, addr)
 }
-
-// sharedLeaseContextKey marks worker 0's one reuse-only base-pool attempt.
-// Transport.getConn retains request-context values in its detached dial
-// context, so a pool miss fails closed without opening a new connection.
-type sharedLeaseContextKey struct{}
 
 // newTransport builds the internal transport: HTTP/1.1 only, because HTTP/2
 // would multiplex every parallel range request onto a single TCP connection
@@ -277,7 +226,6 @@ func newTransport(
 		TLSClientConfig:       o.TLSConfig,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		ReadBufferSize:        bufSize,
 		MaxIdleConnsPerHost:   o.Parts + 1,
 		IdleConnTimeout:       90 * time.Second,
 	}
@@ -426,7 +374,7 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 	electStart := time.Now()
-	resp, err := d.elect(ctx, rawURL)
+	resp, remoteAddr, electCancel, err := d.elect(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -437,39 +385,38 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 	contentType := resp.Header.Get("Content-Type")
 
 	if rejected(contentType, d.opt.RejectContentTypes) {
+		electCancel(nil)
 		resp.Body.Close()
 		return nil, &ContentTypeError{ContentType: contentType}
 	}
 
 	destPath, err := resolveDest(dest, finalURL, resp.Header)
 	if err != nil {
+		electCancel(nil)
 		resp.Body.Close()
 		return nil, err
 	}
 	var total int64 = -1
 	multipart := false
+	initialUsable := false
+	fullInitialRange := false
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
 		start, end, t, crErr := parseContentRange(resp.Header.Get("Content-Range"))
-		if crErr == nil && start == 0 && end == 0 && t > 0 {
+		if crErr == nil && start == 0 && end >= 0 && t > 0 && end < t {
 			total = t
 			multipart = true
+			initialUsable = true
+			fullInitialRange = end == t-1
 		}
 	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 		total = 0 // elect only lets a 416 through for a zero-length resource
-	case resp.ContentLength > 0:
-		total = resp.ContentLength
-	}
-	// The election response served its purpose (final URL, headers,
-	// status); workers issue their own ranged requests. A valid one-byte
-	// multipart probe through the internal transport is drained (bounded)
-	// so its connection returns to the pool for reuse; anything else keeps
-	// today's immediate close.
-	probeReusable := false
-	if d.base != nil && multipart && resp.ContentLength == 1 && !resp.Close {
-		probeReusable = drainProbe(resp.Body, min(probeDrainTimeout, d.opt.Timeout))
-	} else {
-		resp.Body.Close()
+		initialUsable = true
+	case resp.StatusCode == http.StatusOK:
+		initialUsable = true
+		if resp.ContentLength >= 0 {
+			total = resp.ContentLength
+		}
 	}
 
 	d.log.Debug("election", "url", redactURL(finalURL), "status", resp.StatusCode,
@@ -490,20 +437,42 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		contentType: contentType,
 		electDur:    electDur,
 	}
-	r.probeReusable = probeReusable
+	if initialUsable {
+		resp.Body = &closeOnceBody{ReadCloser: resp.Body}
+		r.initial = resp
+		r.initialAddr = remoteAddr
+		r.initialCancel = electCancel
+	} else {
+		electCancel(nil)
+		resp.Body.Close()
+	}
+	defer r.closeInitial()
 	if r.total > 0 && r.validator() == "" && !r.checksumConfigured() {
 		multipart = false
-		// The probe's total belongs to a representation we cannot bind to
-		// the following requests. Let the actual download declare its own
-		// length rather than truncating it to a possibly stale size.
-		r.total = -1
-		d.log.Debug("probe size discarded without validator or checksum",
-			"url", redactURL(finalURL))
+		if resp.StatusCode == http.StatusPartialContent && !fullInitialRange {
+			// A capped initial range cannot be continued safely without a
+			// validator or checksum binding later requests to this response.
+			// Fall back to a fresh full GET and let it declare its own length.
+			r.closeInitial()
+			r.total = -1
+			d.log.Debug("capped initial range discarded without validator or checksum",
+				"url", redactURL(finalURL))
+		}
 	}
 
-	unlock, err := acquireDestination(ctx, destPath)
+	unlock, contended, err := tryAcquireDestination(ctx, destPath)
 	if err != nil {
 		return nil, fmt.Errorf("lock destination %s: %w", destPath, err)
+	}
+	if contended {
+		// Waiting behind another download to the same destination: do not
+		// park an open, unread initial stream (and its server connection)
+		// for the winner's whole run. The loser re-requests after the wait.
+		r.closeInitial()
+		unlock, err = acquireDestination(ctx, destPath)
+		if err != nil {
+			return nil, fmt.Errorf("lock destination %s: %w", destPath, err)
+		}
 	}
 	defer unlock()
 
@@ -607,51 +576,70 @@ func Discard(ctx context.Context, dest string) error {
 	return nil
 }
 
-// elect sends the probe GET (Range: bytes=0-0, one byte) that follows
-// redirects and decides between multipart (206), single-stream (200), and
-// empty (416 on a zero-length resource). Transient failures are retried a
-// few times.
-func (d *Downloader) elect(ctx context.Context, rawURL string) (*http.Response, error) {
+// elect sends a useful initial GET (Range: bytes=0-) that follows redirects
+// and decides between multipart (206), single-stream (200), and empty (416 on
+// a zero-length resource). A successful 200/206 body is transferred directly
+// to worker 0 instead of paying for a second request. Transient failures are
+// retried a few times.
+//
+// The returned cancel aborts the initial request itself. It is the only
+// reliable way to unblock a stalled body read: an io.ReadCloser carries no
+// contract that Close is safe (or effective) concurrently with Read, and
+// Options.Transport bodies are arbitrary. Callers must invoke it exactly
+// once the response is finished with (any cause; nil for ordinary cleanup).
+func (d *Downloader) elect(ctx context.Context, rawURL string) (
+	*http.Response, string, context.CancelCauseFunc, error) {
 	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
 	for attempt := range 3 {
 		if attempt > 0 {
 			if err := sleepCtx(ctx, bo.next()); err != nil {
-				return nil, err
+				return nil, "", nil, err
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		ectx, ecancel := context.WithCancelCause(ctx)
+		req, err := http.NewRequestWithContext(ectx, http.MethodGet, rawURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("build request: %w", err)
+			ecancel(nil)
+			return nil, "", nil, fmt.Errorf("build request: %w", err)
 		}
 		d.applyHeaders(req, req.URL)
-		req.Header.Set("Range", "bytes=0-0")
+		req.Header.Set("Range", "bytes=0-")
+		var remoteAddr string
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(ci httptrace.GotConnInfo) {
+				remoteAddr = ci.Conn.RemoteAddr().String()
+			},
+		}))
 		resp, err := client.Do(req)
 		if err != nil {
+			ecancel(nil)
 			err = redactErr(err)
 			if ctx.Err() != nil {
-				return nil, err
+				return nil, "", nil, err
 			}
 			lastErr = err
 			continue
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
-			return resp, nil
+			return resp, remoteAddr, ecancel, nil
 		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && emptyContentRange(resp.Header):
-			// A range probe on a zero-length resource is unsatisfiable:
+			// A range request on a zero-length resource is unsatisfiable:
 			// the file exists and is empty.
-			return resp, nil
+			return resp, remoteAddr, ecancel, nil
 		case isRetryableStatus(resp.StatusCode):
 			resp.Body.Close()
+			ecancel(nil)
 			lastErr = StatusError(resp.StatusCode)
 		default:
 			resp.Body.Close()
-			return nil, StatusError(resp.StatusCode)
+			ecancel(nil)
+			return nil, "", nil, StatusError(resp.StatusCode)
 		}
 	}
-	return nil, fmt.Errorf("probe %s: %w", redactURL(rawURL), lastErr)
+	return nil, "", nil, fmt.Errorf("initial request %s: %w", redactURL(rawURL), lastErr)
 }
 
 func isRetryableStatus(code int) bool {
@@ -848,15 +836,20 @@ type run struct {
 	total       int64 // -1 when unknown
 	etag        string
 	lastMod     string
-	contentType string // from the election probe response
+	contentType string // from the initial response
 	// electDur is the election round-trip wall time: the best available
 	// proxy for what a fresh connection on this path costs (DNS, dial, TLS,
 	// TTFB). It scales the ramp's settling floor.
 	electDur time.Duration
-	// probeReusable records that the election body was fully consumed and
-	// closed through the internal transport, so its connection is back in
-	// the base pool (Step 1 of probe reuse leases it to worker 0).
-	probeReusable bool
+	// initial is the successful election response. Fresh worker 0 consumes it
+	// directly, eliminating the old probe-plus-worker request pair. A resumed
+	// multipart run closes it before issuing requests for its missing ranges.
+	// initialCancel aborts the initial request itself — the only reliable way
+	// to unblock a stalled body read on an arbitrary transport; it travels
+	// with the response and is invoked exactly once by whoever disposes of it.
+	initial       *http.Response
+	initialAddr   string
+	initialCancel context.CancelCauseFunc
 	// progress counts body bytes read this run (drives the concurrency ramp).
 	progress atomic.Int64
 	// ramp is the adaptive-concurrency governor; nil when Parts is 1 or on
@@ -864,8 +857,38 @@ type run struct {
 	ramp *rampState
 }
 
+// closeOnceBody lets the worker timeout close an initial response to unblock a
+// read while normal ownership cleanup still calls Close. The underlying body
+// sees exactly one close, including for custom RoundTrippers.
+type closeOnceBody struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func (b *closeOnceBody) Close() error {
+	b.once.Do(func() { b.err = b.ReadCloser.Close() })
+	return b.err
+}
+
 func (r *run) checksumConfigured() bool {
 	return r.sha256 != "" || r.sha1 != ""
+}
+
+func (r *run) takeInitial() (*http.Response, string, context.CancelCauseFunc) {
+	resp, addr, cancel := r.initial, r.initialAddr, r.initialCancel
+	r.initial, r.initialAddr, r.initialCancel = nil, "", nil
+	return resp, addr, cancel
+}
+
+func (r *run) closeInitial() {
+	resp, _, cancel := r.takeInitial()
+	if cancel != nil {
+		cancel(nil)
+	}
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 }
 
 func (r *run) name() string { return filepath.Base(r.destPath) }
@@ -911,6 +934,12 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 	}
 	st := loadState(statePath(r.partPath))
 	resumed := st != nil && st.usable(file, sourceID, r.total, r.etag, r.lastMod)
+	if resumed {
+		// The useful initial response starts at byte zero, while a resume must
+		// request only its missing ranges. Closing it preserves the sidecar's
+		// exact resume semantics without staging duplicate bytes.
+		r.closeInitial()
+	}
 
 	var resumedBytes int64
 	if resumed {
@@ -980,6 +1009,15 @@ const (
 	rampSettleCap   = 200 * time.Millisecond
 )
 
+// rampEligible reports whether the remaining work can supply at least one
+// minimum-sized chunk to every configured connection. Below that point the
+// scheduler cannot make meaningful use of the full cap, while merely testing
+// another connection can dominate the remaining transfer. Using remaining
+// work also keeps a nearly complete resume on its proven flow.
+func rampEligible(remaining, minPartSize int64, parts int) bool {
+	return parts > 1 && minPartSize > 0 && remaining/minPartSize >= int64(parts)
+}
+
 // settleFloorFor derives a run's settling wall floor from its election
 // round-trip: twice the observed cost of a fresh request on this path,
 // clamped so a degenerate measurement can neither erase the floor nor
@@ -1008,7 +1046,6 @@ type rampState struct {
 	// released; rs.mu never nests with the scheduler or controller locks.
 	spawn    func(int)
 	demote   func(keep int)
-	log      *slog.Logger
 	now      func() time.Time // injected in tests
 	parts    int
 	window   int64
@@ -1021,6 +1058,10 @@ type rampState struct {
 	// admittedAt is when the most recent batch was admitted; settling does
 	// not complete before settleMin has elapsed since then.
 	admittedAt time.Time
+	// unreadyWindows counts full windows after settleMin while at least one
+	// created worker has yet to contribute. The batch gets the ordinary
+	// settling window plus the stabilized measurement budget before rejection.
+	unreadyWindows int
 	// prevAdmitted is the flow count before the most recent batch, recorded
 	// at admission time (batches are clamped: Parts=6 admits 1→2→4→6).
 	prevAdmitted int
@@ -1033,56 +1074,10 @@ type rampState struct {
 	markAt            int64
 	markTime          time.Time
 
-	// Decision telemetry (observability only; no policy consumes it).
-	// enabled is fixed at run creation so the normal disabled path avoids
-	// record construction, readiness locking, and allocations entirely.
-	enabled bool
-	// runID correlates a run's records; seq orders them. pending is the
-	// record built under mu for note() to emit after unlocking.
-	runID   uint64
-	seq     int
-	pending *rampDecision
-	// ready records each admitted batch worker's spawn-to-first-body-byte
-	// latency. The values are concurrent, not additive completion-time costs.
-	// Reset at each admission.
-	ready map[int]time.Duration
-	// emitMu/emitCond/nextEmit serialize record emission in seq order:
-	// after an admission unlocks mu, another worker can cross a later
-	// decision window and reach emission first, which would write records
-	// out of order. Guarded lazily under emitMu; never nests inside mu.
-	emitMu   sync.Mutex
-	emitCond *sync.Cond
-	nextEmit int
-}
-
-// rampDecision is one immutable governor decision record. Field semantics
-// are part of the evidence schema (rampDecisionSchema). The judged transition
-// owns baseline/rate/q/readiness; an admit action may also create a distinct
-// transition. Keeping those identities separate is essential for later-batch
-// decisions: when 1→2 pays and the governor admits 2→4, the observed q still
-// belongs to 1→2. Readiness is concurrent setup latency, never an additive
-// completion-time cost.
-type rampDecision struct {
-	seq      int
-	action   string // "admit" | "freeze" | "demote" | "keep-final"
-	reason   string
-	ceiling  int
-	baseline rampSample
-	measured rampSample
-	q        float64
-	qValid   bool
-
-	judged  rampBatch
-	created rampBatch
-
-	settleMin time.Duration
-	window    int64
-	readyLat  []time.Duration // judged-batch readiness latencies, sorted
-}
-
-type rampBatch struct {
-	prior, admitted int
-	clamped, final  bool
+	// batchReady becomes true when any worker from the batch under judgment
+	// delivers a body byte. This prevents natural acceleration of an existing
+	// flow from being credited to a batch that has contributed nothing.
+	batchReady bool
 }
 
 type rampSample struct {
@@ -1094,25 +1089,12 @@ func (s rampSample) rate() float64 {
 	return float64(s.bytes) / max(s.elapsed.Seconds(), 1e-9)
 }
 
-func (b rampBatch) size() int { return max(b.admitted-b.prior, 0) }
-
-func (b rampBatch) transition() string {
-	if b.size() == 0 || b.prior == 0 {
-		return ""
-	}
-	return strconv.Itoa(b.prior) + "->" + strconv.Itoa(b.admitted)
-}
-
-const rampDecisionSchema = 3
-
 func (rs *rampState) note(total int64) {
 	if rs.done.Load() {
 		return
 	}
 	rs.mu.Lock()
 	spawnFrom, spawnN, demoteTo := rs.noteLocked(total, rs.now())
-	rec := rs.pending
-	rs.pending = nil
 	rs.mu.Unlock()
 	for i := range spawnN {
 		rs.spawn(spawnFrom + i)
@@ -1120,41 +1102,11 @@ func (rs *rampState) note(total int64) {
 	if demoteTo > 0 {
 		rs.demote(demoteTo)
 	}
-	if rec != nil {
-		rs.emitOrdered(rec)
-	}
 }
 
-// emitOrdered writes rec only once every earlier-sequenced record has been
-// written, so the JSONL stream is strictly seq-ordered even when a fast
-// transfer crosses the next decision window while this caller is still
-// running the previous decision's side effects. The wait is brief and
-// bounded: the predecessor is already past its decision and its spawn/
-// demote side effects never block.
-func (rs *rampState) emitOrdered(rec *rampDecision) {
-	rs.emitMu.Lock()
-	defer rs.emitMu.Unlock()
-	if rs.emitCond == nil {
-		rs.emitCond = sync.NewCond(&rs.emitMu)
-	}
-	if rs.nextEmit == 0 {
-		rs.nextEmit = 1
-	}
-	for rs.nextEmit != rec.seq {
-		rs.emitCond.Wait()
-	}
-	rs.emit(rec)
-	rs.nextEmit++
-	rs.emitCond.Broadcast()
-}
-
-// noteWorkerReady records worker id's spawn-to-first-body-byte latency when
-// it belongs to the batch under judgment. Called once per worker lifetime.
-func (rs *rampState) noteWorkerReady(id int, spawnedAt time.Time) {
-	if !rs.enabled || spawnedAt.IsZero() {
-		return
-	}
-	now := rs.now()
+// noteWorkerReady marks worker id as contributing when it delivers its first
+// body byte.
+func (rs *rampState) noteWorkerReady(id int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	// admittedAt zero means no batch was ever admitted: the initial worker
@@ -1162,91 +1114,32 @@ func (rs *rampState) noteWorkerReady(id int, spawnedAt time.Time) {
 	if rs.admittedAt.IsZero() || id < rs.prevAdmitted || id >= rs.admitted {
 		return
 	}
-	if _, dup := rs.ready[id]; dup {
-		return
-	}
-	if rs.ready == nil {
-		rs.ready = make(map[int]time.Duration)
-	}
-	rs.ready[id] = max(now.Sub(spawnedAt), 0)
+	rs.batchReady = true
 }
 
-// recordLocked completes rec with governor-owned fields (sequence,
-// baseline, windows, and judged-batch readiness latencies) and stores it as
-// the pending record for note() to emit after mu is released.
-func (rs *rampState) recordLocked(rec rampDecision) {
-	if !rs.enabled {
-		return
-	}
-	rs.seq++
-	rec.seq = rs.seq
-	rec.ceiling = rs.parts
-	rec.baseline = rs.admissionBaseline
-	rec.settleMin = rs.settleMin
-	rec.window = rs.window
-	rec.readyLat = make([]time.Duration, 0, len(rs.ready))
-	for _, d := range rs.ready {
-		rec.readyLat = append(rec.readyLat, d)
-	}
-	slices.Sort(rec.readyLat)
-	rs.pending = &rec
+func (rs *rampState) rejectUnreadyLocked() (spawnFrom, spawnN, demoteTo int) {
+	rs.done.Store(true)
+	return 0, 0, rs.prevAdmitted
 }
 
-// emit logs one decision record. It runs strictly outside rs.mu.
-func (rs *rampState) emit(rec *rampDecision) {
-	if !rs.log.Enabled(context.Background(), slog.LevelDebug) {
+// rejectThrottledBatch stops expansion when the server rejects a ranged
+// request with 429. If a batch is under judgment, roll it back to the previous
+// proven flow count; keeping rejected workers would turn the server's explicit
+// overload signal into retry traffic and preserve the harmful concurrency.
+func (rs *rampState) rejectThrottledBatch() {
+	rs.mu.Lock()
+	if rs.done.Load() {
+		rs.mu.Unlock()
 		return
 	}
-	rate := rec.measured.rate()
-	var readyMin, readyMed, readyMax time.Duration = -1, -1, -1
-	if n := len(rec.readyLat); n > 0 {
-		readyMin, readyMed, readyMax = rec.readyLat[0], rec.readyLat[n/2], rec.readyLat[n-1]
-	}
-	rs.log.Debug("ramp decision",
-		"schema", rampDecisionSchema,
-		"run", rs.runID,
-		"seq", rec.seq,
-		"action", rec.action,
-		"reason", rec.reason,
-		"judged_transition", rec.judged.transition(),
-		"judged_prior", rec.judged.prior,
-		"judged_admitted", rec.judged.admitted,
-		"judged_batch_size", rec.judged.size(),
-		"judged_clamped", rec.judged.clamped,
-		"judged_final", rec.judged.final,
-		"created_transition", rec.created.transition(),
-		"created_prior", rec.created.prior,
-		"created_admitted", rec.created.admitted,
-		"created_batch_size", rec.created.size(),
-		"created_clamped", rec.created.clamped,
-		"created_final", rec.created.final,
-		"ceiling", rec.ceiling,
-		"baseline_bytes", rec.baseline.bytes,
-		"baseline_us", rec.baseline.elapsed.Microseconds(),
-		"baseline_bps", int64(rec.baseline.rate()),
-		"measured_bytes", rec.measured.bytes,
-		"measured_us", rec.measured.elapsed.Microseconds(),
-		"rate_bps", int64(rate),
-		"q", rec.q,
-		"q_valid", rec.qValid,
-		"window_bytes", rec.window,
-		"measure_windows", rampMeasureWindows,
-		"settle_floor_ms", rec.settleMin.Milliseconds(),
-		"ready_min_us", durMicros(readyMin),
-		"ready_med_us", durMicros(readyMed),
-		"ready_max_us", durMicros(readyMax),
-		"ready_workers", len(rec.readyLat),
-		"batch_workers", rec.judged.size(),
-	)
-}
+	keep := max(rs.prevAdmitted, 1)
+	demote := rs.admitted > keep
+	rs.done.Store(true)
+	rs.mu.Unlock()
 
-// durMicros renders a readiness latency for logging; -1 means unrecorded.
-// Microseconds keep loopback latencies distinguishable from zero.
-func durMicros(d time.Duration) int64 {
-	if d < 0 {
-		return -1
+	if demote {
+		rs.demote(keep)
 	}
-	return d.Microseconds()
 }
 
 // noteLocked advances the ramp state machine by at most one window and
@@ -1267,9 +1160,18 @@ func (rs *rampState) noteLocked(total int64, now time.Time) (spawnFrom, spawnN, 
 	case rs.settling:
 		// The just-admitted batch is still dialing/ramping; consume windows
 		// without deciding and without touching the baseline, and do not
-		// finish settling before the batch had wall time to connect.
+		// finish settling before the batch had wall time to connect and at least
+		// one created worker has delivered body bytes.
 		if now.Sub(rs.admittedAt) >= rs.settleMin {
-			rs.settling = false
+			if rs.batchReady {
+				rs.settling = false
+				rs.unreadyWindows = 0
+			} else {
+				rs.unreadyWindows++
+				if rs.unreadyWindows > rampMeasureWindows {
+					return rs.rejectUnreadyLocked()
+				}
+			}
 		}
 	case rs.admitted == 1 && rs.admitted < rs.parts:
 		// Record the pre-admission steady window and probe the first batch.
@@ -1304,72 +1206,30 @@ func (rs *rampState) measureLocked(bytes int64, elapsed time.Duration) (rampSamp
 func (rs *rampState) decideLocked(sample rampSample, now time.Time) (spawnFrom, spawnN, demoteTo int) {
 	rate := sample.rate()
 	baseline := rs.admissionBaseline.rate()
-	q := rate / max(baseline, 1e-9)
-	judged := rs.admitted - rs.prevAdmitted
-	judgedClamped := judged < rs.prevAdmitted
-	judgedFinal := rs.admitted == rs.parts
 	switch {
 	case rate < baseline*rampDemote:
-		rs.recordLocked(rampDecision{
-			action: "demote", reason: "batch-not-paying",
-			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
-				clamped: judgedClamped, final: judgedFinal},
-			measured: sample, q: q, qValid: true,
-		})
 		rs.done.Store(true)
 		return 0, 0, rs.prevAdmitted
 	case rate < baseline*rampImprovement:
-		rs.recordLocked(rampDecision{
-			action: "freeze", reason: "marginal-gain",
-			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
-				clamped: judgedClamped, final: judgedFinal},
-			measured: sample, q: q, qValid: true,
-		})
 		rs.done.Store(true)
 	case rs.admitted < rs.parts:
 		return rs.admitLocked(sample, now)
 	default:
-		rs.recordLocked(rampDecision{
-			action: "keep-final", reason: "final-batch-paying",
-			judged: rampBatch{prior: rs.prevAdmitted, admitted: rs.admitted,
-				clamped: judgedClamped, final: true},
-			measured: sample, q: q, qValid: true,
-		})
 		rs.done.Store(true)
 	}
 	return 0, 0, 0
 }
 
 func (rs *rampState) admitLocked(sample rampSample, now time.Time) (spawnFrom, spawnN, demoteTo int) {
-	reason, q, qValid := "first-batch-probe", 0.0, false
-	judgedPrior, judgedAdmitted := 0, 0
-	judgedClamped, judgedFinal := false, false
-	if rs.admissionBaseline.bytes > 0 {
-		reason = "clear-gain"
-		q = sample.rate() / max(rs.admissionBaseline.rate(), 1e-9)
-		qValid = true
-		judgedPrior, judgedAdmitted = rs.prevAdmitted, rs.admitted
-		judged := judgedAdmitted - judgedPrior
-		judgedClamped = judged < judgedPrior
-		judgedFinal = judgedAdmitted == rs.parts
-	}
-	prior := rs.admitted
 	add := min(rs.admitted, rs.parts-rs.admitted)
-	rs.recordLocked(rampDecision{
-		action: "admit", reason: reason,
-		judged: rampBatch{prior: judgedPrior, admitted: judgedAdmitted,
-			clamped: judgedClamped, final: judgedFinal},
-		created: rampBatch{prior: prior, admitted: prior + add,
-			clamped: add < prior, final: prior+add == rs.parts},
-		measured: sample, q: q, qValid: qValid,
-	})
 	rs.admissionBaseline = sample
 	rs.admittedAt = now
 	rs.prevAdmitted = rs.admitted
 	spawnFrom = rs.admitted
 	rs.admitted += add
 	rs.settling = true
-	clear(rs.ready)
+	rs.unreadyWindows = 0
+	rs.batchReady = false
 	return spawnFrom, add, 0
 }
 
@@ -1384,17 +1244,6 @@ func (r *run) runWorkers(
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-
-	var picker *picker
-	if r.d.pinningEnabled(r.url) {
-		u, err := url.Parse(r.url)
-		if err == nil {
-			picker = newPicker(u.Hostname(), portOf(u), r.d.log)
-			if r.d.resolveHook != nil {
-				picker.resolve = r.d.resolveHook
-			}
-		}
-	}
 
 	var wg sync.WaitGroup
 	var firstErr error
@@ -1417,13 +1266,7 @@ func (r *run) runWorkers(
 		ctl.mu.Lock()
 		ctl.cancels[id] = wcancel
 		ctl.mu.Unlock()
-		w := newWorker(id, r, sched, file, picker)
-		if r.ramp != nil && r.ramp.enabled {
-			// Timestamp immediately before goroutine submission so readiness
-			// includes scheduling, dial/TLS, request, and response latency, but
-			// excludes decision-log emission and worker construction.
-			w.spawnedAt = r.ramp.now()
-		}
+		w := newWorker(id, r, sched, file)
 		wg.Go(func() {
 			defer func() {
 				ctl.mu.Lock()
@@ -1447,30 +1290,23 @@ func (r *run) runWorkers(
 			}
 		}
 	}
-	if r.d.opt.Parts > 1 {
+	remaining := sched.remainingBytes()
+	if rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts) {
 		// Window: big enough to measure meaningfully while leaving room to
 		// evaluate several doubling steps. At the remaining/16 branch, the
 		// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
 		// the fixed 2*MinPartSize cap makes it earlier on larger objects.
 		// Size from REMAINING work so a near-complete resume still ramps.
-		window := max(min(2*r.d.opt.MinPartSize, sched.remainingBytes()/16), 1)
-		telemetryEnabled := r.d.log.Enabled(context.Background(), slog.LevelDebug)
-		var runID uint64
-		if telemetryEnabled {
-			runID = r.d.rampRuns.Add(1)
-		}
+		window := max(min(2*r.d.opt.MinPartSize, remaining/16), 1)
 		r.ramp = &rampState{
 			spawn:     spawn,
 			demote:    retire,
-			log:       r.d.log,
 			now:       time.Now,
 			parts:     r.d.opt.Parts,
 			window:    window,
 			settleMin: settleFloorFor(r.electDur),
 			admitted:  1,
 			markTime:  time.Now(),
-			enabled:   telemetryEnabled,
-			runID:     runID,
 		}
 	}
 	spawn(0)
@@ -1532,34 +1368,6 @@ func (r *run) runWorkers(
 	return nil
 }
 
-// pinningEnabled reports whether per-node connection pinning applies: it
-// requires the internal transport and no proxy for the target URL.
-func (d *Downloader) pinningEnabled(rawURL string) bool {
-	if d.base == nil {
-		return false
-	}
-	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
-	if err != nil {
-		return false
-	}
-	if d.base.Proxy != nil {
-		if proxyURL, err := d.base.Proxy(req); err != nil || proxyURL != nil {
-			return false
-		}
-	}
-	return true
-}
-
-func portOf(u *url.URL) string {
-	if p := u.Port(); p != "" {
-		return p
-	}
-	if u.Scheme == "http" {
-		return "80"
-	}
-	return "443"
-}
-
 // single downloads r.url over one sequential stream (server ignored Range or
 // size is unknown). No resume: a retry restarts from byte zero.
 func (r *run) single(ctx context.Context) (*Result, error) {
@@ -1582,7 +1390,7 @@ func (r *run) single(ctx context.Context) (*Result, error) {
 	}
 
 	r.rep.Start(Info{Name: r.name(), Total: r.total})
-	w := newWorker(0, r, nil, file, nil)
+	w := newWorker(0, r, nil, file)
 	if err := w.singleStream(ctx); err != nil {
 		return nil, err
 	}

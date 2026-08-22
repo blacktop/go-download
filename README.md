@@ -2,88 +2,42 @@
 
 [![Go](https://github.com/blacktop/go-download/actions/workflows/go.yml/badge.svg)](https://github.com/blacktop/go-download/actions/workflows/go.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/blacktop/go-download.svg)](https://pkg.go.dev/github.com/blacktop/go-download) [![License](http://img.shields.io/:license-mit-blue.svg)](http://doge.mit-license.org)
 
-> Download LARGE files as fast as possible. Zero dependencies.
+> Fast, resumable downloads for large files. Standard library only.
 
 ---
 
 ## Features
 
-- **Parallel parts** — the file is split into ranges downloaded over parallel HTTP/1.1 connections (HTTP/2 is deliberately avoided: it would multiplex every range onto a single TCP connection)
-- **Dynamic work stealing** — fast connections steal the remaining tail of slow ones (aria2-style segment allocation), so one bad connection never drags out the whole download
-- **CDN node racing** — when the host resolves to multiple edge nodes, each connection is pinned to one node, per-node throughput is measured (EWMA), and statistically slow nodes are abandoned for better ones
-- **Automatic resume** — progress is tracked in a `.part.json` sidecar; an interrupted download picks up where it left off, validated against the server's ETag/Last-Modified
-- **Stall detection** — a per-read timeout (adaptive on flaky links) aborts and retries hung connections; retries resume mid-range, never re-downloading bytes
-- **Safe by construction** — bytes are staged in a preallocated `.part` file written at disjoint offsets; the destination path is only installed atomically after size (and optional checksum) verification, without replacing a late-created file unless overwrite is enabled
-- **Zero dependencies** — the library is pure standard library; bring your own progress UI via the `Reporter` interface (or use the `dl` CLI)
+- Splits files into ranges and downloads them over parallel HTTP/1.1 connections. HTTP/2 is deliberately avoided because it would multiplex the ranges over one TCP connection.
+- Lets idle connections take the unfinished tail of slower chunks, similar to aria2's segment allocation.
+- Records progress in a `.part.json` sidecar. Before resuming, the downloader checks the server's ETag or Last-Modified value.
+- Times out stalled reads, with extra tolerance for flaky links. Range requests resume from the last byte written; a non-range fallback starts over.
+- Writes into a preallocated `.part` file at disjoint offsets. The destination is installed atomically only after size and optional checksum verification. A file created at the destination during the download is left alone unless overwrite is enabled.
+- Uses only the Go standard library. Progress UIs can implement `Reporter` or use the included `dl` command.
 
 ## How it works
 
-A CDN hostname usually resolves to several edge nodes with very different
-speeds. Instead of letting the OS pick one, every parallel connection is
-pinned to its own node, each node's throughput is measured continuously, and
-statistically bad nodes are abandoned for better ones:
+The initial `Range: bytes=0-` response becomes the first download stream, so
+data starts moving immediately. Short downloads finish on that connection. If
+enough data remains, the downloader measures aggregate throughput and adds
+HTTP/1.1 connections in batches, doubling the active count at each step. A
+batch stays if it improves throughput; otherwise, its workers retire.
+Idle workers take the unfinished tail of slower chunks.
 
 ```mermaid
 flowchart TD
-    A["Resolve host → all CDN edge nodes<br/>(A + AAAA records)"] --> B["Pick a node per connection<br/>(power-of-two-choices,<br/>unexplored nodes first)"]
-    B --> C["Pin an HTTP/1.1 connection to that node<br/>and download range chunks in parallel"]
-    C --> D["Work stealing: idle connections<br/>take the tail of the slowest chunk"]
-    C --> E["Measure throughput per read<br/>(EWMA per node)"]
-    E --> F{"Node slower than 25%<br/>of the best node,<br/>after 8 MiB warmup?"}
-    F -- "no" --> C
-    F -- "yes" --> G["Cull: abort the body,<br/>keep every byte written,<br/>strike the node"]
-    H["Stall: no progress within<br/>the adaptive read timeout"] --> G
-    G --> I{"Two strikes?"}
-    I -- "yes" --> J["Ban the node for 30s"]
-    I -- "no" --> B
-    J --> B
+    A["Start useful initial response"] --> B{"Enough work to ramp?"}
+    B -- "no" --> C["Finish on one connection"]
+    B -- "yes" --> D["Add a batch of connections"]
+    D --> E{"Did aggregate throughput improve?"}
+    E -- "yes" --> F["Keep batch; split or steal work"]
+    F --> D
+    E -- "no" --> G["Retire batch"]
+    G --> C
 ```
 
-Culling costs nothing: the aborted chunk resumes mid-range on the next node
-(`Range` is recomputed from the byte cursor), so no byte is ever downloaded
-twice — the download simply migrates toward whichever edge nodes are fastest
-right now.
-
-## Performance
-
-Parallel parts pay off when the bottleneck is **per connection** — per-flow
-shaping, throttled CDN edges, long fat networks. When a single TCP flow
-already saturates the path there is nothing to parallelize, so the engine
-**ramps adaptively**: it starts with one connection, measures a slow-start
-burn-in baseline, then adds connections in doubling steps only while each
-step improves aggregate throughput (a server 429 also freezes the ramp).
-On a saturated line the download transparently behaves like a single-stream
-client instead of competing with itself.
-
-The in-repo benchmarks measure both regimes against a stdlib `http.Get` +
-`io.Copy` baseline (Apple M5 Max, Go 1.26, 2026-08-20):
-
-| Scenario | `http.Get` | `go-download` | |
-|---|---|---|---|
-| Per-connection throttle, loopback (64 MiB, each connection capped ~28 MB/s) | ~27 MB/s | **77–87 MB/s** (ramps to 4 parts) | **~3.1×** |
-| Unconstrained loopback (8 MiB — no bottleneck to parallelize) | ~2.5–3.1 GB/s | ~1.0–1.1 GB/s | ~0.36× |
-| Real WAN, single-flow-saturated line (Hetzner `100MB.bin`, paired vs `curl --http1.1`) | 1.4–7.1 MB/s (line varied) | retires back to 1 connection | **1.03× median** over 10 interleaved rounds |
-
-The constrained row is the design target and matches an independent
-measurement by [ipsw](https://github.com/blacktop/ipsw), whose engine
-benchmarks recorded 3.76× throughput on constrained paths. The other rows
-are the honest fine print: with no per-flow limit there is nothing to
-parallelize, so the ramp retires probed flows that failed to pay back to
-the last winning count (a single connection on a saturated line) and the
-first worker reuses the probe's connection. The end-to-end result still
-includes the probe round-trip, staging, verification, and fsync costs.
-Loopback numbers mostly measure fixed overhead, and real-network results
-vary run to run with the line itself.
-
-Reproduce:
-
-```bash
-just bench                 # loopback pairs: unconstrained + per-connection throttle
-
-# real-network pair against a de facto speed-test file (Hetzner/thinkbroadband/Tele2):
-DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin \
-    go test -bench BenchmarkReal -benchtime 3x .
-```
+Each retry computes its `Range` from the current byte cursor. Data already
+written remains useful after a stall, transport error, or worker retirement.
 
 ## Install
 
@@ -91,7 +45,7 @@ DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin \
 go get github.com/blacktop/go-download
 ```
 
-## Getting Started
+## Getting started
 
 ```go
 package main
@@ -125,7 +79,7 @@ func main() {
 }
 ```
 
-All knobs live on `download.Options`:
+Configure the downloader with `download.Options`:
 
 ```go
 dl, err := download.New(&download.Options{
@@ -136,11 +90,12 @@ dl, err := download.New(&download.Options{
 })
 ```
 
-HTTP/3? Plug a QUIC `http.RoundTripper` (e.g. quic-go) into `Options.Transport` — the library stays dependency-free.
+For HTTP/3, pass a QUIC `http.RoundTripper`, such as quic-go, through
+`Options.Transport`. The core library does not depend on a QUIC implementation.
 
 ## CLI
 
-The repo ships a `dl` command (separate module) with multi-bar progress:
+The separate `dl` module includes a multi-bar progress display:
 
 ```bash
 go install github.com/blacktop/go-download/cmd/dl@latest
@@ -148,14 +103,74 @@ go install github.com/blacktop/go-download/cmd/dl@latest
 dl -p 8 --sha256 020a1e8... https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz
 ```
 
-Interrupted? Run the same command again — it resumes.
+Run the same command after an interruption to resume the download.
+
+## Performance
+
+Parallel parts help when throughput is capped per connection, such as on a
+shaped link or throttled CDN edge. If one TCP flow already fills the path,
+extra connections only add overhead.
+
+The downloader starts with the initial `Range: bytes=0-` response and measures
+its rate after TCP slow start. It then doubles the connection count while each
+new batch improves aggregate throughput. An HTTP 429 response, or a batch that
+never delivers data, returns the downloader to the last flow count that
+worked. On a path with a shared bandwidth cap, it settles back to one stream.
+
+Small downloads do not ramp. The downloader explores only when the remaining
+data can supply one `MinPartSize` chunk to every configured part. With the
+defaults of 8 parts and 16 MiB per part, that boundary is 128 MiB. On a range
+server with a validator, the initial response remains the only connection
+below the boundary, so resume still works without another request.
+
+The default small- and large-file benchmarks compare complete download
+lifecycles: the stdlib baseline uses the same range request, stages into a
+temporary file, calls `Sync`, and renames the result. The shaped-network rows
+retain the raw stdlib baseline because transfer time dominates finalization.
+These are fresh measurements from an Apple M5 Max with Go 1.27 on August 21,
+2026:
+
+| Scenario | Baseline | `go-download` | Result |
+|---|---:|---:|---:|
+| Default small file, unconstrained loopback (4 MiB) | 6.51 ms | **6.27 ms** | within noise |
+| Default large file, unconstrained loopback (128 MiB) | 2.64 GiB/s | **3.14 GiB/s** | **1.19×** |
+| Per-connection throttle (64 MiB, raw stdlib; about 26 MB/s per flow) | 26.15 MB/s | **79.95 MB/s** | **3.06×** |
+| Shared 32 MB/s cap (raw stdlib) | 34.34 MB/s | 33.40 MB/s | **0.973×** |
+| Real WAN, one-flow 100 MiB, paired with curl HTTP/1.1 | paired baseline | paired median | **0.973×** |
+
+The constrained case is what the multipart scheduler is built for. Its 3.06×
+result is close to an independent [ipsw](https://github.com/blacktop/ipsw)
+benchmark, which measured 3.76× throughput on a constrained path. When all
+connections share one cap, the extra batch retires and the transfer returns to
+one flow.
+
+There is also a deliberately aggressive 8 MiB diagnostic benchmark configured
+with four parts and 1 MiB chunks. It reaches about 1.0 GiB/s, versus roughly
+3.0 GiB/s for a raw `http.Get` + `io.Copy`. That is not the default small-file
+path, and the raw baseline skips staging, `Sync`, atomic installation, and
+resume bookkeeping. It remains in the suite to make multipart overhead visible,
+not as a like-for-like product comparison.
+
+WAN results are noisier. The final exact-tree series alternated execution order
+for ten rounds, kept every round, and verified the endpoint, validator, size,
+and HTTP/1.1 protocol before and after. Individual `go-download`/curl ratios
+ranged from 0.844× to 1.109×; the paired median was 0.973×.
+
+Reproduce:
+
+```bash
+just bench                 # every loopback benchmark behind the table above
+
+# real-network pair against a public 100 MiB test file:
+env DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin go test -bench BenchmarkReal -benchtime 3x .
+```
 
 ## Development
 
-`cmd/dl` pins a published library version; run `just setup` once after
-cloning to create a `go.work` so it builds against the in-tree library.
-`just check` runs everything CI runs.
+`cmd/dl` pins a published library version. After cloning, run `just setup` once
+to create a `go.work` file that points it at the in-tree library. `just check`
+runs the same checks as CI.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

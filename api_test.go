@@ -120,14 +120,14 @@ func TestRejectContentTypes(t *testing.T) {
 	if cte.ContentType != "text/html; charset=UTF-8" {
 		t.Errorf("ContentTypeError.ContentType = %q", cte.ContentType)
 	}
-	// Nothing may exist on disk, and the server saw only the probe.
+	// Nothing may exist on disk, and the server saw only the initial request.
 	for _, p := range []string{dest, dest + ".part", dest + ".part.json"} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%s exists after rejected content type", p)
 		}
 	}
 	if n := len(st.rangeHeaders()); n != 1 {
-		t.Errorf("server saw %d requests, want only the probe", n)
+		t.Errorf("server saw %d requests, want only the initial request", n)
 	}
 
 	// Non-matching type proceeds.

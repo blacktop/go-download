@@ -1,41 +1,58 @@
 package download
 
 import (
-	"log/slog"
 	"testing"
 	"time"
 )
 
 // rampHarness drives noteLocked purely with injected byte totals and times.
 type rampHarness struct {
-	rs    *rampState
-	total int64
-	at    time.Time
+	rs        *rampState
+	total     int64
+	at        time.Time
+	autoReady bool
 }
 
 func newRampHarness(parts int, window int64) *rampHarness {
 	start := time.Unix(1000, 0)
 	h := &rampHarness{
 		rs: &rampState{
-			enabled:   true,
-			log:       slog.New(slog.DiscardHandler),
 			parts:     parts,
 			window:    window,
 			settleMin: rampSettleCap,
 			admitted:  1,
 			markTime:  start,
 		},
-		at: start,
+		at:        start,
+		autoReady: true,
 	}
 	h.rs.now = func() time.Time { return h.at }
 	return h
 }
 
-// takeRecord drains the pending decision record the way note() would.
-func (h *rampHarness) takeRecord() *rampDecision {
-	rec := h.rs.pending
-	h.rs.pending = nil
-	return rec
+func TestRampEligible(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		remaining int64
+		minPart   int64
+		parts     int
+		want      bool
+	}{
+		{name: "one part", remaining: 1 << 30, minPart: 16 << 20, parts: 1},
+		{name: "invalid minimum", remaining: 1 << 30, parts: 8},
+		{name: "one byte short", remaining: 128<<20 - 1, minPart: 16 << 20, parts: 8},
+		{name: "exact runway", remaining: 128 << 20, minPart: 16 << 20, parts: 8, want: true},
+		{name: "large remainder", remaining: 1 << 30, minPart: 16 << 20, parts: 8, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := rampEligible(tc.remaining, tc.minPart, tc.parts); got != tc.want {
+				t.Fatalf("rampEligible(%d, %d, %d) = %t, want %t",
+					tc.remaining, tc.minPart, tc.parts, got, tc.want)
+			}
+		})
+	}
 }
 
 // window advances exactly one full byte window at the given rate (bytes/sec)
@@ -43,7 +60,13 @@ func (h *rampHarness) takeRecord() *rampDecision {
 func (h *rampHarness) window(rate float64) (spawnFrom, spawnN, demoteTo int) {
 	h.total += h.rs.window
 	h.at = h.at.Add(time.Duration(float64(h.rs.window) / rate * float64(time.Second)))
-	return h.rs.noteLocked(h.total, h.at)
+	spawnFrom, spawnN, demoteTo = h.rs.noteLocked(h.total, h.at)
+	if h.autoReady {
+		for i := range spawnN {
+			h.rs.noteWorkerReady(spawnFrom + i)
+		}
+	}
+	return spawnFrom, spawnN, demoteTo
 }
 
 func (h *rampHarness) measure(rate float64) (spawnFrom, spawnN, demoteTo int) {
@@ -134,6 +157,67 @@ func TestRampDoesNotDemoteDuringAdmissionSettling(t *testing.T) {
 	}
 	if h.rs.admissionBaseline != baseline {
 		t.Fatal("settling windows must not touch the admission baseline")
+	}
+}
+
+func TestRampRejectsBatchThatNeverContributes(t *testing.T) {
+	t.Parallel()
+	h := newRampHarness(4, 1000)
+	h.autoReady = false
+	h.window(100) // burn-in
+	h.window(100) // baseline + admit worker 1
+
+	// The original flow speeds up enough to clear the admission threshold,
+	// but worker 1 has delivered nothing. None of that gain may be credited
+	// to the new batch, regardless of elapsed wall time or byte windows.
+	for range rampMeasureWindows {
+		if _, n, d := h.window(230); n != 0 || d != 0 {
+			t.Fatalf("unready batch acted: spawn=%d demote=%d", n, d)
+		}
+		if !h.rs.settling || h.rs.admitted != 2 || h.rs.done.Load() {
+			t.Fatalf("unready state: settling=%t admitted=%d done=%t",
+				h.rs.settling, h.rs.admitted, h.rs.done.Load())
+		}
+	}
+	if _, n, d := h.window(230); n != 0 || d != 1 {
+		t.Fatalf("expired unready batch = (spawn=%d, demote=%d), want demote to 1", n, d)
+	}
+	if !h.rs.done.Load() {
+		t.Fatal("rejecting an unready batch must finish the ramp")
+	}
+}
+
+func TestRampWaitsForAdmittedWorkerContribution(t *testing.T) {
+	t.Parallel()
+	h := newRampHarness(4, 1000)
+	h.autoReady = false
+	h.window(100)
+	h.window(100)
+
+	for range rampMeasureWindows {
+		if _, n, d := h.window(230); n != 0 || d != 0 {
+			t.Fatalf("unready batch acted: spawn=%d demote=%d", n, d)
+		}
+	}
+
+	h.rs.noteWorkerReady(1)
+	h.window(230) // release settling; this window is not a decision sample
+	if h.rs.settling {
+		t.Fatal("settling did not release after the admitted worker contributed")
+	}
+	if from, n, d := h.measure(230); from != 2 || n != 2 || d != 0 {
+		t.Fatalf("ready paying batch = (%d,%d,%d), want admit workers 2..3", from, n, d)
+	}
+	if h.rs.batchReady {
+		t.Fatal("new admission inherited the previous batch's readiness")
+	}
+	h.rs.noteWorkerReady(1)
+	if h.rs.batchReady {
+		t.Fatal("worker outside the current batch marked it ready")
+	}
+	h.rs.noteWorkerReady(2)
+	if !h.rs.batchReady {
+		t.Fatal("worker in the current batch did not mark it ready")
 	}
 }
 
@@ -318,147 +402,5 @@ func TestSettleFloorClampBounds(t *testing.T) {
 		if got := settleFloorFor(tc.elect); got != tc.want {
 			t.Errorf("%s: settleFloorFor(%v) = %v, want %v", tc.name, tc.elect, got, tc.want)
 		}
-	}
-}
-
-// TestDecisionRecordEveryAction is the deterministic record oracle: each
-// governor action produces exactly one pending record with the schema's
-// decision-specific fields filled.
-func TestDecisionRecordEveryAction(t *testing.T) {
-	t.Parallel()
-
-	t.Run("first admission", func(t *testing.T) {
-		t.Parallel()
-		h := newRampHarness(4, 1000)
-		h.window(100) // burn-in: no record
-		if rec := h.takeRecord(); rec != nil {
-			t.Fatalf("burn-in produced a record: %+v", rec)
-		}
-		h.window(100) // baseline → admit
-		rec := h.takeRecord()
-		if rec == nil {
-			t.Fatal("first admission produced no record")
-		}
-		if rec.action != "admit" || rec.reason != "first-batch-probe" ||
-			rec.created.prior != 1 || rec.created.admitted != 2 || rec.qValid ||
-			rec.judged.size() != 0 || rec.seq != 1 ||
-			rec.created.final || rec.created.clamped {
-			t.Fatalf("first admission record = %+v", rec)
-		}
-	})
-
-	t.Run("demote", func(t *testing.T) {
-		t.Parallel()
-		h := newRampHarness(4, 1000)
-		h.window(100)
-		h.window(100) // admit 1->2
-		h.takeRecord()
-		h.window(100) // settle
-		h.measure(100)
-		rec := h.takeRecord()
-		if rec == nil {
-			t.Fatal("demotion produced no record")
-		}
-		if rec.action != "demote" || rec.reason != "batch-not-paying" ||
-			rec.judged.prior != 1 || rec.judged.admitted != 2 || !rec.qValid {
-			t.Fatalf("demote record = %+v", rec)
-		}
-		if rec.q < 0.9 || rec.q > 1.02 {
-			t.Fatalf("flat demotion q = %v", rec.q)
-		}
-	})
-
-	t.Run("freeze", func(t *testing.T) {
-		t.Parallel()
-		h := newRampHarness(4, 1000)
-		h.window(100)
-		h.window(100)
-		h.takeRecord()
-		h.window(100) // settle
-		h.measure(110)
-		rec := h.takeRecord()
-		if rec == nil || rec.action != "freeze" || rec.reason != "marginal-gain" ||
-			rec.judged.prior != 1 || rec.judged.admitted != 2 || !rec.qValid {
-			t.Fatalf("freeze record = %+v", rec)
-		}
-		if rec.q < 1.05 || rec.q >= rampImprovement {
-			t.Fatalf("freeze q = %v", rec.q)
-		}
-	})
-
-	t.Run("expand then keep-final with readiness", func(t *testing.T) {
-		t.Parallel()
-		h := newRampHarness(4, 1000)
-		h.window(100)
-		h.window(100) // admit 1->2
-		h.takeRecord()
-		spawnedAt := h.rs.admittedAt
-		h.window(230)                      // settle
-		h.rs.noteWorkerReady(1, spawnedAt) // batch worker 1 became productive
-		h.measure(230)                     // clear gain → admit 2->4
-		rec := h.takeRecord()
-		if rec == nil || rec.action != "admit" || rec.reason != "clear-gain" ||
-			rec.judged.prior != 1 || rec.judged.admitted != 2 ||
-			rec.created.prior != 2 || rec.created.admitted != 4 || !rec.qValid {
-			t.Fatalf("expand record = %+v", rec)
-		}
-		if rec.q < 2.0 || rec.q > 2.6 {
-			t.Fatalf("expand q = %v", rec.q)
-		}
-		if len(rec.readyLat) != 1 {
-			t.Fatalf("expand readiness = %+v (judged batch 1->2 had one worker ready)", rec)
-		}
-		if rec.readyLat[0] <= 0 {
-			t.Fatalf("readiness latency = %v, want positive", rec.readyLat[0])
-		}
-
-		// Workers 2 and 3 of the final batch become productive; only they
-		// may appear in the final record.
-		spawnedAt = h.rs.admittedAt
-		h.rs.noteWorkerReady(2, spawnedAt)
-		h.rs.noteWorkerReady(3, spawnedAt)
-		h.rs.noteWorkerReady(1, spawnedAt) // stale id outside the current batch: ignored
-		h.window(520)                      // settle
-		h.measure(520)
-		rec = h.takeRecord()
-		if rec == nil || rec.action != "keep-final" || rec.reason != "final-batch-paying" ||
-			rec.judged.prior != 2 || rec.judged.admitted != 4 || !rec.judged.final {
-			t.Fatalf("keep-final record = %+v", rec)
-		}
-		if len(rec.readyLat) != 2 {
-			t.Fatalf("keep-final readiness = %+v, want exactly the final batch's two workers", rec)
-		}
-		if !h.rs.done.Load() {
-			t.Fatal("keep-final must finish the ramp")
-		}
-	})
-}
-
-func TestDecisionTelemetryDisabledIsInert(t *testing.T) {
-	t.Parallel()
-	h := newRampHarness(4, 1000)
-	h.rs.enabled = false
-	h.window(100)
-	h.window(100)
-	if h.rs.pending != nil || h.rs.seq != 0 || h.rs.ready != nil {
-		t.Fatalf("disabled telemetry retained state: pending=%+v seq=%d ready=%v",
-			h.rs.pending, h.rs.seq, h.rs.ready)
-	}
-}
-
-func TestWorkerReadinessUsesActualSpawnTime(t *testing.T) {
-	t.Parallel()
-	h := newRampHarness(2, 1000)
-	h.window(100)
-	h.window(100) // admit worker 1
-	h.takeRecord()
-
-	// The admission decision happened much earlier than the worker spawn.
-	// Only the interval from actual goroutine submission may be recorded.
-	h.at = h.at.Add(2 * time.Second)
-	spawnedAt := h.at.Add(-37 * time.Millisecond)
-	h.rs.noteWorkerReady(1, spawnedAt)
-	if got := h.rs.ready[1]; got != 37*time.Millisecond {
-		t.Fatalf("readiness = %v, want 37ms from actual spawn", got)
 	}
 }

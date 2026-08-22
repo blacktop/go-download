@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -102,8 +101,8 @@ func TestRedirectSensitiveHeadersNotReapplied(t *testing.T) {
 			t.Errorf("origin request did not receive configured %s", name)
 		}
 	}
-	if len(received) < 2 {
-		t.Fatalf("target saw %d requests, want probe plus worker", len(received))
+	if len(received) != 1 {
+		t.Fatalf("target saw %d requests, want one useful redirected request", len(received))
 	}
 	for i, h := range received {
 		for _, name := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
@@ -123,11 +122,13 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 		t.Parallel()
 		v1 := bytes.Repeat([]byte{0x11}, 128<<10)
 		v2 := bytes.Repeat([]byte{0x22}, len(v1)+(16<<10))
+		var initialRequests atomic.Int32
 		var rangedWorkers atomic.Int32
 		var fullRequests atomic.Int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.Header.Get("Range") {
-			case "bytes=0-0":
+			case "bytes=0-":
+				initialRequests.Add(1)
 				writeBareRange(w, r, v1, "")
 			case "":
 				fullRequests.Add(1)
@@ -141,42 +142,38 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 
 		d := newDL(t, &Options{Parts: 4, MinPartSize: 4 << 10})
 		_, got := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
-		if !bytes.Equal(got, v2) {
-			t.Fatal("validator-less fallback did not produce one coherent representation")
+		if !bytes.Equal(got, v1) {
+			t.Fatal("validator-less download did not preserve its initial representation")
 		}
 		if got := rangedWorkers.Load(); got != 0 {
 			t.Errorf("validator-less download issued %d worker range requests", got)
 		}
-		if got := fullRequests.Load(); got != 1 {
-			t.Errorf("full requests = %d, want 1", got)
+		if got := initialRequests.Load(); got != 1 {
+			t.Errorf("initial requests = %d, want 1", got)
+		}
+		if got := fullRequests.Load(); got != 0 {
+			t.Errorf("redundant full requests = %d, want 0", got)
 		}
 	})
 
 	t.Run("checksum permits multipart", func(t *testing.T) {
 		t.Parallel()
-		data := testData(128 << 10)
+		data := testData(4 << 20)
 		sum := fmt.Sprintf("%x", sha256.Sum256(data))
-		var rangedWorkers atomic.Int32
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Range") != "bytes=0-0" {
-				rangedWorkers.Add(1)
-			}
-			writeBareRange(w, r, data, "")
-		}))
+		var st stats
+		srv := httptest.NewServer(throttledRangeHandler(data, "", &st,
+			5*time.Millisecond, 64, func(*http.Request) bool { return true }))
 		defer srv.Close()
 
 		d := newDL(t, &Options{
-			Parts: 4, MinPartSize: 4 << 10, ExpectedSHA256: sum,
+			Parts: 4, MinPartSize: 256 << 10, ExpectedSHA256: sum,
 		})
 		res, got := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
 		if !bytes.Equal(got, data) || res.SHA256 != sum {
 			t.Fatal("checksummed multipart download failed")
 		}
-		// One ranged worker request proves multipart mode (the single-stream
-		// fallback sends no Range header at all). The exact count depends on
-		// how far the concurrency ramp gets before this small file finishes.
-		if got := rangedWorkers.Load(); got < 1 {
-			t.Errorf("checksum-backed download fell back to single-stream (%d worker ranges)", got)
+		if got := len(st.rangeHeaders()); got < 2 {
+			t.Errorf("ranged requests = %d, want checksum-backed parallel requests", got)
 		}
 	})
 
@@ -185,8 +182,11 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 		probeData := testData(64 << 10)
 		fullData := testData(96 << 10)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Range") == "bytes=0-0" {
-				writeBareRange(w, r, probeData, "")
+			if r.Header.Get("Range") == "bytes=0-" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(probeData)))
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(probeData[:1])
 				return
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(len(fullData)))
@@ -210,8 +210,11 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 		probeData := testData(64 << 10)
 		fullData := testData(96 << 10)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Range") == "bytes=0-0" {
-				writeBareRange(w, r, probeData, "")
+			if r.Header.Get("Range") == "bytes=0-" {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(probeData)))
+				w.Header().Set("Content-Length", "1")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(probeData[:1])
 				return
 			}
 			w.WriteHeader(http.StatusOK)
@@ -238,8 +241,12 @@ func TestMultipartRejectsMismatchedContentRange(t *testing.T) {
 	t.Parallel()
 	data := testData(64 << 10)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-0" {
-			writeBareRange(w, r, data, `"v1"`)
+		if r.Header.Get("Range") == "bytes=0-" {
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:1])
 			return
 		}
 		start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data)))
@@ -273,10 +280,6 @@ func TestMultipartCappedRangesDoNotSpendRetries(t *testing.T) {
 	const capSize = int64(1 << 10)
 	var workerRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-0" {
-			writeBareRange(w, r, data, `"v1"`)
-			return
-		}
 		workerRequests.Add(1)
 		start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data)))
 		if !ok {
@@ -325,7 +328,7 @@ func TestRetryableResponseBodiesCloseOnce(t *testing.T) {
 				sourceURL: &url.URL{Scheme: "http", Host: "example.test"},
 				total:     1, etag: `"v1"`,
 			}
-			w := newWorker(0, r, nil, nil, nil)
+			w := newWorker(0, r, nil, nil)
 			var err error
 			if ranged {
 				sched := newScheduler(1)
@@ -517,18 +520,22 @@ func TestConcurrentGetsSerializeSameDestination(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseWorker) }) }
 	t.Cleanup(release)
-	var probes atomic.Int32
-	var workers atomic.Int32
+	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-0" {
-			probes.Add(1)
-			writeBareRange(w, r, data, `"v1"`)
-			return
+		if got := r.Header.Get("Range"); got != "bytes=0-" {
+			t.Errorf("initial Range = %q, want bytes=0-", got)
 		}
-		workers.Add(1)
+		requests.Add(1)
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // let each Get reach the destination lock before body bytes
+		}
 		startOnce.Do(func() { close(workerStarted) })
 		<-releaseWorker
-		writeBareRange(w, r, data, `"v1"`)
+		_, _ = w.Write(data)
 	}))
 	defer srv.Close()
 
@@ -554,14 +561,11 @@ func TestConcurrentGetsSerializeSameDestination(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(3 * time.Second)
-	for probes.Load() < 2 && time.Now().Before(deadline) {
+	for requests.Load() < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := probes.Load(); got != 2 {
-		t.Fatalf("probe requests = %d, want 2 concurrent calls", got)
-	}
-	if got := workers.Load(); got != 1 {
-		t.Fatalf("worker requests before release = %d, want 1 staging owner", got)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("initial requests = %d, want 2 concurrent calls", got)
 	}
 	release()
 
@@ -579,9 +583,6 @@ func TestConcurrentGetsSerializeSameDestination(t *testing.T) {
 	}
 	if successes != 1 || existsErrors != 1 {
 		t.Fatalf("successes=%d ErrDestExists=%d, want one each", successes, existsErrors)
-	}
-	if got := workers.Load(); got != 1 {
-		t.Errorf("worker requests after completion = %d, want 1", got)
 	}
 	got, err := os.ReadFile(dest)
 	if err != nil {
@@ -670,87 +671,11 @@ func TestReporterScopesConcurrentDownloads(t *testing.T) {
 	}
 }
 
-func TestRetryableStatusDropsPinnedNode(t *testing.T) {
-	t.Parallel()
-	data := testData(32 << 10)
-	var badRequests atomic.Int32
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		badRequests.Add(1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer bad.Close()
-	var goodStats stats
-	good := httptest.NewServer(rangeHandler(data, `"v1"`, &goodStats))
-	defer good.Close()
-
-	d := newDL(t, &Options{
-		Parts: 1,
-		Proxy: func(*http.Request) (*url.URL, error) {
-			return nil, nil
-		},
-	})
-	backends := map[string]string{
-		"192.0.2.1:80": strings.TrimPrefix(bad.URL, "http://"),
-		"192.0.2.2:80": strings.TrimPrefix(good.URL, "http://"),
-	}
-	d.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		backend, ok := backends[addr]
-		if !ok {
-			return nil, &net.AddrError{Err: "unexpected", Addr: addr}
-		}
-		return (&net.Dialer{}).DialContext(ctx, network, backend)
-	}
-
-	p := testPicker("192.0.2.1", "192.0.2.2")
-	if err := p.refresh(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	// Force the first two selections to the bad node; its second strike
-	// bans it, after which the good node must be selected.
-	p.nodes[1].conns = 1
-	dest := filepath.Join(t.TempDir(), "part")
-	file, err := os.OpenFile(dest, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	if err := file.Truncate(int64(len(data))); err != nil {
-		t.Fatal(err)
-	}
-	sched := newScheduler(4 << 10)
-	sched.addPending(0, int64(len(data)), 0)
-	grant := sched.next(0)
-	run := &run{
-		d: d, rep: NopReporter{}, url: "http://cdn.test/file.bin", sourceURL: &url.URL{Scheme: "http", Host: "cdn.test"},
-		total: int64(len(data)), etag: `"v1"`, partPath: dest,
-	}
-	w := newWorker(0, run, sched, file, p)
-	defer w.dropNode()
-	for attempt := 1; attempt <= 2; attempt++ {
-		err := w.attempt(t.Context(), grant)
-		if !errors.Is(err, StatusError(http.StatusServiceUnavailable)) {
-			t.Fatalf("bad attempt %d error = %v", attempt, err)
-		}
-		if w.node != nil || w.client != nil {
-			t.Fatalf("bad attempt %d retained pinned node/client", attempt)
-		}
-	}
-	if err := w.attempt(t.Context(), grant); err != nil {
-		t.Fatalf("healthy-node attempt failed: %v", err)
-	}
-	if got := badRequests.Load(); got != 2 {
-		t.Errorf("bad-node requests = %d, want 2 before ban", got)
-	}
-	if len(goodStats.rangeHeaders()) != 1 {
-		t.Errorf("healthy node requests = %v, want one", goodStats.rangeHeaders())
-	}
-}
-
 func TestAdaptiveTimeoutNeverDropsConfiguredBase(t *testing.T) {
 	t.Parallel()
 	const base = 2 * time.Minute
 	d := newDL(t, &Options{Timeout: base})
-	w := newWorker(0, &run{d: d, rep: NopReporter{}}, nil, nil, nil)
+	w := newWorker(0, &run{d: d, rep: NopReporter{}}, nil, nil)
 	w.bumpTimeout()
 	if w.timeout != base {
 		t.Errorf("bumpTimeout reduced configured base: got %v, want %v", w.timeout, base)
@@ -763,7 +688,7 @@ func TestAdaptiveTimeoutNeverDropsConfiguredBase(t *testing.T) {
 
 	const huge = time.Duration(1<<63 - 1)
 	hugeDownloader := newDL(t, &Options{Timeout: huge})
-	hugeWorker := newWorker(0, &run{d: hugeDownloader, rep: NopReporter{}}, nil, nil, nil)
+	hugeWorker := newWorker(0, &run{d: hugeDownloader, rep: NopReporter{}}, nil, nil)
 	hugeWorker.bumpTimeout()
 	if hugeWorker.timeout != huge {
 		t.Errorf("bumpTimeout overflowed configured base: got %v, want %v", hugeWorker.timeout, huge)

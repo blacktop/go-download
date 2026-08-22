@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptrace"
 	"os"
@@ -23,24 +22,16 @@ const (
 	decayWindow = 16
 )
 
-// maxFreeRotations bounds budget-free node rotations per chunk (culls and
-// dial failures) so a fully unreachable host still exhausts the retry
-// budget instead of rotating forever.
-const maxFreeRotations = 8
-
 var (
-	errStall           = errors.New("read stalled")
-	errCulled          = errors.New("node statistically slow, reassigning")
-	errNodeUnreachable = errors.New("node unreachable, reassigning")
+	errStall = errors.New("read stalled")
 	// errWorkerRetired is the cancellation cause used to wake and gracefully
 	// stop a worker the ramp demoted; it must never surface as a download
 	// failure.
-	errWorkerRetired   = errors.New("worker retired by concurrency governor")
-	errSharedLeaseMiss = errors.New("reusable probe connection unavailable")
-	errRangeCapped     = errors.New("server capped range response")
-	errShortBody       = errors.New("server closed body before range completed")
-	errRangeIgnored    = errors.New("server ignored Range request")
-	errContentChanged  = errors.New("remote content changed during download")
+	errWorkerRetired  = errors.New("worker retired by concurrency governor")
+	errRangeCapped    = errors.New("server capped range response")
+	errShortBody      = errors.New("server closed body before range completed")
+	errRangeIgnored   = errors.New("server ignored Range request")
+	errContentChanged = errors.New("remote content changed during download")
 )
 
 // permanentError marks a failure that retrying cannot fix.
@@ -50,46 +41,44 @@ func (e *permanentError) Error() string { return e.err.Error() }
 func (e *permanentError) Unwrap() error { return e.err }
 
 // worker owns one connection slot: it pulls chunks from the scheduler and
-// downloads each with retry, stall detection, and (when enabled) CDN node
-// pinning.
+// downloads each with retry and stall detection.
 type worker struct {
 	id     int
 	r      *run
 	sched  *scheduler
 	file   *os.File
-	picker *picker // nil when pinning is disabled
-
-	node   *node
 	client *http.Client
-	// sharedClient is worker 0's one-attempt lease on the base transport. It
-	// must be detached without closing the base pool after that attempt.
-	sharedClient bool
-	timeout      time.Duration
-	dtt          int // full buffers until the next timeout decay step
-	bo           backoff
-	buf          []byte
-	bufp         *[]byte // pool token for releaseBuf
+	// initial is the election response worker 0 can consume without issuing a
+	// second request. initialAddr preserves the normal Connected callback;
+	// initialCancel aborts the election request itself (the only reliable
+	// way to unblock a stalled body read on an arbitrary transport).
+	initial       *http.Response
+	initialAddr   string
+	initialCancel context.CancelCauseFunc
+	timeout       time.Duration
+	dtt           int // full buffers until the next timeout decay step
+	bo            backoff
+	buf           []byte
+	bufp          *[]byte // pool token for releaseBuf
 	// announced tracks whether the single-stream path has emitted its
 	// ChunkStart (retries emit ChunkRestart instead).
 	announced bool
-	// sawBody tracks the worker's first received body byte for ramp
-	// readiness telemetry (spawn-to-first-byte latency).
-	sawBody   bool
-	spawnedAt time.Time
+	// sawBody tracks the worker's first received body byte so the ramp cannot
+	// judge a newly admitted batch before that worker contributes.
+	sawBody bool
 	// sleep is the retry/backoff sleeper; tests replace it with a
 	// channel-coordinated fake to prove cancellation without wall-clock
 	// assertions. Internal seam only.
 	sleep func(ctx context.Context, d time.Duration) error
 }
 
-func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *worker {
+func newWorker(id int, r *run, sched *scheduler, file *os.File) *worker {
 	bp := r.d.bufs.Get().(*[]byte)
 	w := &worker{
 		id:      id,
 		r:       r,
 		sched:   sched,
 		file:    file,
-		picker:  p,
 		timeout: r.d.opt.Timeout,
 		buf:     *bp,
 		bufp:    bp,
@@ -98,11 +87,31 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File, p *picker) *work
 	if r.d.sleepHook != nil {
 		w.sleep = r.d.sleepHook
 	}
-	if id == 0 && p != nil && r.probeReusable {
-		w.client = r.d.newClient(r.d.base)
-		w.sharedClient = true
+	if id == 0 {
+		w.initial, w.initialAddr, w.initialCancel = r.takeInitial()
 	}
 	return w
+}
+
+func (w *worker) closeInitial() {
+	if w.initialCancel != nil {
+		w.initialCancel(nil)
+	}
+	if w.initial != nil {
+		_ = w.initial.Body.Close()
+	}
+	w.initial, w.initialAddr, w.initialCancel = nil, "", nil
+}
+
+// takeInitial hands the pending initial response (with its request cancel)
+// to the attempt that will consume it, clearing the worker's reference.
+func (w *worker) takeInitial() (*http.Response, string, context.CancelCauseFunc) {
+	resp, addr, cancel := w.initial, w.initialAddr, w.initialCancel
+	w.initial, w.initialAddr, w.initialCancel = nil, "", nil
+	if cancel == nil {
+		cancel = func(error) {}
+	}
+	return resp, addr, cancel
 }
 
 // releaseBuf returns the worker's read buffer to the Downloader pool.
@@ -119,7 +128,7 @@ func (w *worker) releaseBuf() {
 // run pulls chunks until the scheduler has nothing left for this worker.
 func (w *worker) run(ctx context.Context) error {
 	defer w.releaseBuf()
-	defer w.dropNode()
+	defer w.closeInitial()
 	defer w.sched.exit(w.id)
 	for {
 		if ctx.Err() != nil {
@@ -175,7 +184,6 @@ func genuineUnderRetirement(err error) bool {
 // re-downloads written bytes.
 func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 	attempt := 0
-	freeRotations := 0
 	chargedAt := w.r.progress.Load()
 	for {
 		err := w.attempt(ctx, c)
@@ -183,15 +191,6 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			w.sched.complete(c)
 			w.r.rep.ChunkDone(c.id)
 			return nil
-		}
-		if errors.Is(err, errSharedLeaseMiss) {
-			if ctx.Err() != nil {
-				return err
-			}
-			// The base pool had no acceptable reused connection. attempt detached
-			// the shared client, so retry immediately through normal pinned
-			// selection without a strike, backoff, or retry-budget charge.
-			continue
 		}
 		if perm, ok := errors.AsType[*permanentError](err); ok {
 			// Genuine permanent/integrity/write failures always win a race
@@ -210,16 +209,6 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			// A complete server-declared subrange advanced the cursor. Continue
 			// immediately without charging progress against the retry budget.
 			w.r.d.log.Debug("continuing capped range", "worker", w.id, "chunk", c.id)
-			continue
-		}
-		if (errors.Is(err, errCulled) || errors.Is(err, errNodeUnreachable)) &&
-			freeRotations < maxFreeRotations {
-			// Abandoning a statistically slow or unreachable node for a
-			// better one is progress, not failure: no retry budget, no
-			// backoff. Rotations are bounded here and by strikes/bans, so
-			// a fully dead host still falls through to charged retries.
-			freeRotations++
-			w.r.d.log.Debug("reassigning chunk", "worker", w.id, "chunk", c.id, "err", err)
 			continue
 		}
 		throttled := errors.Is(err, StatusError(http.StatusTooManyRequests))
@@ -265,13 +254,10 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if !todo {
 		return nil
 	}
-	if err := w.ensureClient(ctx); err != nil {
-		return err
+	if w.initial != nil {
+		return w.initialRangeAttempt(ctx, c, cursor, end)
 	}
-	sharedAttempt := w.sharedClient
-	if sharedAttempt {
-		defer w.detachSharedClient()
-	}
+	w.ensureClient()
 
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -279,16 +265,9 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	defer timer.Stop()
 
 	trace := &httptrace.ClientTrace{GotConn: func(ci httptrace.GotConnInfo) {
-		if sharedAttempt && !ci.Reused {
-			cancel(errSharedLeaseMiss)
-			return
-		}
 		w.r.rep.Connected(c.id, ci.Conn.RemoteAddr().String())
 	}}
 	reqCtx := httptrace.WithClientTrace(actx, trace)
-	if sharedAttempt {
-		reqCtx = context.WithValue(reqCtx, sharedLeaseContextKey{}, struct{}{})
-	}
 	req, err := http.NewRequestWithContext(reqCtx,
 		http.MethodGet, w.r.url, nil)
 	if err != nil {
@@ -302,73 +281,101 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		if context.Cause(actx) == errSharedLeaseMiss || errors.Is(err, errSharedLeaseMiss) { //nolint:errorlint // exact internal sentinel
-			return errSharedLeaseMiss
-		}
 		return w.classify(err, actx)
-	}
-	if context.Cause(actx) == errSharedLeaseMiss { //nolint:errorlint // exact internal sentinel
-		_ = resp.Body.Close()
-		return errSharedLeaseMiss
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		contentRange := resp.Header.Get("Content-Range")
-		s, e, total, crErr := parseContentRange(contentRange)
-		// The range must start at the cursor and describe our representation
-		// (total "*" is RFC-valid unknown). A server-revised shorter range is
-		// accepted, but it may not extend beyond the requested range.
-		if crErr != nil || s != cursor || e < s || e >= end ||
-			(total != -1 && total != w.r.total) {
-			_ = resp.Body.Close()
-			return &permanentError{fmt.Errorf(
-				"wrong Content-Range %q for requested bytes %d-%d/%d",
-				contentRange, cursor, end-1, w.r.total)}
-		}
-		responseEnd := e + 1 // convert inclusive HTTP end to scheduler-exclusive end
-		capped := responseEnd < end
-		defer resp.Body.Close()
-		body := &observedReader{r: io.LimitReader(resp.Body, responseEnd-s), w: w}
-		err := w.readLoop(body, timer, w.chunkSink(c))
-		if err == nil {
-			return nil
-		}
-		if capped && errors.Is(err, io.EOF) {
-			next, _, _ := w.sched.cursor(c)
-			if next >= responseEnd {
-				return errRangeCapped
-			}
-		}
-		return w.classify(err, actx)
+		return w.readPartialResponse(resp, actx, timer, c, cursor, end)
 	case resp.StatusCode == http.StatusOK:
 		_ = resp.Body.Close()
 		if w.r.validator() != "" {
 			// If-Range mismatch: the remote file was replaced.
 			return &permanentError{errContentChanged}
 		}
-		w.strikeNode()
-		w.dropNode()
 		return errRangeIgnored
 	case resp.StatusCode == http.StatusTooManyRequests:
-		// "Slow down" is server-wide, not this node's fault: back off via
-		// the retry path without striking (a strike-ban here would churn
-		// through every node and make the overload worse), and freeze the
-		// concurrency ramp — the server just told us the flow count is
-		// already too high.
+		// Reject the batch under judgment: the server just told us its added
+		// flow count is too high, so retaining it would only create retry
+		// traffic.
 		_ = resp.Body.Close()
 		if w.r.ramp != nil {
-			w.r.ramp.done.Store(true)
+			w.r.ramp.rejectThrottledBatch()
 		}
 		return StatusError(resp.StatusCode)
 	case isRetryableStatus(resp.StatusCode):
 		_ = resp.Body.Close()
-		w.strikeNode()
-		w.dropNode()
 		return StatusError(resp.StatusCode)
 	default:
 		_ = resp.Body.Close()
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
+}
+
+func (w *worker) initialRangeAttempt(
+	ctx context.Context, c *chunk, cursor, end int64,
+) error {
+	resp, addr, ecancel := w.takeInitial()
+	defer ecancel(nil)
+	actx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	// The response was created before worker 0 existed, on its own request
+	// context. Forward every local cancellation cause (stall, retirement,
+	// parent cancel) into that request so a blocked body read genuinely
+	// unblocks — Body.Close carries no such contract for arbitrary
+	// transports.
+	stop := context.AfterFunc(actx, func() {
+		ecancel(context.Cause(actx))
+		// Also close the (close-once) body: request-context cancellation is
+		// the contract, but Close-only custom bodies still deserve a wake.
+		_ = resp.Body.Close()
+	})
+	defer stop()
+	timer := time.AfterFunc(w.timeout, func() { cancel(errStall) })
+	defer timer.Stop()
+	if addr != "" {
+		w.r.rep.Connected(c.id, addr)
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		_ = resp.Body.Close()
+		return &permanentError{StatusError(resp.StatusCode)}
+	}
+	return w.readPartialResponse(resp, actx, timer, c, cursor, end)
+}
+
+func (w *worker) readPartialResponse(
+	resp *http.Response,
+	actx context.Context,
+	timer *time.Timer,
+	c *chunk,
+	cursor, end int64,
+) error {
+	contentRange := resp.Header.Get("Content-Range")
+	s, e, total, crErr := parseContentRange(contentRange)
+	// The range must start at the cursor and describe our representation
+	// (total "*" is RFC-valid unknown). A server-revised shorter range is
+	// accepted, but it may not extend beyond the requested range.
+	if crErr != nil || s != cursor || e < s || e >= end ||
+		(total != -1 && total != w.r.total) {
+		_ = resp.Body.Close()
+		return &permanentError{fmt.Errorf(
+			"wrong Content-Range %q for requested bytes %d-%d/%d",
+			contentRange, cursor, end-1, w.r.total)}
+	}
+	responseEnd := e + 1 // convert inclusive HTTP end to scheduler-exclusive end
+	capped := responseEnd < end
+	defer resp.Body.Close()
+	body := &observedReader{r: io.LimitReader(resp.Body, responseEnd-s), w: w}
+	err := w.readLoop(body, timer, w.chunkSink(c))
+	if err == nil {
+		return nil
+	}
+	if capped && errors.Is(err, io.EOF) {
+		next, _, _ := w.sched.cursor(c)
+		if next >= responseEnd {
+			return errRangeCapped
+		}
+	}
+	return w.classify(err, actx)
 }
 
 // chunkSink writes each read at the claimed offset. Claiming before writing
@@ -397,36 +404,27 @@ func (w *worker) chunkSink(c *chunk) func(buf []byte, d time.Duration) (bool, er
 	}
 }
 
-// observedReader feeds per-read throughput into the node picker and the
-// concurrency ramp, and aborts the body with errCulled once the node proves
-// statistically slow. Observing raw reads (typically one TLS record) keeps
-// both responsive even when the connection is too slow to ever fill a whole
-// buffer.
+// observedReader feeds per-read throughput into the concurrency ramp.
+// Observing raw reads keeps it responsive even when a connection is too slow
+// to fill a whole buffer.
 type observedReader struct {
 	r io.Reader
 	w *worker
 }
 
 func (o *observedReader) Read(p []byte) (int, error) {
-	start := time.Now()
 	n, err := o.r.Read(p)
 	if n > 0 {
-		if o.w.picker != nil {
-			o.w.picker.observe(o.w.node, int64(n), time.Since(start))
-		}
 		total := o.w.r.progress.Add(int64(n))
 		if o.w.r.ramp != nil {
-			if o.w.r.ramp.enabled && !o.w.sawBody {
-				// First body byte this worker ever received: its
-				// spawn-to-first-byte readiness latency (telemetry only).
+			if !o.w.sawBody {
+				// First body byte this worker ever received: it can now
+				// participate in the aggregate-rate judgment.
 				o.w.sawBody = true
-				o.w.r.ramp.noteWorkerReady(o.w.id, o.w.spawnedAt)
+				o.w.r.ramp.noteWorkerReady(o.w.id)
 			}
 			o.w.r.ramp.note(total)
 		}
-	}
-	if err == nil && o.w.picker != nil && o.w.picker.shouldCull(o.w.node) {
-		return n, errCulled
 	}
 	return n, err
 }
@@ -483,48 +481,22 @@ func (w *worker) pump(timer *time.Timer,
 	}
 }
 
-// classify sorts an attempt failure into retryable/permanent and applies the
-// node-health consequences. It is the single funnel for transport errors, so
-// URL redaction lives here rather than at each client.Do call site.
+// classify sorts an attempt failure into retryable/permanent. It is the
+// single funnel for transport errors, so URL redaction lives here rather than
+// at each client.Do call site.
 func (w *worker) classify(err error, actx context.Context) error {
 	err = redactErr(err)
 	if _, ok := errors.AsType[*permanentError](err); ok {
 		return err
 	}
-	if errors.Is(err, errCulled) {
-		w.strikeNode()
-		w.dropNode()
-		return errCulled
-	}
 	if context.Cause(actx) == errStall { //nolint:errorlint // exact sentinel set by our AfterFunc
 		w.bumpTimeout()
-		w.strikeNode()
-		w.dropNode()
 		return errStall
 	}
 	if errors.Is(err, io.EOF) {
 		return errShortBody
 	}
-	// Connection-level failure (unreachable address, reset, TLS error):
-	// strike the pinned node and rotate so the retry can try another one.
-	// A pinned dial failure (e.g. an unroutable AAAA node on a v4-only
-	// network) fails in microseconds and should rotate for free rather
-	// than burning retry budget and backoff sleeps.
-	dialFailed := isDialError(err)
-	w.strikeNode()
-	w.dropNode()
-	if dialFailed && w.picker != nil {
-		return fmt.Errorf("%w: %w", errNodeUnreachable, err)
-	}
 	return err
-}
-
-// isDialError reports whether err failed before a connection existed.
-func isDialError(err error) bool {
-	if op, ok := errors.AsType[*net.OpError](err); ok {
-		return op.Op == "dial"
-	}
-	return false
 }
 
 func (w *worker) bumpTimeout() {
@@ -559,73 +531,19 @@ func (w *worker) decayTimeout() {
 	}
 }
 
-// ensureClient lazily builds the worker's HTTP client. With a picker, the
-// client's transport pins connections to one chosen node.
-func (w *worker) ensureClient(ctx context.Context) error {
+// ensureClient lazily builds the worker's HTTP client.
+func (w *worker) ensureClient() {
 	if w.client != nil {
-		return nil
-	}
-	if w.picker == nil {
-		w.client = w.r.d.newClient(w.r.d.roundTripper())
-		return nil
-	}
-	n, err := w.picker.pick(ctx)
-	if err != nil {
-		return err
-	}
-	w.node = n
-	tr := w.r.d.base.Clone()
-	expected := net.JoinHostPort(w.picker.host, w.picker.port)
-	pinned := net.JoinHostPort(n.addr.String(), w.picker.port)
-	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if addr == expected {
-			addr = pinned
-		}
-		return w.r.d.dial(ctx, network, addr)
-	}
-	tr.MaxConnsPerHost = 1
-	w.client = w.r.d.newClient(tr)
-	w.r.d.log.Debug("worker pinned to node", "worker", w.id, "addr", pinned)
-	return nil
-}
-
-// dropNode releases the worker's pinned node so the next attempt picks a
-// (possibly different) one. A no-op when pinning is disabled: the shared
-// client must not be torn down.
-func (w *worker) dropNode() {
-	if w.sharedClient {
-		w.detachSharedClient()
 		return
 	}
-	if w.picker == nil || w.node == nil {
-		return
-	}
-	if w.client != nil {
-		w.client.CloseIdleConnections()
-	}
-	w.client = nil
-	w.picker.release(w.node)
-	w.node = nil
-}
-
-func (w *worker) detachSharedClient() {
-	if !w.sharedClient {
-		return
-	}
-	w.client = nil
-	w.sharedClient = false
-}
-
-func (w *worker) strikeNode() {
-	if w.picker != nil {
-		w.picker.strike(w.node)
-	}
+	w.client = w.r.d.newClient(w.r.d.roundTripper())
 }
 
 // singleStream downloads the whole body sequentially (no Range support or
 // unknown size). A retry restarts from byte zero.
 func (w *worker) singleStream(ctx context.Context) error {
 	defer w.releaseBuf()
+	defer w.closeInitial()
 	for attempt := 0; ; attempt++ {
 		err := w.singleAttempt(ctx)
 		if err == nil {
@@ -647,36 +565,148 @@ func (w *worker) singleStream(ctx context.Context) error {
 	}
 }
 
+// announceSingle emits the single-stream ChunkStart exactly once; retries
+// emit ChunkRestart instead (their truncation discarded prior bytes).
+func (w *worker) announceSingle(expected int64) {
+	if !w.announced {
+		w.announced = true
+		w.r.rep.ChunkStart(0, 0, expected, 0)
+		return
+	}
+	if rs, ok := w.r.rep.(ChunkRestarter); ok {
+		rs.ChunkRestart(0)
+	}
+}
+
+// headerValidator mirrors run.validator's precedence over a response's own
+// headers: a strong ETag, else Last-Modified, else "".
+func headerValidator(h http.Header) string {
+	if etag := h.Get("ETag"); isStrongETag(etag) {
+		return etag
+	}
+	return h.Get("Last-Modified")
+}
+
+// checkSingleStatus classifies a single-stream response: proceed to the
+// body (nil, nil), complete as a valid empty resource (empty=true), retry
+// (StatusError), or fail permanently. The body is never read here.
+func checkSingleStatus(resp *http.Response, initial bool, total int64) (empty bool, err error) {
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return false, nil
+	case initial && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && total == 0:
+		return true, nil
+	case initial && resp.StatusCode == http.StatusPartialContent:
+		contentRange := resp.Header.Get("Content-Range")
+		s, e, respTotal, crErr := parseContentRange(contentRange)
+		if crErr != nil || s != 0 || respTotal < 0 || e != respTotal-1 ||
+			(total >= 0 && respTotal != total) {
+			return false, &permanentError{fmt.Errorf(
+				"initial Content-Range %q does not cover the full representation",
+				contentRange)}
+		}
+		return false, nil
+	case isRetryableStatus(resp.StatusCode):
+		return false, StatusError(resp.StatusCode)
+	default:
+		return false, &permanentError{StatusError(resp.StatusCode)}
+	}
+}
+
+// completeEmptySingle finishes a zero-length download: truncate, announce,
+// done — no body bytes are ever involved.
+func (w *worker) completeEmptySingle() error {
+	if err := w.file.Truncate(0); err != nil {
+		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
+	}
+	w.announceSingle(0)
+	w.r.rep.ChunkDone(0)
+	return nil
+}
+
+// singleSink stages sequential body bytes at the running offset with
+// progress reporting; the download is done once the declared length is
+// reached (a zero-length body completes without delivering bytes).
+func (w *worker) singleSink(written *int64, expected int64) func([]byte, time.Duration) (bool, error) {
+	return func(buf []byte, d time.Duration) (bool, error) {
+		if len(buf) == 0 {
+			w.r.rep.ChunkProgress(0, 0, d)
+			return expected >= 0 && *written >= expected, nil
+		}
+		if _, err := w.file.WriteAt(buf, *written); err != nil {
+			return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}
+		}
+		*written += int64(len(buf))
+		w.r.rep.ChunkProgress(0, len(buf), d)
+		if len(buf) == len(w.buf) {
+			w.decayTimeout()
+		}
+		return expected >= 0 && *written >= expected, nil
+	}
+}
+
 func (w *worker) singleAttempt(ctx context.Context) error {
-	if err := w.ensureClient(ctx); err != nil {
-		return err
+	resp, addr, ecancel := w.takeInitial()
+	initial := resp != nil
+	defer ecancel(nil)
+	if !initial {
+		w.ensureClient()
 	}
 
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	if initial {
+		// Forward every local cancellation cause into the election request
+		// so a blocked body read genuinely unblocks (see initialRangeAttempt).
+		stop := context.AfterFunc(actx, func() {
+			ecancel(context.Cause(actx))
+			_ = resp.Body.Close()
+		})
+		defer stop()
+		if addr != "" {
+			w.r.rep.Connected(0, addr)
+		}
+	}
 	timer := time.AfterFunc(w.timeout, func() { cancel(errStall) })
 	defer timer.Stop()
 
-	req, err := http.NewRequestWithContext(actx, http.MethodGet, w.r.url, nil)
-	if err != nil {
-		return &permanentError{err}
+	if !initial {
+		req, err := http.NewRequestWithContext(actx, http.MethodGet, w.r.url, nil)
+		if err != nil {
+			return &permanentError{err}
+		}
+		w.r.applyHeaders(req)
+		resp, err = w.client.Do(req)
+		if err != nil {
+			return w.classify(err, actx)
+		}
 	}
-	w.r.applyHeaders(req)
-	resp, err := w.client.Do(req)
+	empty, err := checkSingleStatus(resp, initial, w.r.total)
 	if err != nil {
-		return w.classify(err, actx)
+		_ = resp.Body.Close()
+		return err
 	}
-	switch {
-	case resp.StatusCode == http.StatusOK:
-		defer resp.Body.Close()
-	case isRetryableStatus(resp.StatusCode):
+	if empty {
+		// A valid empty-resource 416 carries an ERROR body, not content:
+		// complete the empty download without reading or staging a byte.
 		_ = resp.Body.Close()
-		w.strikeNode()
-		w.dropNode()
-		return StatusError(resp.StatusCode)
-	default:
-		_ = resp.Body.Close()
-		return &permanentError{StatusError(resp.StatusCode)}
+		return w.completeEmptySingle()
+	}
+	defer resp.Body.Close()
+
+	if !initial {
+		// A fresh attempt may be answered by a different representation than
+		// the election saw. When the election supplied a validator, a changed
+		// or missing validator on the retry is a content change — fail before
+		// touching previously staged bytes. Either way the fresh response
+		// establishes its own full length: stopping it at the election total
+		// installs a truncated prefix, and a configured checksum must cover
+		// the COMPLETE representation actually downloaded, not a prefix that
+		// happens to hash like the old object.
+		if v := w.r.validator(); v != "" && headerValidator(resp.Header) != v {
+			return &permanentError{errContentChanged}
+		}
+		w.r.total = -1
 	}
 
 	// Truncate only after a successful response: a failed attempt must not
@@ -689,31 +719,9 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	if expected < 0 && resp.ContentLength >= 0 {
 		expected = resp.ContentLength
 	}
-	if !w.announced {
-		w.announced = true
-		w.r.rep.ChunkStart(0, 0, expected, 0)
-	} else if rs, ok := w.r.rep.(ChunkRestarter); ok {
-		// A retry discarded the previous attempt's bytes (Truncate above).
-		rs.ChunkRestart(0)
-	}
+	w.announceSingle(expected)
 	var written int64
-	sink := func(buf []byte, d time.Duration) (bool, error) {
-		if len(buf) == 0 {
-			w.r.rep.ChunkProgress(0, 0, d)
-			// A zero-length body (empty file) is complete without ever
-			// delivering bytes.
-			return expected >= 0 && written >= expected, nil
-		}
-		if _, err := w.file.WriteAt(buf, written); err != nil {
-			return false, &permanentError{fmt.Errorf("write %s: %w", w.file.Name(), err)}
-		}
-		written += int64(len(buf))
-		w.r.rep.ChunkProgress(0, len(buf), d)
-		if len(buf) == len(w.buf) {
-			w.decayTimeout()
-		}
-		return expected >= 0 && written >= expected, nil
-	}
+	sink := w.singleSink(&written, expected)
 	if expected < 0 {
 		// A plain Read preserves the distinction between a clean EOF and an
 		// unexpected EOF from a truncated chunked response. io.ReadFull, used

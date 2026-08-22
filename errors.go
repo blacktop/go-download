@@ -26,7 +26,7 @@ var (
 	errURLDetailsRedacted = errors.New("request failed (url details redacted)")
 )
 
-// ContentTypeError is returned when the probe response's media type matches
+// ContentTypeError is returned when the initial response's media type matches
 // Options.RejectContentTypes. Nothing was written to disk.
 type ContentTypeError struct {
 	ContentType string // the offending Content-Type header value

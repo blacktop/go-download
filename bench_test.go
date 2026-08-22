@@ -251,13 +251,35 @@ func BenchmarkSharedCapMultipart(b *testing.B) {
 }
 
 // BenchmarkSmallFileDefault guards the chosen small-file policy: at default
-// options an object under 2x MinPartSize cannot split, so the multipart
-// engine runs one flow with no extra dials and measured within noise of the
-// sequential path while retaining resume (corrected size-crossover
-// experiment, 2026-08-21). A wall-time or allocation regression here means
-// the small-file lifecycle grew real overhead.
+// options an object below Parts*MinPartSize stays on its useful initial
+// response with no probe, follow-up request, or extra dial while retaining
+// resume. A wall-time or allocation regression here means the small-file
+// lifecycle grew real overhead.
 func BenchmarkSmallFileDefault(b *testing.B) {
-	data := testData(4 << 20)
+	benchmarkDefaultDownload(b, 4<<20)
+}
+
+// BenchmarkSmallFileDurableStdlib is the semantics-matched baseline for
+// BenchmarkSmallFileDefault: it uses the same useful range response, stages
+// to a temporary file, syncs it, and installs it with a rename.
+func BenchmarkSmallFileDurableStdlib(b *testing.B) {
+	benchmarkDurableStdlib(b, 4<<20)
+}
+
+// BenchmarkLargeFileDefault covers the first default-policy size eligible for
+// adaptive expansion (8 parts * 16 MiB). It protects the large-file path
+// without forcing aggressive multipart settings into a small fixture.
+func BenchmarkLargeFileDefault(b *testing.B) {
+	benchmarkDefaultDownload(b, 128<<20)
+}
+
+func BenchmarkLargeFileDurableStdlib(b *testing.B) {
+	benchmarkDurableStdlib(b, 128<<20)
+}
+
+func benchmarkDefaultDownload(b *testing.B, size int) {
+	b.Helper()
+	data := testData(size)
 	var st stats
 	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
 	b.Cleanup(srv.Close)
@@ -272,6 +294,49 @@ func BenchmarkSmallFileDefault(b *testing.B) {
 	for b.Loop() {
 		dest := filepath.Join(dir, "bench.bin")
 		if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Remove(dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkDurableStdlib(b *testing.B, size int) {
+	b.Helper()
+	data := testData(size)
+	var st stats
+	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	b.Cleanup(srv.Close)
+
+	dir := b.TempDir()
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		dest := filepath.Join(dir, "bench.bin")
+		part := dest + ".part"
+		req, err := http.NewRequestWithContext(b.Context(), http.MethodGet, srv.URL+"/file.bin", nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		req.Header.Set("Range", "bytes=0-")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		file, err := os.Create(part)
+		if err != nil {
+			resp.Body.Close()
+			b.Fatal(err)
+		}
+		_, copyErr := io.Copy(file, resp.Body)
+		closeBodyErr := resp.Body.Close()
+		syncErr := file.Sync()
+		closeFileErr := file.Close()
+		if copyErr != nil || closeBodyErr != nil || syncErr != nil || closeFileErr != nil {
+			b.Fatalf("durable copy: copy=%v body=%v sync=%v close=%v", copyErr, closeBodyErr, syncErr, closeFileErr)
+		}
+		if err := os.Rename(part, dest); err != nil {
 			b.Fatal(err)
 		}
 		if err := os.Remove(dest); err != nil {

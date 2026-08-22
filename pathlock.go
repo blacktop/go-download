@@ -21,12 +21,13 @@ type pathLockEntry struct {
 
 var destinationLocks pathLockRegistry
 
-// acquireDestination waits for exclusive ownership of dest while respecting
-// ctx. The returned function must be called exactly once.
-func acquireDestination(ctx context.Context, dest string) (func(), error) {
+// refDestination resolves dest to its canonical lock key and returns the
+// referenced entry. Every successful call must be balanced by exactly one
+// releaseDestinationRef.
+func refDestination(dest string) (string, *pathLockEntry, error) {
 	key, err := filepath.Abs(dest)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	// Resolve directory symlinks (e.g. /tmp vs /private/tmp) so path
 	// aliases of one destination share a lock. Best-effort: the download
@@ -36,6 +37,7 @@ func acquireDestination(ctx context.Context, dest string) (func(), error) {
 	}
 
 	destinationLocks.mu.Lock()
+	defer destinationLocks.mu.Unlock()
 	if destinationLocks.locks == nil {
 		destinationLocks.locks = make(map[string]*pathLockEntry)
 	}
@@ -46,8 +48,26 @@ func acquireDestination(ctx context.Context, dest string) (func(), error) {
 		destinationLocks.locks[key] = entry
 	}
 	entry.refs++
-	destinationLocks.mu.Unlock()
+	return key, entry, nil
+}
 
+func unlockFunc(key string, entry *pathLockEntry) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.token <- struct{}{}
+			releaseDestinationRef(key, entry)
+		})
+	}
+}
+
+// acquireDestination waits for exclusive ownership of dest while respecting
+// ctx. The returned function must be called exactly once.
+func acquireDestination(ctx context.Context, dest string) (func(), error) {
+	key, entry, err := refDestination(dest)
+	if err != nil {
+		return nil, err
+	}
 	select {
 	case <-ctx.Done():
 		releaseDestinationRef(key, entry)
@@ -59,14 +79,33 @@ func acquireDestination(ctx context.Context, dest string) (func(), error) {
 			return nil, err
 		}
 	}
+	return unlockFunc(key, entry), nil
+}
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
+// tryAcquireDestination takes the destination lock only if it is free right
+// now. On success it returns the unlock function (call exactly once) and
+// contended=false. When another holder owns the lock it returns
+// contended=true and a nil unlock. Cancellation and key-resolution failures
+// surface as err — distinct from contention — with the token and reference
+// rolled back exactly as acquireDestination does, so a caller whose context
+// died during election can never proceed to touch staging.
+func tryAcquireDestination(ctx context.Context, dest string) (unlock func(), contended bool, err error) {
+	key, entry, err := refDestination(dest)
+	if err != nil {
+		return nil, false, err
+	}
+	select {
+	case <-entry.token:
+		if err := ctx.Err(); err != nil {
 			entry.token <- struct{}{}
 			releaseDestinationRef(key, entry)
-		})
-	}, nil
+			return nil, false, err
+		}
+		return unlockFunc(key, entry), false, nil
+	default:
+		releaseDestinationRef(key, entry)
+		return nil, true, nil
+	}
 }
 
 func releaseDestinationRef(key string, entry *pathLockEntry) {

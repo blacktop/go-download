@@ -25,10 +25,6 @@ func TestRampSurvivesSingleSlotThrottle(t *testing.T) {
 	var rejected atomic.Int32
 	slot := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-0" {
-			writeBareRange(w, r, data, `"v1"`)
-			return
-		}
 		select {
 		case slot <- struct{}{}:
 			defer func() { <-slot }()
@@ -70,8 +66,33 @@ func TestRampSurvivesSingleSlotThrottle(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("downloaded bytes differ from source")
 	}
-	if rejected.Load() == 0 {
+	if got := rejected.Load(); got == 0 {
 		t.Skip("second worker never collided with the slot; scenario not exercised")
+	} else if got != 1 {
+		t.Fatalf("server rejected %d extra requests, want one before the batch retires", got)
+	}
+}
+
+func TestRampStaysSingleWithoutRunwayForConfiguredParts(t *testing.T) {
+	t.Parallel()
+	const minPart = 16 << 10
+	data := testData(4*minPart - 1)
+	var st stats
+	srv := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &st,
+		5*time.Millisecond, 1, func(*http.Request) bool { return true }))
+	t.Cleanup(srv.Close)
+
+	d := newDL(t, &Options{Parts: 4, MinPartSize: minPart})
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	_, got := mustGet(t, d, srv.URL+"/file.bin", dest)
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes differ from source")
+	}
+	st.mu.Lock()
+	maxConc := st.maxConc
+	st.mu.Unlock()
+	if maxConc != 1 {
+		t.Fatalf("maximum request concurrency = %d, want one proven flow", maxConc)
 	}
 }
 
@@ -84,9 +105,7 @@ func TestResumeRampUsesRemainingWork(t *testing.T) {
 	data := testData(total)
 	var st stats
 	srv := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &st,
-		5*time.Millisecond, 1, func(r *http.Request) bool {
-			return r.Header.Get("Range") != "bytes=0-0"
-		}))
+		5*time.Millisecond, 1, func(*http.Request) bool { return true }))
 	t.Cleanup(srv.Close)
 
 	// Prefab a resume state: everything done except two 64 KiB chunks.
