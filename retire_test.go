@@ -395,7 +395,7 @@ func (r *demotionReporter) ChunkDone(id int) {
 func TestRampDemotesOnFlatThroughput(t *testing.T) {
 	t.Parallel()
 	// 16 MiB at a 4 MB/s shared cap (~4s): stabilized decision windows
-	// (512 KiB each) average enough limiter quanta that the flat verdict is
+	// (1 MiB each) average enough limiter quanta that the flat verdict is
 	// unambiguous, and leave ample post-demotion runway under -race.
 	data := testData(16 << 20)
 	var st stats
@@ -404,7 +404,7 @@ func TestRampDemotesOnFlatThroughput(t *testing.T) {
 		newSharedLimiter(4<<20), &flows))
 	t.Cleanup(srv.Close)
 
-	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10})
+	d := newDL(t, &Options{Parts: 4, MinPartSize: 1 << 20})
 	dest := filepath.Join(t.TempDir(), "file.bin")
 	res, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
 	if err != nil {
