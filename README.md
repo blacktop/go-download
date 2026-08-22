@@ -118,15 +118,21 @@ once and the governor never retires below it (`MinParts == Parts` is fixed
 parallelism); an explicit 429 still sheds eager flows. See the `Options`
 documentation for how small objects clamp the floor.
 
-Apple M5 Max, Go 1.27, August 21, 2026:
+Apple M5 Max, Go 1.27, August 21, 2026 (6 runs each, benchstat medians):
 
 | Workload | Baseline | `go-download` | Result |
 |---|---:|---:|---:|
-| 4 MiB loopback | 6.51 ms | 6.27 ms | within noise |
-| 128 MiB loopback | 2.64 GiB/s | 3.14 GiB/s | **1.19×** |
-| 64 MiB per-flow cap | 26.15 MB/s | 79.95 MB/s | **3.06×** |
-| Shared 32 MB/s cap | 34.34 MB/s | 33.40 MB/s | **0.973×** |
+| 4 MiB loopback | 7.06 ms | 7.28 ms | within noise |
+| 128 MiB loopback | 2.05 GiB/s | 2.73 GiB/s | **1.33×** (±15% run noise) |
+| 64 MiB per-flow cap, `Parts: 4` | 28.6 MB/s | 87.2 MB/s | **3.05×** |
+| 64 MiB per-flow cap, `Parts: 8`, `MinParts: 8` | 120.9 MB/s (default ramp) | 216.7 MB/s | **1.79×** |
+| Shared 32 MB/s cap | 34.4 MB/s | 33.5 MB/s | **0.973×** |
 | 100 MiB WAN | curl HTTP/1.1 | paired median | **0.973×** |
+
+The `MinParts` row compares the same engine with and without the floor: on a
+per-flow-limited link the default ramp spends the first part of a mid-size
+transfer proving each connection pays. The WAN row predates `MinParts` and
+was not re-run (it needs `DL_BENCH_URL` and a live network).
 
 The loopback comparisons cover the same durable lifecycle: ranged request,
 temporary file, `Sync`, and atomic rename. The shaped-link rows use a raw stdlib
