@@ -44,6 +44,16 @@ type Options struct {
 	// starts only when the remaining work contains at least one MinPartSize per
 	// configured part. Default 8. 1 disables parallelism (but keeps resume).
 	Parts int
+	// MinParts is the concurrency floor: that many connections open at start
+	// and the adaptive governor never retires below it. 0 (the default) means
+	// 1, which keeps the measured ramp; MinParts == Parts is fixed parallelism
+	// for hosts known to be per-flow limited. Must not exceed Parts.
+	//
+	// The floor is clamped to the ranges the work can supply: the scheduler
+	// halves the largest remainder and never splits below 2*MinPartSize, so
+	// a 3*MinPartSize object yields two ranges, not three. An explicit 429
+	// overrides the floor — an overloaded server sheds eager flows.
+	MinParts int
 	// MinPartSize stops dynamic splitting: a remaining range is never
 	// split below 2x this size. Default 16 MiB.
 	MinPartSize int64
@@ -152,6 +162,13 @@ func New(opt *Options) (*Downloader, error) {
 	}
 	if o.Parts < 1 {
 		return nil, fmt.Errorf("invalid Parts %d: must be >= 1", o.Parts)
+	}
+	if o.MinParts == 0 {
+		o.MinParts = 1
+	}
+	if o.MinParts < 1 || o.MinParts > o.Parts {
+		return nil, fmt.Errorf("invalid MinParts %d: must satisfy 1 <= MinParts <= Parts (%d)",
+			o.MinParts, o.Parts)
 	}
 	if o.MinPartSize == 0 {
 		o.MinPartSize = defaultMinPartSize
@@ -841,19 +858,23 @@ type run struct {
 	// proxy for what a fresh connection on this path costs (DNS, dial, TLS,
 	// TTFB). It scales the ramp's settling floor.
 	electDur time.Duration
-	// initial is the successful election response. Fresh worker 0 consumes it
-	// directly, eliminating the old probe-plus-worker request pair. A resumed
-	// multipart run closes it before issuing requests for its missing ranges.
-	// initialCancel aborts the initial request itself — the only reliable way
-	// to unblock a stalled body read on an arbitrary transport; it travels
-	// with the response and is invoked exactly once by whoever disposes of it.
+	// initial is the successful election response. The worker granted the
+	// byte-zero chunk consumes it directly, eliminating the old
+	// probe-plus-worker request pair. A resumed multipart run closes it
+	// before issuing requests for its missing ranges. initialCancel aborts
+	// the initial request itself — the only reliable way to unblock a stalled
+	// body read on an arbitrary transport; it travels with the response and
+	// is invoked exactly once by whoever disposes of it. initialMu makes the
+	// hand-off atomic across eagerly started workers.
+	initialMu     sync.Mutex
 	initial       *http.Response
 	initialAddr   string
 	initialCancel context.CancelCauseFunc
 	// progress counts body bytes read this run (drives the concurrency ramp).
 	progress atomic.Int64
-	// ramp is the adaptive-concurrency governor; nil when Parts is 1 or on
-	// the single-stream path.
+	// ramp is the adaptive-concurrency governor; nil on the single-stream
+	// path. Its throughput ramp may be finished from the start, but its
+	// throttle control stays live for the run.
 	ramp *rampState
 }
 
@@ -875,17 +896,22 @@ func (r *run) checksumConfigured() bool {
 	return r.sha256 != "" || r.sha1 != ""
 }
 
+// takeInitial hands the pending initial response (with its request cancel,
+// never nil) to exactly one caller; later callers get a nil response.
 func (r *run) takeInitial() (*http.Response, string, context.CancelCauseFunc) {
+	r.initialMu.Lock()
+	defer r.initialMu.Unlock()
 	resp, addr, cancel := r.initial, r.initialAddr, r.initialCancel
 	r.initial, r.initialAddr, r.initialCancel = nil, "", nil
+	if cancel == nil {
+		cancel = func(error) {}
+	}
 	return resp, addr, cancel
 }
 
 func (r *run) closeInitial() {
 	resp, _, cancel := r.takeInitial()
-	if cancel != nil {
-		cancel(nil)
-	}
+	cancel(nil)
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -1044,10 +1070,13 @@ type rampState struct {
 	mu   sync.Mutex
 	// spawn and demote are side effects executed by note AFTER rs.mu is
 	// released; rs.mu never nests with the scheduler or controller locks.
-	spawn    func(int)
-	demote   func(keep int)
-	now      func() time.Time // injected in tests
-	parts    int
+	spawn  func(int)
+	demote func(keep int)
+	now    func() time.Time // injected in tests
+	parts  int
+	// floor is the flow count the run started with (Options.MinParts,
+	// clamped); the governor probes upward from it and never retires below it.
+	floor    int
 	window   int64
 	warmed   bool // burn-in window consumed
 	settling bool // one no-decision window after each admission
@@ -1122,24 +1151,33 @@ func (rs *rampState) rejectUnreadyLocked() (spawnFrom, spawnN, demoteTo int) {
 	return 0, 0, rs.prevAdmitted
 }
 
-// rejectThrottledBatch stops expansion when the server rejects a ranged
-// request with 429. If a batch is under judgment, roll it back to the previous
-// proven flow count; keeping rejected workers would turn the server's explicit
-// overload signal into retry traffic and preserve the harmful concurrency.
-func (rs *rampState) rejectThrottledBatch() {
+// rejectThrottled handles an explicit 429 on a ranged request from worker
+// id. MinParts is a performance preference; a server overload response wins:
+//
+//	above the floor (batch under judgment or frozen) → roll back to prevAdmitted
+//	at the floor (including MinParts == Parts)       → demote to one flow
+//	already at one flow                              → nothing to shed
+//
+// Expansion always stops. A 429 from a worker id at or past the current
+// admitted count is stale — that worker was already selected for retirement
+// by an earlier rollback — and must not compound the demotion; survivors
+// hold the lowest ids. After a rollback the next 429 steps to the floor, so a
+// persistently hostile host walks admitted → floor → 1 in explicit steps.
+func (rs *rampState) rejectThrottled(id int) {
 	rs.mu.Lock()
-	if rs.done.Load() {
+	rs.done.Store(true)
+	if id >= rs.admitted || rs.admitted <= 1 {
 		rs.mu.Unlock()
 		return
 	}
-	keep := max(rs.prevAdmitted, 1)
-	demote := rs.admitted > keep
-	rs.done.Store(true)
-	rs.mu.Unlock()
-
-	if demote {
-		rs.demote(keep)
+	keep := 1
+	if rs.admitted > rs.floor {
+		keep = max(rs.prevAdmitted, rs.floor)
 	}
+	rs.admitted = keep
+	rs.prevAdmitted = rs.floor
+	rs.mu.Unlock()
+	rs.demote(keep)
 }
 
 // noteLocked advances the ramp state machine by at most one window and
@@ -1173,7 +1211,7 @@ func (rs *rampState) noteLocked(total int64, now time.Time) (spawnFrom, spawnN, 
 				}
 			}
 		}
-	case rs.admitted == 1 && rs.admitted < rs.parts:
+	case rs.admitted == rs.floor && rs.admittedAt.IsZero():
 		// Record the pre-admission steady window and probe the first batch.
 		return rs.admitLocked(rampSample{bytes: bytes, elapsed: elapsed}, now)
 	default:
@@ -1291,25 +1329,33 @@ func (r *run) runWorkers(
 		}
 	}
 	remaining := sched.remainingBytes()
-	if rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts) {
-		// Window: big enough to measure meaningfully while leaving room to
-		// evaluate several doubling steps. At the remaining/16 branch, the
-		// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
-		// the fixed 2*MinPartSize cap makes it earlier on larger objects.
-		// Size from REMAINING work so a near-complete resume still ramps.
-		window := max(min(2*r.d.opt.MinPartSize, remaining/16), 1)
-		r.ramp = &rampState{
-			spawn:     spawn,
-			demote:    retire,
-			now:       time.Now,
-			parts:     r.d.opt.Parts,
-			window:    window,
-			settleMin: settleFloorFor(r.electDur),
-			admitted:  1,
-			markTime:  time.Now(),
-		}
+	start := sched.prepare(r.d.opt.MinParts)
+	// Window: big enough to measure meaningfully while leaving room to
+	// evaluate several doubling steps. At the remaining/16 branch, the
+	// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
+	// the fixed 2*MinPartSize cap makes it earlier on larger objects.
+	// Size from REMAINING work so a near-complete resume still ramps.
+	window := max(min(2*r.d.opt.MinPartSize, remaining/16), 1)
+	r.ramp = &rampState{
+		spawn:     spawn,
+		demote:    retire,
+		now:       time.Now,
+		parts:     r.d.opt.Parts,
+		floor:     start,
+		window:    window,
+		settleMin: settleFloorFor(r.electDur),
+		admitted:  start,
+		markTime:  time.Now(),
 	}
-	spawn(0)
+	if start >= r.d.opt.Parts || !rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts) {
+		// No throughput ramp: the floor already fills Parts, or the remaining
+		// work cannot feed every configured connection. The governor still
+		// exists so an explicit 429 can shed eager flows.
+		r.ramp.done.Store(true)
+	}
+	for id := range start {
+		spawn(id)
+	}
 
 	flushDone := make(chan struct{})
 	go func() {

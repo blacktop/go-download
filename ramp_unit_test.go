@@ -20,6 +20,7 @@ func newRampHarness(parts int, window int64) *rampHarness {
 			parts:     parts,
 			window:    window,
 			settleMin: rampSettleCap,
+			floor:     1,
 			admitted:  1,
 			markTime:  start,
 		},

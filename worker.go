@@ -43,23 +43,16 @@ func (e *permanentError) Unwrap() error { return e.err }
 // worker owns one connection slot: it pulls chunks from the scheduler and
 // downloads each with retry and stall detection.
 type worker struct {
-	id     int
-	r      *run
-	sched  *scheduler
-	file   *os.File
-	client *http.Client
-	// initial is the election response worker 0 can consume without issuing a
-	// second request. initialAddr preserves the normal Connected callback;
-	// initialCancel aborts the election request itself (the only reliable
-	// way to unblock a stalled body read on an arbitrary transport).
-	initial       *http.Response
-	initialAddr   string
-	initialCancel context.CancelCauseFunc
-	timeout       time.Duration
-	dtt           int // full buffers until the next timeout decay step
-	bo            backoff
-	buf           []byte
-	bufp          *[]byte // pool token for releaseBuf
+	id      int
+	r       *run
+	sched   *scheduler
+	file    *os.File
+	client  *http.Client
+	timeout time.Duration
+	dtt     int // full buffers until the next timeout decay step
+	bo      backoff
+	buf     []byte
+	bufp    *[]byte // pool token for releaseBuf
 	// announced tracks whether the single-stream path has emitted its
 	// ChunkStart (retries emit ChunkRestart instead).
 	announced bool
@@ -87,31 +80,7 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File) *worker {
 	if r.d.sleepHook != nil {
 		w.sleep = r.d.sleepHook
 	}
-	if id == 0 {
-		w.initial, w.initialAddr, w.initialCancel = r.takeInitial()
-	}
 	return w
-}
-
-func (w *worker) closeInitial() {
-	if w.initialCancel != nil {
-		w.initialCancel(nil)
-	}
-	if w.initial != nil {
-		_ = w.initial.Body.Close()
-	}
-	w.initial, w.initialAddr, w.initialCancel = nil, "", nil
-}
-
-// takeInitial hands the pending initial response (with its request cancel)
-// to the attempt that will consume it, clearing the worker's reference.
-func (w *worker) takeInitial() (*http.Response, string, context.CancelCauseFunc) {
-	resp, addr, cancel := w.initial, w.initialAddr, w.initialCancel
-	w.initial, w.initialAddr, w.initialCancel = nil, "", nil
-	if cancel == nil {
-		cancel = func(error) {}
-	}
-	return resp, addr, cancel
 }
 
 // releaseBuf returns the worker's read buffer to the Downloader pool.
@@ -128,7 +97,6 @@ func (w *worker) releaseBuf() {
 // run pulls chunks until the scheduler has nothing left for this worker.
 func (w *worker) run(ctx context.Context) error {
 	defer w.releaseBuf()
-	defer w.closeInitial()
 	defer w.sched.exit(w.id)
 	for {
 		if ctx.Err() != nil {
@@ -254,8 +222,12 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if !todo {
 		return nil
 	}
-	if w.initial != nil {
-		return w.initialRangeAttempt(ctx, c, cursor, end)
+	if cursor == 0 {
+		// The election body starts at byte zero: whichever worker is granted
+		// that chunk consumes it instead of issuing a duplicate request.
+		if resp, addr, ecancel := w.r.takeInitial(); resp != nil {
+			return w.initialRangeAttempt(ctx, c, end, resp, addr, ecancel)
+		}
 	}
 	w.ensureClient()
 
@@ -285,7 +257,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
-		return w.readPartialResponse(resp, actx, timer, c, cursor, end)
+		return w.readPartialResponse(resp, actx, timer, c, cursor, end, end)
 	case resp.StatusCode == http.StatusOK:
 		_ = resp.Body.Close()
 		if w.r.validator() != "" {
@@ -294,12 +266,11 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		}
 		return errRangeIgnored
 	case resp.StatusCode == http.StatusTooManyRequests:
-		// Reject the batch under judgment: the server just told us its added
-		// flow count is too high, so retaining it would only create retry
-		// traffic.
+		// The server just told us the flow count is too high; retaining it
+		// would only create retry traffic. Shed flows, eager ones included.
 		_ = resp.Body.Close()
 		if w.r.ramp != nil {
-			w.r.ramp.rejectThrottledBatch()
+			w.r.ramp.rejectThrottled(w.id)
 		}
 		return StatusError(resp.StatusCode)
 	case isRetryableStatus(resp.StatusCode):
@@ -312,9 +283,9 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 }
 
 func (w *worker) initialRangeAttempt(
-	ctx context.Context, c *chunk, cursor, end int64,
+	ctx context.Context, c *chunk, end int64,
+	resp *http.Response, addr string, ecancel context.CancelCauseFunc,
 ) error {
-	resp, addr, ecancel := w.takeInitial()
 	defer ecancel(nil)
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -339,7 +310,12 @@ func (w *worker) initialRangeAttempt(
 		_ = resp.Body.Close()
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
-	return w.readPartialResponse(resp, actx, timer, c, cursor, end)
+	// The election asked for bytes=0-, so its Content-Range spans the whole
+	// representation regardless of how much of this chunk's tail was
+	// pre-split for eager siblings; validate against what was requested but
+	// read only up to the chunk's prepared end. The unread remainder is not
+	// drained: that would spend bandwidth on bytes siblings already own.
+	return w.readPartialResponse(resp, actx, timer, c, 0, w.r.total, end)
 }
 
 func (w *worker) readPartialResponse(
@@ -347,21 +323,23 @@ func (w *worker) readPartialResponse(
 	actx context.Context,
 	timer *time.Timer,
 	c *chunk,
-	cursor, end int64,
+	cursor, requested, end int64,
 ) error {
 	contentRange := resp.Header.Get("Content-Range")
 	s, e, total, crErr := parseContentRange(contentRange)
 	// The range must start at the cursor and describe our representation
 	// (total "*" is RFC-valid unknown). A server-revised shorter range is
-	// accepted, but it may not extend beyond the requested range.
-	if crErr != nil || s != cursor || e < s || e >= end ||
+	// accepted, but it may not extend beyond the requested range. Reads are
+	// bounded by end, which is the chunk's extent at attempt time (equal to
+	// requested except for the reused election response).
+	if crErr != nil || s != cursor || e < s || e >= requested ||
 		(total != -1 && total != w.r.total) {
 		_ = resp.Body.Close()
 		return &permanentError{fmt.Errorf(
 			"wrong Content-Range %q for requested bytes %d-%d/%d",
-			contentRange, cursor, end-1, w.r.total)}
+			contentRange, cursor, requested-1, w.r.total)}
 	}
-	responseEnd := e + 1 // convert inclusive HTTP end to scheduler-exclusive end
+	responseEnd := min(e+1, end) // inclusive HTTP end to scheduler-exclusive end
 	capped := responseEnd < end
 	defer resp.Body.Close()
 	body := &observedReader{r: io.LimitReader(resp.Body, responseEnd-s), w: w}
@@ -543,7 +521,6 @@ func (w *worker) ensureClient() {
 // unknown size). A retry restarts from byte zero.
 func (w *worker) singleStream(ctx context.Context) error {
 	defer w.releaseBuf()
-	defer w.closeInitial()
 	for attempt := 0; ; attempt++ {
 		err := w.singleAttempt(ctx)
 		if err == nil {
@@ -646,7 +623,7 @@ func (w *worker) singleSink(written *int64, expected int64) func([]byte, time.Du
 }
 
 func (w *worker) singleAttempt(ctx context.Context) error {
-	resp, addr, ecancel := w.takeInitial()
+	resp, addr, ecancel := w.r.takeInitial()
 	initial := resp != nil
 	defer ecancel(nil)
 	if !initial {

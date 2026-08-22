@@ -83,7 +83,8 @@ Configure the downloader with `download.Options`:
 
 ```go
 dl, err := download.New(&download.Options{
-    Parts:          8,                // parallel connections
+    Parts:          8,                // parallel connections (cap)
+    MinParts:       1,                // opened eagerly; never retired below
     MinPartSize:    16 << 20,         // never split ranges below 2x this
     ExpectedSHA256: "6ca0e5...",      // verify before the final install
     Reporter:       myProgressUI,     // receive progress events
@@ -110,6 +111,12 @@ Run the same command after an interruption to resume the download.
 Small files stay on the initial connection. Larger files add connections only
 while aggregate throughput improves; shared-cap links settle back to one.
 With the defaults (`Parts: 8`, `MinPartSize: 16 MiB`), ramping begins at 128 MiB.
+
+On hosts known to be per-flow limited, the ramp's single-flow warm-up costs
+real time on mid-size objects. `MinParts` opens that many connections at
+once and the governor never retires below it (`MinParts == Parts` is fixed
+parallelism); an explicit 429 still sheds eager flows. See the `Options`
+documentation for how small objects clamp the floor.
 
 Apple M5 Max, Go 1.27, August 21, 2026:
 

@@ -23,8 +23,9 @@ type chunk struct {
 }
 
 // scheduler hands byte ranges to workers. Fresh downloads start with a single
-// chunk covering the whole file; idle workers obtain work by splitting the
-// largest in-flight remainder. Resumed downloads seed pending with the
+// chunk covering the whole file, pre-split by prepare for eagerly started
+// workers; idle workers obtain work by splitting the largest in-flight
+// remainder. Resumed downloads seed pending with the
 // incomplete chunks from the sidecar. The ramp can retire excess workers via
 // demote: their unclaimed remainders move to pending and the flow limit
 // refuses them on their next visit.
@@ -74,6 +75,41 @@ func (s *scheduler) addPending(off, end, done int64) {
 	s.pending = append(s.pending, c)
 }
 
+// prepare splits pending so up to n workers can each be granted a range
+// immediately, and returns how many grants that yields (at least 1). It uses
+// the same halving rule as next — largest remainder first, never below
+// 2*minSize — so every eager worker spawned for the returned count finds
+// work. Pending ranges are unannounced, so splitting them emits no Reporter
+// events.
+func (s *scheduler) prepare(n int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.pending) < n {
+		var victim *chunk
+		for _, c := range s.pending {
+			if victim == nil || c.end-(c.off+c.done) > victim.end-(victim.off+victim.done) {
+				victim = c
+			}
+		}
+		if victim == nil || victim.end-(victim.off+victim.done) < 2*s.minSize {
+			break
+		}
+		s.pending = append(s.pending, s.splitLocked(victim))
+	}
+	return max(min(len(s.pending), n), 1)
+}
+
+// splitLocked halves c's unclaimed remainder (which must be at least
+// 2*minSize) and returns the new upper chunk; c keeps the lower half.
+func (s *scheduler) splitLocked(c *chunk) *chunk {
+	cursor := c.off + c.done
+	mid := cursor + (c.end-cursor)/2
+	upper := &chunk{id: s.nextID, off: mid, end: c.end}
+	s.nextID++
+	c.end = mid
+	return upper
+}
+
 // next returns the next chunk for worker workerID, or nil when the worker
 // must exit. Registration, retirement checks, limit refusal, granting, and
 // drain deregistration all happen in one critical section, so "live" always
@@ -107,10 +143,8 @@ func (s *scheduler) next(workerID int) *chunk {
 	}
 	if victim != nil {
 		if remaining := victim.end - (victim.off + victim.done); remaining >= 2*s.minSize {
-			mid := victim.off + victim.done + remaining/2
-			c := &chunk{id: s.nextID, owner: workerID, off: mid, end: victim.end}
-			s.nextID++
-			victim.end = mid
+			c := s.splitLocked(victim)
+			c.owner = workerID
 			s.active[c.id] = c
 			if s.onResize != nil {
 				s.onResize(victim.id, victim.end-victim.off)

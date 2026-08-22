@@ -1,6 +1,7 @@
 package download
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -171,7 +172,7 @@ func BenchmarkRealStdlib(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.SetBytes(size)
+	b.SetBytes(int64(size))
 }
 
 func BenchmarkRealMultipart(b *testing.B) {
@@ -194,7 +195,7 @@ func BenchmarkRealMultipart(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.SetBytes(size)
+	b.SetBytes(int64(size))
 }
 
 // The shared-cap pair models the saturated access link: one limiter caps the
@@ -341,6 +342,42 @@ func benchmarkDurableStdlib(b *testing.B, size int) {
 		}
 		if err := os.Remove(dest); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkConstrainedMinParts sweeps the concurrency floor over object
+// sizes on the per-flow-capped link: MinParts 1 is the default measured ramp,
+// 8 is fixed parallelism, 4 probes one batch from a warm floor. The ramp's
+// warm-up is a fixed cost, so its share shrinks with object size.
+func BenchmarkConstrainedMinParts(b *testing.B) {
+	for _, size := range []int{64 << 20, 128 << 20, 512 << 20} {
+		data := testData(size)
+		for _, minParts := range []int{1, 4, 8} {
+			name := fmt.Sprintf("size=%dMiB/minParts=%d", size>>20, minParts)
+			b.Run(name, func(b *testing.B) {
+				var st stats
+				srv := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &st,
+					constrainedDelay, 64, func(*http.Request) bool { return true }))
+				b.Cleanup(srv.Close)
+				dir := b.TempDir()
+				d, err := New(&Options{Parts: 8, MinParts: minParts, MinPartSize: 1 << 20,
+					Logger: slog.New(slog.DiscardHandler)})
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				for b.Loop() {
+					dest := filepath.Join(dir, "bench.bin")
+					if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
+						b.Fatal(err)
+					}
+					if err := os.Remove(dest); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 		}
 	}
 }
