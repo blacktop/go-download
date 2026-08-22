@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 )
 
@@ -176,24 +177,64 @@ type sharedLimiter struct {
 	mu      sync.Mutex
 	next    time.Time
 	perByte time.Duration
+	active  int
 }
 
 func newSharedLimiter(bytesPerSec int64) *sharedLimiter {
 	return &sharedLimiter{perByte: time.Duration(int64(time.Second) / bytesPerSec)}
 }
 
-// acquire blocks until n bytes may be sent without exceeding the shared rate.
+// enter starts a transfer epoch. Idle time between downloads must not become
+// credit that the next download can spend as an unpaced burst.
+func (l *sharedLimiter) enter() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.active == 0 {
+		l.next = time.Now()
+	}
+	l.active++
+}
+
+func (l *sharedLimiter) exit() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.active--
+}
+
+// acquire reserves n bytes on the shared schedule and waits for their slot.
+// A late wake keeps its original reservation so extra waiters cannot turn
+// scheduler delay into an apparent throughput gain.
 func (l *sharedLimiter) acquire(n int) {
 	l.mu.Lock()
 	now := time.Now()
-	if l.next.Before(now) {
+	if l.next.IsZero() {
 		l.next = now
 	}
-	wait := l.next.Sub(now)
+	wait := max(l.next.Sub(now), 0)
 	l.next = l.next.Add(time.Duration(n) * l.perByte)
 	l.mu.Unlock()
 	if wait > 0 {
 		time.Sleep(wait)
+	}
+}
+
+func TestSharedLimiterSchedule(t *testing.T) {
+	lim := newSharedLimiter(1 << 20)
+	lim.enter()
+	late := time.Now().Add(-time.Second)
+	lim.next = late
+	lim.acquire(1)
+	if want := late.Add(lim.perByte); lim.next != want {
+		t.Fatalf("late acquire moved schedule to %v, want %v", lim.next, want)
+	}
+	lim.exit()
+
+	before := time.Now()
+	lim.enter()
+	after := time.Now()
+	defer lim.exit()
+	if lim.next.Before(before) || lim.next.After(after) {
+		t.Fatalf("new transfer schedule = %v, want within [%v, %v]", lim.next, before, after)
 	}
 }
 
@@ -250,6 +291,8 @@ func sharedCapHandler(data []byte, etag string, st *stats, lim *sharedLimiter, f
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st.enter(r)
 		defer st.exit()
+		lim.enter()
+		defer lim.exit()
 		body := data
 		if start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data))); ok {
 			if etag != "" {
