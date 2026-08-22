@@ -131,7 +131,10 @@ func throttledRangeHandler(data []byte, etag string, st *stats,
 				f.Flush()
 			}
 			body = body[n:]
-			if isSlow {
+			// The final bytes have already left the handler. Do not keep this
+			// request counted as an active flow during a trailing pacing sleep:
+			// the client can legitimately start its next request immediately.
+			if isSlow && len(body) > 0 {
 				select {
 				case <-r.Context().Done():
 					return
