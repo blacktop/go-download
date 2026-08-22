@@ -8,21 +8,21 @@
 
 ## Features
 
-- Splits files into ranges and downloads them over parallel HTTP/1.1 connections. HTTP/2 is deliberately avoided because it would multiplex the ranges over one TCP connection.
-- Lets idle connections take the unfinished tail of slower chunks, similar to aria2's segment allocation.
-- Records progress in a `.part.json` sidecar. Before resuming, the downloader checks the server's ETag or Last-Modified value.
-- Times out stalled reads, with extra tolerance for flaky links. Range requests resume from the last byte written; a non-range fallback starts over.
-- Writes into a preallocated `.part` file at disjoint offsets. The destination is installed atomically only after size and optional checksum verification. A file created at the destination during the download is left alone unless overwrite is enabled.
-- Uses only the Go standard library. Progress UIs can implement `Reporter` or use the included `dl` command.
+- Parallel HTTP/1.1 range downloads that add connections only while they help.
+- Work stealing: idle connections can finish the slow tail of another range.
+- Safe resume using a `.part.json` sidecar and ETag or Last-Modified validation.
+- Stall recovery from the last byte written. Non-range servers fall back to a clean restart.
+- Atomic installation after size and optional checksum (SHA-256/SHA-1) verification. Existing destinations are preserved unless overwrite is enabled.
+- Standard library only. Progress UIs can implement `Reporter` or use the `dl` command.
 
 ## How it works
 
-The initial `Range: bytes=0-` response becomes the first download stream, so
-data starts moving immediately. Short downloads finish on that connection. If
-enough data remains, the downloader measures aggregate throughput and adds
-HTTP/1.1 connections in batches, doubling the active count at each step. A
-batch stays if it improves throughput; otherwise, its workers retire.
-Idle workers take the unfinished tail of slower chunks.
+The initial `Range: bytes=0-` response is the first download stream. Short
+downloads finish there. For larger files, the downloader measures throughput,
+adds connections in batches, and retires a batch when it stops helping. Idle
+workers can take the unfinished tail of slower ranges.
+Ranges use separate HTTP/1.1 connections; HTTP/2 would put them back on one TCP
+connection.
 
 ```mermaid
 flowchart TD
@@ -36,8 +36,8 @@ flowchart TD
     G --> C
 ```
 
-Each retry computes its `Range` from the current byte cursor. Data already
-written remains useful after a stall, transport error, or worker retirement.
+Retries start from the current byte cursor, so completed work survives stalls,
+transport errors, and worker retirement.
 
 ## Install
 
@@ -107,59 +107,34 @@ Run the same command after an interruption to resume the download.
 
 ## Performance
 
-Parallel parts help when throughput is capped per connection, such as on a
-shaped link or throttled CDN edge. If one TCP flow already fills the path,
-extra connections only add overhead.
+Small files stay on the initial connection. Larger files add connections only
+while aggregate throughput improves; shared-cap links settle back to one.
+With the defaults (`Parts: 8`, `MinPartSize: 16 MiB`), ramping begins at 128 MiB.
 
-The downloader starts with the initial `Range: bytes=0-` response and measures
-its rate after TCP slow start. It then doubles the connection count while each
-new batch improves aggregate throughput. An HTTP 429 response, or a batch that
-never delivers data, returns the downloader to the last flow count that
-worked. On a path with a shared bandwidth cap, it settles back to one stream.
+Apple M5 Max, Go 1.27, August 21, 2026:
 
-Small downloads do not ramp. The downloader explores only when the remaining
-data can supply one `MinPartSize` chunk to every configured part. With the
-defaults of 8 parts and 16 MiB per part, that boundary is 128 MiB. On a range
-server with a validator, the initial response remains the only connection
-below the boundary, so resume still works without another request.
-
-The default small- and large-file benchmarks compare complete download
-lifecycles: the stdlib baseline uses the same range request, stages into a
-temporary file, calls `Sync`, and renames the result. The shaped-network rows
-retain the raw stdlib baseline because transfer time dominates finalization.
-These are fresh measurements from an Apple M5 Max with Go 1.27 on August 21,
-2026:
-
-| Scenario | Baseline | `go-download` | Result |
+| Workload | Baseline | `go-download` | Result |
 |---|---:|---:|---:|
-| Default small file, unconstrained loopback (4 MiB) | 6.51 ms | **6.27 ms** | within noise |
-| Default large file, unconstrained loopback (128 MiB) | 2.64 GiB/s | **3.14 GiB/s** | **1.19×** |
-| Per-connection throttle (64 MiB, raw stdlib; about 26 MB/s per flow) | 26.15 MB/s | **79.95 MB/s** | **3.06×** |
-| Shared 32 MB/s cap (raw stdlib) | 34.34 MB/s | 33.40 MB/s | **0.973×** |
-| Real WAN, one-flow 100 MiB, paired with curl HTTP/1.1 | paired baseline | paired median | **0.973×** |
+| 4 MiB loopback | 6.51 ms | 6.27 ms | within noise |
+| 128 MiB loopback | 2.64 GiB/s | 3.14 GiB/s | **1.19×** |
+| 64 MiB per-flow cap | 26.15 MB/s | 79.95 MB/s | **3.06×** |
+| Shared 32 MB/s cap | 34.34 MB/s | 33.40 MB/s | **0.973×** |
+| 100 MiB WAN | curl HTTP/1.1 | paired median | **0.973×** |
 
-The constrained case is what the multipart scheduler is built for. Its 3.06×
-result is close to an independent [ipsw](https://github.com/blacktop/ipsw)
-benchmark, which measured 3.76× throughput on a constrained path. When all
-connections share one cap, the extra batch retires and the transfer returns to
-one flow.
+The loopback comparisons cover the same durable lifecycle: ranged request,
+temporary file, `Sync`, and atomic rename. The shaped-link rows use a raw stdlib
+baseline because transfer time dominates. The WAN run alternated execution
+order, kept every round, and checked the endpoint, validator, size, and protocol.
+Individual WAN ratios ranged from 0.844× to 1.109×.
 
-There is also a deliberately aggressive 8 MiB diagnostic benchmark configured
-with four parts and 1 MiB chunks. It reaches about 1.0 GiB/s, versus roughly
-3.0 GiB/s for a raw `http.Get` + `io.Copy`. That is not the default small-file
-path, and the raw baseline skips staging, `Sync`, atomic installation, and
-resume bookkeeping. It remains in the suite to make multipart overhead visible,
-not as a like-for-like product comparison.
-
-WAN results are noisier. The final exact-tree series alternated execution order
-for ten rounds, kept every round, and verified the endpoint, validator, size,
-and HTTP/1.1 protocol before and after. Individual `go-download`/curl ratios
-ranged from 0.844× to 1.109×; the paired median was 0.973×.
+An aggressive 8 MiB multipart benchmark remains in the suite to expose
+overhead. It is intentionally excluded above because its raw `http.Get` baseline
+skips staging, `Sync`, atomic installation, and resume bookkeeping.
 
 Reproduce:
 
 ```bash
-just bench                 # every loopback benchmark behind the table above
+just bench                 # every loopback benchmark behind the results above
 
 # real-network pair against a public 100 MiB test file:
 env DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin go test -bench BenchmarkReal -benchtime 3x .
