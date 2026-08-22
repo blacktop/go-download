@@ -63,7 +63,7 @@ func (h *retireHarness) start(ctx context.Context, id int) <-chan error {
 	h.mu.Lock()
 	h.cancels[id] = wcancel
 	h.mu.Unlock()
-	w := newWorker(id, h.r, h.sched, h.file, nil)
+	w := newWorker(id, h.r, h.sched, h.file)
 	done := make(chan error, 1)
 	go func() { done <- w.run(wctx) }()
 	return done
@@ -305,7 +305,7 @@ func TestCallerCancellationWinsPermanentResponseRace(t *testing.T) {
 	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := make(http.Header)
 		header.Set("ETag", `"v1"`)
-		if req.Header.Get("Range") == "bytes=0-0" {
+		if req.Header.Get("Range") == "bytes=0-" {
 			header.Set("Content-Range", "bytes 0-0/"+strconv.Itoa(total))
 			return &http.Response{
 				StatusCode:    http.StatusPartialContent,
@@ -347,17 +347,15 @@ func TestCallerCancellationWinsPermanentResponseRace(t *testing.T) {
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 
-// demotionReporter records the reporter stream plus the wall time of the
-// last resize, for the control-plane flow oracle.
+// demotionReporter records the reporter stream through a governor demotion.
 type demotionReporter struct {
 	NopReporter
-	mu         sync.Mutex
-	started    map[int]int
-	dones      map[int]int
-	lengths    map[int]int64 // last known length per id
-	resizeUp   bool
-	preStart   bool
-	lastResize time.Time
+	mu       sync.Mutex
+	started  map[int]int
+	dones    map[int]int
+	lengths  map[int]int64 // last known length per id
+	resizeUp bool
+	preStart bool
 }
 
 func newDemotionReporter() *demotionReporter {
@@ -383,7 +381,6 @@ func (r *demotionReporter) ChunkResize(id int, length int64) {
 		r.resizeUp = true
 	}
 	r.lengths[id] = length
-	r.lastResize = time.Now()
 }
 
 func (r *demotionReporter) ChunkDone(id int) {
@@ -407,17 +404,12 @@ func TestRampDemotesOnFlatThroughput(t *testing.T) {
 		newSharedLimiter(4<<20), &flows))
 	t.Cleanup(srv.Close)
 
-	rep := newDemotionReporter()
 	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10})
 	dest := filepath.Join(t.TempDir(), "file.bin")
-	start := time.Now()
-	res, err := d.Do(t.Context(), &Request{
-		URL: srv.URL + "/file.bin", Dest: dest, Reporter: rep,
-	})
+	res, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	end := time.Now()
 	got, err := os.ReadFile(res.Path)
 	if err != nil {
 		t.Fatal(err)
@@ -426,23 +418,20 @@ func TestRampDemotesOnFlatThroughput(t *testing.T) {
 		t.Fatalf("size = %d, want %d", len(got), len(data))
 	}
 
-	rep.mu.Lock()
-	lastResize := rep.lastResize
-	rep.mu.Unlock()
-	if lastResize.IsZero() {
-		t.Fatal("no resize events: the probe batch was never admitted or never retired")
+	// Server-observed flow oracle: after the probe raises concurrency above
+	// one, retirement restores exactly one flow for a sustained span.
+	// ChunkResize cannot timestamp this reliably because it also reports
+	// ordinary tail steals, including steals near EOF.
+	// The oracle is vacuous unless a second flow was actually admitted: a
+	// zero firstAtLeast(2) would make longestSpan measure the entire
+	// single-flow run and trivially clear the threshold.
+	probed := flows.firstAtLeast(2)
+	if probed.IsZero() {
+		t.Fatal("ramp never admitted a second flow: nothing was probed or retired")
 	}
-	// Control-plane oracle: after the demotion shrink plus residual grace
-	// for the retiring worker's last buffer, exactly one flow remains for
-	// a sustained mid-transfer window.
-	oa := lastResize.Add(200 * time.Millisecond)
-	ob := oa.Add(400 * time.Millisecond)
-	if ob.After(end) {
-		t.Fatalf("observation window [%v,%v] ran past completion %v; scenario too fast",
-			oa.Sub(start), ob.Sub(start), end.Sub(start))
-	}
-	if got := flows.maxConcBetween(oa, ob); got != 1 {
-		t.Fatalf("steady-state flows after demotion = %d, want 1", got)
+	single := flows.longestSpan(func(c int) bool { return c == 1 }, probed)
+	if single < 400*time.Millisecond {
+		t.Fatalf("longest one-flow span after probing = %v, want at least 400ms", single)
 	}
 }
 
@@ -590,7 +579,7 @@ func TestRetirementDoesNotMaskWriteFailure(t *testing.T) {
 // individually throttled, the ramp must reach Parts=4 flows and RETAIN them
 // after admission settling — throughput alone cannot distinguish four flows
 // from a lucky two, and a demotion regression would silently halve
-// parallelism. The probe is exempt from flow accounting.
+// parallelism. The useful initial response is the first accounted flow.
 func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	t.Parallel()
 	data := testData(8 << 20)
@@ -603,18 +592,13 @@ func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	inner := throttledRangeHandler(data, `"v1"`, &st,
 		20*time.Millisecond, 64, func(*http.Request) bool { return true })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-0" {
-			inner.ServeHTTP(w, r)
-			return
-		}
 		flows.enter()
 		defer flows.exit()
 		inner.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
 
-	logger, cap := newDecisionCapture()
-	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10, Logger: logger})
+	d := newDL(t, &Options{Parts: 4, MinPartSize: 256 << 10})
 	dest := filepath.Join(t.TempDir(), "file.bin")
 	start := time.Now()
 	if _, err := d.Get(t.Context(), srv.URL+"/file.bin", dest); err != nil {
@@ -632,13 +616,6 @@ func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
 	if sustained := flows.longestAt(4); sustained < wall/4 {
 		t.Fatalf("longest 4-flow span %v of %v total: flows were not retained", sustained, wall)
 	}
-	// Decision-record view of the same retention claim: the constrained
-	// regime must never emit a demote record.
-	for _, rec := range cap.decisions(t) {
-		if rec["action"] == "demote" {
-			t.Fatalf("constrained run emitted a demote record: %v", rec)
-		}
-	}
 }
 
 // TestPoolDemoteCancelsParkedWorker drives the PRODUCTION dispatch path —
@@ -652,31 +629,22 @@ func TestPoolDemoteCancelsParkedWorker(t *testing.T) {
 	t.Parallel()
 	data := testData(4 << 20)
 	lim := newSharedLimiter(2 << 20) // paced so ramp windows elapse
-	// Connection 1 carries the election probe and worker 0's shared-lease
-	// stream. The SECOND dialed connection is deterministically the admitted
-	// worker 1 (worker 0 is still streaming its first response when the ramp
-	// spawns worker 1); its request blocks before headers, forever. Worker
-	// 0's later pinned reconnects (3rd+) are served normally.
+	// Connection 1 carries worker 0's useful initial stream. The SECOND dialed
+	// connection is deterministically the admitted worker 1 (worker 0 is still
+	// streaming its first response when the ramp spawns worker 1); its request
+	// blocks before headers, forever. Later connections are served normally.
 	parked := make(chan struct{}, 4)
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var connections int
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, _ := r.Context().Value(probeConnIDKey{}).(int)
+		id, _ := r.Context().Value(testConnIDKey{}).(int)
 		if id == 2 {
 			select {
 			case parked <- struct{}{}:
 			default:
 			}
 			<-release // never answer: only worker-context cancellation wakes the client
-			return
-		}
-		if r.Header.Get("Range") == "bytes=0-0" {
-			w.Header().Set("ETag", `"v1"`)
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusPartialContent)
-			w.Write(data[:1])
 			return
 		}
 		start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data)))
@@ -703,7 +671,7 @@ func TestPoolDemoteCancelsParkedWorker(t *testing.T) {
 		connections++
 		id := connections
 		mu.Unlock()
-		return context.WithValue(ctx, probeConnIDKey{}, id)
+		return context.WithValue(ctx, testConnIDKey{}, id)
 	}
 	srv.Start()
 	t.Cleanup(func() { close(release); srv.Close() })

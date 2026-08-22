@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -362,12 +364,13 @@ func TestResume(t *testing.T) {
 	if !res.Resumed {
 		t.Error("expected Resumed=true")
 	}
-	// Phase 2 must not re-fetch from byte 0 (beyond the probe request).
+	// Phase 2 must not consume or re-fetch from byte 0 beyond its closed
+	// initial response.
 	phase2 := st.rangeStarts()[before:]
 	fullRefetches := 0
 	for i, s := range phase2 {
 		if i == 0 {
-			continue // election probe is always bytes=0-0
+			continue // the resumed run closes its initial bytes=0- response
 		}
 		if s == 0 {
 			fullRefetches++
@@ -499,8 +502,8 @@ func TestSHA256Verification(t *testing.T) {
 			t.Error("rerun should report Resumed")
 		}
 		refetches := len(st.rangeStarts()) - before
-		if refetches > 1 { // the election probe is the only allowed request
-			t.Errorf("rerun made %d content requests; want none beyond the probe", refetches)
+		if refetches > 1 { // the closed initial response is the only allowed request
+			t.Errorf("rerun made %d content requests; want none beyond the initial response", refetches)
 		}
 		assertClean(t, dest)
 	})
@@ -559,16 +562,36 @@ func TestSHA1Verification(t *testing.T) {
 func TestGetEmptyFile(t *testing.T) {
 	t.Parallel()
 
-	t.Run("range server answers the probe with 416", func(t *testing.T) {
+	t.Run("range server answers the initial request with 416", func(t *testing.T) {
 		t.Parallel()
+		// ServeContent answers "bytes=0-" on empty content with 200, so a
+		// real 416 fixture is required: it must carry Content-Range bytes */0
+		// AND a non-empty error body (as nginx and http.Error produce) that
+		// the engine must never read or stage.
 		var st stats
-		srv := httptest.NewServer(rangeHandler(nil, `"v1"`, &st))
+		var served416 atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			st.enter(r)
+			defer st.exit()
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Content-Range", "bytes */0")
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			served416.Add(1)
+			io.WriteString(w, "<html>416 Requested Range Not Satisfiable</html>")
+		}))
 		defer srv.Close()
 		dest := filepath.Join(t.TempDir(), "empty.bin")
 		d := newDL(t, nil)
 		res, got := mustGet(t, d, srv.URL+"/empty.bin", dest)
+		if served416.Load() == 0 {
+			t.Fatal("fixture never served a 416: the oracle is vacuous")
+		}
 		if res.Size != 0 || len(got) != 0 {
-			t.Errorf("Size = %d, body = %d bytes; want an empty file", res.Size, len(got))
+			t.Errorf("Size = %d, body = %d bytes; want an empty file (the 416 error body must not be staged)",
+				res.Size, len(got))
+		}
+		if requests := st.rangeHeaders(); len(requests) != 1 || requests[0] != "bytes=0-" {
+			t.Errorf("requests = %v, want exactly the initial ranged request", requests)
 		}
 		assertClean(t, dest)
 	})
@@ -641,5 +664,169 @@ func TestOptionsValidation(t *testing.T) {
 	}
 	if d.opt.Parts != defaultParts || d.opt.MinPartSize != defaultMinPartSize {
 		t.Error("nil Options must select defaults")
+	}
+}
+
+// TestSingleRetryAdoptsRepublishedLength: without a validator or checksum,
+// nothing binds a fresh single-stream retry to the representation the
+// election saw. A retained election total must not truncate a republished
+// larger file into a "successful" install — the buffer-aligned old length
+// is exactly the case where truncation would otherwise pass verification.
+func TestSingleRetryAdoptsRepublishedLength(t *testing.T) {
+	t.Parallel()
+	old := testData(1 << 20) // multiple of the 512 KiB read buffer
+	republished := testData(2 << 20)
+	for i := range republished {
+		republished[i] ^= 0xFF // differs from old at every offset
+	}
+	var attempt atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No validators, Range ignored: the single-stream path.
+		if attempt.Add(1) == 1 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(old)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(old[:256<<10])
+			panic(http.ErrAbortHandler) // die mid-body: forces a retry
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(republished)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(republished)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	d := newDL(t, &Options{MaxRetries: 3})
+	res, got := mustGet(t, d, srv.URL+"/file.bin", dest)
+	if res.Size != int64(len(republished)) {
+		t.Fatalf("Size = %d, want the republished %d (stale election total retained)",
+			res.Size, len(republished))
+	}
+	if !bytes.Equal(got, republished) {
+		t.Fatal("installed bytes are not the republished representation")
+	}
+	assertClean(t, dest)
+}
+
+// TestSingleRetryChecksumCoversFullRepublishedBody: a configured checksum
+// must hash the COMPLETE representation the retry actually serves. If the
+// retry stopped at the stale election total, the prefix of a republished
+// larger object would hash exactly like the original and install truncated.
+func TestSingleRetryChecksumCoversFullRepublishedBody(t *testing.T) {
+	t.Parallel()
+	old := testData(1 << 20)
+	republished := append(append([]byte(nil), old...), testData(1<<20)...) // old is its prefix
+	sum := sha256.Sum256(old)
+	var attempt atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempt.Add(1) == 1 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(old)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(old[:256<<10])
+			panic(http.ErrAbortHandler)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(republished)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(republished)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	d := newDL(t, &Options{MaxRetries: 3, ExpectedSHA256: hex.EncodeToString(sum[:])})
+	_, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
+	if _, ok := errors.AsType[*ChecksumError](err); !ok {
+		t.Fatalf("Get error = %v, want ChecksumError over the full republished body", err)
+	}
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Fatal("truncated republished content was installed")
+	}
+}
+
+// TestSingleRetryValidatorMismatchFails: when the election supplied a
+// validator, a retry answered by a different representation (changed ETag)
+// must fail with errContentChanged — never install the new response's
+// prefix under the old identity, and never destroy already-staged bytes.
+func TestSingleRetryValidatorMismatchFails(t *testing.T) {
+	t.Parallel()
+	old := testData(1 << 20)
+	republished := testData(2 << 20)
+	var attempt atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempt.Add(1) == 1 {
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Content-Length", strconv.Itoa(len(old)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(old[:256<<10])
+			panic(http.ErrAbortHandler)
+		}
+		w.Header().Set("ETag", `"v2"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(republished)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(republished)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	d := newDL(t, &Options{MaxRetries: 3})
+	_, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
+	if !errors.Is(err, errContentChanged) {
+		t.Fatalf("Get error = %v, want errContentChanged", err)
+	}
+	if _, err := os.Lstat(dest); !os.IsNotExist(err) {
+		t.Fatal("changed representation was installed")
+	}
+	// The failing retry must not have truncated what attempt 1 staged.
+	fi, err := os.Stat(dest + ".part")
+	if err != nil {
+		t.Fatalf("staged part missing after validator mismatch: %v", err)
+	}
+	if fi.Size() != 256<<10 {
+		t.Fatalf("staged part = %d bytes, want attempt 1's 256 KiB untouched", fi.Size())
+	}
+}
+
+// TestCancelledContextNeverTouchesStaging: a caller context cancelled while
+// the election round-trip is still in flight (custom transports can return
+// a response regardless) must fail the Get before staging is opened — the
+// existing .part bytes and sidecar stay byte-identical.
+func TestCancelledContextNeverTouchesStaging(t *testing.T) {
+	t.Parallel()
+	data := testData(1 << 20)
+	ctx, cancel := context.WithCancel(t.Context())
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		cancel() // the caller gives up while the round-trip is in flight
+		h := make(http.Header)
+		h.Set("ETag", `"v1"`)
+		h.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
+		return &http.Response{
+			StatusCode:    http.StatusPartialContent,
+			Header:        h,
+			ContentLength: int64(len(data)),
+			Body:          io.NopCloser(bytes.NewReader(data)),
+			Request:       req,
+		}, nil
+	})
+
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	sentinel := []byte("previously staged bytes: do not touch")
+	if err := os.WriteFile(dest+".part", sentinel, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := []byte(`{"unrelated":"sidecar"}`)
+	if err := os.WriteFile(statePath(dest+".part"), sidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDL(t, &Options{Transport: rt})
+	_, err := d.Get(ctx, "http://custom.test/file.bin", dest)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Get error = %v, want context.Canceled", err)
+	}
+	gotPart, err := os.ReadFile(dest + ".part")
+	if err != nil || !bytes.Equal(gotPart, sentinel) {
+		t.Fatalf("staged part modified after cancellation: %q err=%v", gotPart, err)
+	}
+	gotState, err := os.ReadFile(statePath(dest + ".part"))
+	if err != nil || !bytes.Equal(gotState, sidecar) {
+		t.Fatalf("sidecar modified after cancellation: %q err=%v", gotState, err)
 	}
 }

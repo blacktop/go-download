@@ -27,20 +27,6 @@ type stats struct {
 	ranges  []string
 	conc    int
 	maxConc int
-	// served counts body bytes actually written (throttled handler only).
-	served int64
-}
-
-func (s *stats) addServed(n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.served += int64(n)
-}
-
-func (s *stats) servedBytes() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.served
 }
 
 func (s *stats) enter(r *http.Request) {
@@ -141,7 +127,6 @@ func throttledRangeHandler(data []byte, etag string, st *stats,
 			if _, err := w.Write(body[:n]); err != nil {
 				return
 			}
-			st.addServed(n)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -257,22 +242,11 @@ func (f *flowLog) maxConcBetween(a, b time.Time) int {
 }
 
 // sharedCapHandler serves ranged (206) and plain (200) requests, pacing all
-// body bytes through one shared limiter; the one-byte election probe is
-// exempt so it cannot skew flow accounting or the measured rate.
+// body bytes through one shared limiter. The useful initial range is flow 1.
 func sharedCapHandler(data []byte, etag string, st *stats, lim *sharedLimiter, flows *flowLog) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		st.enter(r)
 		defer st.exit()
-		if r.Header.Get("Range") == "bytes=0-0" {
-			if etag != "" {
-				w.Header().Set("ETag", etag)
-			}
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
-			w.Header().Set("Content-Length", "1")
-			w.WriteHeader(http.StatusPartialContent)
-			w.Write(data[:1])
-			return
-		}
 		body := data
 		if start, end, ok := parseFullRange(r.Header.Get("Range"), int64(len(data))); ok {
 			if etag != "" {
@@ -297,7 +271,6 @@ func sharedCapHandler(data []byte, etag string, st *stats, lim *sharedLimiter, f
 			if _, err := w.Write(body[:n]); err != nil {
 				return
 			}
-			st.addServed(n)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -306,19 +279,23 @@ func sharedCapHandler(data []byte, etag string, st *stats, lim *sharedLimiter, f
 	})
 }
 
-// longestAt returns the longest continuous wall-time span during which the
-// in-force concurrency was at least n.
-func (f *flowLog) longestAt(n int) time.Duration {
+// longestSpan returns the longest continuous wall-time span, ignoring
+// events before after, during which the in-force concurrency satisfied
+// match. A span still open at the last event is closed there.
+func (f *flowLog) longestSpan(match func(conc int) bool, after time.Time) time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var longest time.Duration
 	var since time.Time
 	active := false
 	for _, e := range f.events {
+		if e.at.Before(after) {
+			continue
+		}
 		switch {
-		case e.conc >= n && !active:
+		case match(e.conc) && !active:
 			active, since = true, e.at
-		case e.conc < n && active:
+		case !match(e.conc) && active:
 			active = false
 			longest = max(longest, e.at.Sub(since))
 		}
@@ -327,4 +304,22 @@ func (f *flowLog) longestAt(n int) time.Duration {
 		longest = max(longest, f.events[len(f.events)-1].at.Sub(since))
 	}
 	return longest
+}
+
+// firstAtLeast returns when concurrency first reached n (zero time: never).
+func (f *flowLog) firstAtLeast(n int) time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.events {
+		if e.conc >= n {
+			return e.at
+		}
+	}
+	return time.Time{}
+}
+
+// longestAt returns the longest continuous wall-time span during which the
+// in-force concurrency was at least n.
+func (f *flowLog) longestAt(n int) time.Duration {
+	return f.longestSpan(func(c int) bool { return c >= n }, time.Time{})
 }

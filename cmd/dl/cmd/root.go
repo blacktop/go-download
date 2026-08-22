@@ -75,7 +75,7 @@ func init() {
 
 var rootCmd = &cobra.Command{
 	Use:           "dl <url>",
-	Short:         "Download a file as fast as possible: parallel parts, CDN node racing, resume",
+	Short:         "Download a file as fast as possible: adaptive parallel parts and resume",
 	Args:          cobra.ExactArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
