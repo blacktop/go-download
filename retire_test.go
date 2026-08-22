@@ -393,7 +393,9 @@ func (r *demotionReporter) ChunkDone(id int) {
 // shared-cap (saturated) link the ramp must probe, judge the batch flat, and
 // retire it — steady-state concurrent ranged bodies return to exactly one.
 func TestRampDemotesOnFlatThroughput(t *testing.T) {
-	t.Parallel()
+	// This is a wall-rate integration oracle. Running it beside the package's
+	// many parallel race tests can make scheduler starvation look like a
+	// throughput change and postpone a real demotion until EOF.
 	// 16 MiB at a 4 MB/s shared cap (~4s): stabilized decision windows
 	// (1 MiB each) average enough limiter quanta that the flat verdict is
 	// unambiguous, and leave ample post-demotion runway under -race.
@@ -581,7 +583,8 @@ func TestRetirementDoesNotMaskWriteFailure(t *testing.T) {
 // from a lucky two, and a demotion regression would silently halve
 // parallelism. The useful initial response is the first accounted flow.
 func TestConstrainedRampReachesAndKeepsFourFlows(t *testing.T) {
-	t.Parallel()
+	// Keep the rate-sensitive control-plane fixture isolated from the package's
+	// parallel race tests; those tests are load, not part of this link model.
 	data := testData(8 << 20)
 	flows := &flowLog{}
 	var st stats
