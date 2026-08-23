@@ -85,6 +85,7 @@ Configure the downloader with `download.Options`:
 dl, err := download.New(&download.Options{
     Parts:          8,                // parallel connections (cap)
     MinParts:       1,                // opened eagerly; never retired below
+    ResumeID:       "",               // stable resume identity for signed URLs
     MinPartSize:    16 << 20,         // never split ranges below 2x this
     ExpectedSHA256: "6ca0e5...",      // verify before the final install
     Reporter:       myProgressUI,     // receive progress events
@@ -105,6 +106,12 @@ dl -p 8 --sha256 020a1e8... https://dl.google.com/go/go1.26.7.darwin-arm64.tar.g
 ```
 
 Run the same command after an interruption to resume the download.
+
+Resume identity is the request URL by default, query included. When the URL
+carries rotating signed credentials (`?accessKey=…`, CDN tokens) but names
+the same object, set `ResumeID` to something stable such as the scheme, host,
+and path; the sidecar is then reused under a refreshed URL while
+ETag/Last-Modified and size still decide whether the staged bytes are current.
 
 ## Performance
 

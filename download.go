@@ -99,6 +99,15 @@ type Options struct {
 	RejectContentTypes []string
 	// Overwrite allows replacing an existing destination file.
 	Overwrite bool
+	// ResumeID overrides the URL-derived resume identity recorded in the
+	// sidecar. By default the identity hashes the request URL, query
+	// included, so a retry with a different query is a different resource.
+	// Set ResumeID (for example to the scheme, host, and path) when request
+	// URLs carry rotating signed credentials but name the same object, so an
+	// interrupted download resumes under a refreshed URL. Server validators
+	// (ETag/Last-Modified) and size still decide whether the staged bytes
+	// are current. Empty keeps the URL-derived identity.
+	ResumeID string
 	// Reporter receives progress events. Nil means silent.
 	Reporter Reporter
 	// Logger receives debug-level internals. Nil means discard.
@@ -943,7 +952,7 @@ func (r *run) resumable() bool {
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
 	sched := newScheduler(r.d.opt.MinPartSize)
-	sourceID := sourceIdentity(r.sourceURL)
+	sourceID := resumeIdentity(r.d.opt.ResumeID, r.sourceURL)
 
 	flag := os.O_RDWR | os.O_CREATE
 	file, err := os.OpenFile(r.partPath, flag, 0o644)

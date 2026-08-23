@@ -47,6 +47,17 @@ func sourceIdentity(source *url.URL) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// resumeIdentity is the sidecar identity for a run: the caller's ResumeID
+// when set (domain-separated so it can never collide with a URL-derived
+// identity), otherwise the request URL's.
+func resumeIdentity(resumeID string, source *url.URL) string {
+	if resumeID == "" {
+		return sourceIdentity(source)
+	}
+	sum := sha256.Sum256([]byte("resume-id\x00" + resumeID))
+	return hex.EncodeToString(sum[:])
+}
+
 func statePath(partPath string) string { return partPath + ".json" }
 
 // save writes the sidecar atomically (tmp file + rename).
