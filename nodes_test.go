@@ -699,9 +699,7 @@ func TestProxiedElectionNeverResolvesForPlacement(t *testing.T) {
 			return
 		}
 		defer resp.Body.Close()
-		for k, vs := range resp.Header {
-			w.Header()[k] = vs
-		}
+		maps.Copy(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	}))
