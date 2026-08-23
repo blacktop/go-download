@@ -323,13 +323,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 
 	w.gotConn.Store(false)
 	trace := &httptrace.ClientTrace{GotConn: func(ci httptrace.GotConnInfo) {
-		w.gotConn.Store(true)
-		addr := ci.Conn.RemoteAddr().String()
-		// A reused connection was attributed when it was first obtained.
-		if w.place != nil && !ci.Reused {
-			addr = w.place.gotConn(w.id, addr)
-		}
-		w.r.rep.Connected(c.id, addr)
+		w.recordGotConn(c.id, ci)
 	}}
 	reqCtx := httptrace.WithClientTrace(actx, trace)
 	req, err := http.NewRequestWithContext(reqCtx,
@@ -372,6 +366,18 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 		_ = resp.Body.Close()
 		return &permanentError{StatusError(resp.StatusCode)}
 	}
+}
+
+// recordGotConn attributes every connection selected by net/http. Reused
+// connections cannot be skipped: after an origin dial, a cross-host redirect
+// may reuse its own pooled connection and must clear the origin attribution.
+func (w *worker) recordGotConn(chunkID int, ci httptrace.GotConnInfo) {
+	w.gotConn.Store(true)
+	addr := ci.Conn.RemoteAddr().String()
+	if w.place != nil {
+		addr = w.place.gotConn(w.id, addr)
+	}
+	w.r.rep.Connected(chunkID, addr)
 }
 
 func (w *worker) initialRangeAttempt(
@@ -598,8 +604,8 @@ func (w *worker) classify(err error, actx context.Context) error {
 }
 
 // classifyConnection extends ordinary attempt classification with the
-// lifecycle fact supplied by httptrace: without GotConn, dialing completed but
-// the connection was never usable (normally TLS establishment). Rotate the
+// lifecycle fact supplied by httptrace: without GotConn, connection
+// establishment failed before it became usable (during dial or TLS). Rotate the
 // pinned transport immediately unless cancellation already explains the
 // failure or a more specific classifier did.
 func (w *worker) classifyConnection(err error, actx context.Context, gotConn bool) error {

@@ -39,8 +39,8 @@ type nodeAddress struct {
 	order int
 	conns int
 	// unavailableUntil is the single eligibility clock: dial/TLS failures and
-	// slow-node culls both park the address here. Only cullAddress increments
-	// slowStrikes, so availability failures never count as slow evidence.
+	// slow-node culls both park the address here. Only a confirmed slow cull
+	// increments slowStrikes, so availability failures never count as evidence.
 	unavailableUntil time.Time
 	slowStrikes      int
 	healthySample    int
@@ -298,7 +298,7 @@ func (p *nodePlacement) bestLocked(exclude netip.Addr) *nodeAddress {
 			continue
 		}
 		// A post-cull address receives one passive probe, not a batch.
-		if n.slowStrikes > 0 && n.conns != 0 {
+		if n.probing() {
 			continue
 		}
 		if chosen == nil || n.conns < chosen.conns ||
@@ -582,26 +582,21 @@ func (p *nodePlacement) close() {
 	p.d.unregisterPlacement(p)
 }
 
-func (p *nodePlacement) refresh(ctx context.Context) bool {
+func (p *nodePlacement) refresh(ctx context.Context) {
 	resolveCtx, cancelResolve := context.WithTimeout(ctx, nodeResolutionTimeout)
 	addrs, err := p.d.resolve(resolveCtx, p.host)
 	cancelResolve()
 	if err != nil {
 		p.d.log.Debug("node re-resolution failed", "host", p.host, "err", err)
-		return false
+		return
 	}
 	ordered := orderNodeAddresses(p.election, addrs)
 	if len(ordered) == 0 {
-		return false
+		return
 	}
 	p.mu.Lock()
-	before := make([]netip.Addr, len(p.ordered))
-	for i, n := range p.ordered {
-		before[i] = n.addr
-	}
 	p.installOrderLocked(ordered)
 	p.mu.Unlock()
-	return !slices.Equal(before, ordered)
 }
 
 func (p *nodePlacement) dialPreferred(

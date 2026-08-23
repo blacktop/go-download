@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"path/filepath"
@@ -668,6 +669,41 @@ func TestForeignRemoteNeverJoinsOriginPool(t *testing.T) {
 		if addr != a && addr != b {
 			t.Fatalf("reservation %d handed out non-member %v", i, addr)
 		}
+	}
+}
+
+func TestReusedForeignRemoteClearsOriginAttribution(t *testing.T) {
+	t.Parallel()
+	a, b := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	d, p := newPlacementForTest(t, &Options{Parts: 2}, []netip.Addr{a, b})
+	if _, err := p.reserve(3); err != nil {
+		t.Fatal(err)
+	}
+	reporter := &nodeAddressReporter{}
+	w := &worker{
+		id: 3, r: &run{d: d, rep: reporter}, place: p, placed: p.workers[3],
+	}
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	foreign := "198.51.100.9:443"
+	w.recordGotConn(7, httptrace.GotConnInfo{
+		Conn: &logicalRemoteConn{
+			Conn: client, remote: net.TCPAddrFromAddrPort(netip.MustParseAddrPort(foreign)),
+		},
+		Reused: true,
+	})
+	if cur := p.currentAddress(w.placed); cur.IsValid() {
+		t.Fatalf("worker on reused foreign connection still attributed to %v", cur)
+	}
+	if !w.gotConn.Load() {
+		t.Fatal("reused connection did not record GotConn")
+	}
+	addrs, _ := reporter.snapshot()
+	if addrs[foreign] != 1 {
+		t.Fatalf("reported addresses = %v, want reused foreign remote once", addrs)
 	}
 }
 

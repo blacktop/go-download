@@ -119,14 +119,17 @@ The separate `dl` module includes a multi-bar progress display:
 go install github.com/blacktop/go-download/cmd/dl@latest
 
 dl -p 8 --sha256 020a1e8... https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz
+
+# Opt into multi-address placement for an eligible direct CDN host:
+dl -p 8 --enable-node-selection https://cdn.example.com/large-file
 ```
 
 Run the same command after an interruption to resume the download.
 
 Resume identity is the request URL by default, query included. When the URL
 carries rotating signed credentials (`?accessKey=…`, CDN tokens) but names
-the same object, set `ResumeID` to something stable such as the scheme, host,
-and path; the sidecar is then reused under a refreshed URL while
+the same object, pass `--resume-id` with something stable such as the scheme,
+host, and path; the sidecar is then reused under a refreshed URL while
 ETag/Last-Modified and size still decide whether the staged bytes are current.
 
 ## Performance
@@ -163,14 +166,45 @@ baseline because transfer time dominates. The WAN run alternated execution
 order, kept every round, and checked the endpoint, validator, size, and protocol.
 Individual WAN ratios ranged from 0.844× to 1.109×.
 
+### Node-placement boundary
+
+Node placement is opt-in because distributing flows across every resolved
+address is not universally faster than staying on the election address. A
+held-out public Apple CDN sweep on August 23, 2026 used three interleaved
+45-second rounds per configuration:
+
+| Parts/MinParts | Placement | Median MiB/s |
+|---|---:|---:|
+| 8/8 | off | 13.31 |
+| 4/4 | off | 12.23 |
+| 4/4 | on | 11.25 |
+| 8/8 | on | 10.47 |
+| 1/1 | off | 9.22 |
+
+The 8/8 enabled/disabled ratios were 0.94, 0.79, and 0.74. Placement used all
+four resolved addresses, including one whose per-connection rate was roughly
+three times slower than the fastest. That spread remained above the
+conservative 25% culling threshold, so migration correctly did not fire, but
+the diversified run was slower.
+
+Conversely, the deterministic 100:1 slow-node fixture migrated work losslessly
+and completed in about 0.667× the disabled wall time, a 1.50× speedup. Local
+paired benchmarks found inactive paths unchanged and equal-node wall time
+neutral; equal-node placement used about 9.6% more allocations. These results
+support opt-in placement for known multi-address bottlenecks, not a universal
+fastest configuration.
+
 An aggressive 8 MiB multipart benchmark remains in the suite to expose
 overhead. It is intentionally excluded above because its raw `http.Get` baseline
 skips staging, `Sync`, atomic installation, and resume bookkeeping.
 
-Reproduce:
+Reproduce the checked-in local fixtures:
 
 ```bash
-just bench                 # every loopback benchmark behind the results above
+just bench # loopback throughput and placement overhead benchmarks
+
+# lossless 100:1 migration oracle (wall time is diagnostic, not a test gate):
+go test -run '^TestSlowNodeCullingMigratesLosslesslyAtHundredToOne$' -count=1 .
 
 # real-network pair against a public 100 MiB test file:
 env DL_BENCH_URL=https://ash-speed.hetzner.com/100MB.bin go test -bench BenchmarkReal -benchtime 3x .
