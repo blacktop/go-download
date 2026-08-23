@@ -29,10 +29,20 @@ import (
 )
 
 const (
-	defaultParts       = 8
-	defaultMinPartSize = int64(16 << 20)
-	defaultTimeout     = 15 * time.Second
-	defaultMaxRetries  = 10
+	// DefaultParts is the maximum connection count selected by New when
+	// Options.Parts is zero.
+	DefaultParts = 8
+	// DefaultMinParts is the eager connection floor selected by New when
+	// Options.MinParts is zero.
+	DefaultMinParts = 1
+	// DefaultMinPartSize is the split threshold selected by New when
+	// Options.MinPartSize is zero.
+	DefaultMinPartSize int64 = 16 << 20
+)
+
+const (
+	defaultTimeout    = 15 * time.Second
+	defaultMaxRetries = 10
 
 	// bufSize is the worker read-buffer size. TLS caps records at 16 KiB; a
 	// large user-space buffer amortizes the syscall and copy overhead.
@@ -84,8 +94,22 @@ type Options struct {
 	// is set.
 	TLSConfig *tls.Config
 	// Proxy selects a proxy per request for the internal transport (nil means
-	// http.ProxyFromEnvironment). Ignored when Transport is set.
+	// http.ProxyFromEnvironment). Node selection follows the routing of the
+	// actual election request: a proxied election disables placement for that
+	// resource; a later worker request the function routes differently is
+	// simply proxied and never attributed to an origin address. Ignored when
+	// Transport is set.
 	Proxy func(*http.Request) (*url.URL, error)
+	// Policy, when set, adjusts Parts/MinParts/MinPartSize per resource once
+	// the byte-serving URL is known: after the election request (itself a
+	// ranged GET that follows redirects) and before additional range
+	// requests, resume selection, and placement. Zero fields keep the
+	// Options values, except that an inherited MinParts is clamped to a
+	// lowered Parts. An invalid result fails the download. Policy may be
+	// called concurrently when the Downloader is used concurrently. It lets a
+	// caller apply a host-specific policy (fixed parallelism for a
+	// per-flow-limited CDN, say) without a preflight request of its own.
+	Policy func(finalURL string) Concurrency
 	// EnableNodeSelection opts into direct-host address placement for eligible
 	// multipart runs with an owned direct transport and at least two
 	// resolved/election addresses. The zero value keeps the base transport.
@@ -121,10 +145,49 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// Concurrency is a connection policy: Parts caps parallel connections,
+// MinParts is the floor opened eagerly and never retired by throughput
+// measurement, and MinPartSize bounds range splitting. Zero fields mean
+// "unchanged" wherever a Concurrency is applied over another.
+type Concurrency struct {
+	Parts       int
+	MinParts    int
+	MinPartSize int64
+}
+
+// over fills c's zero fields from base and validates the result. An
+// inherited MinParts is clamped to a lowered Parts (this only bites on the
+// Policy path — New's base floor is 1); an explicit one that exceeds Parts is
+// an error.
+func (c Concurrency) over(base Concurrency) (Concurrency, error) {
+	if c.Parts == 0 {
+		c.Parts = base.Parts
+	}
+	if c.Parts < 1 {
+		return c, fmt.Errorf("invalid Parts %d: must be >= 1", c.Parts)
+	}
+	if c.MinParts == 0 {
+		c.MinParts = min(base.MinParts, c.Parts)
+	}
+	if c.MinParts < 1 || c.MinParts > c.Parts {
+		return c, fmt.Errorf("invalid MinParts %d: must satisfy 1 <= MinParts <= Parts (%d)",
+			c.MinParts, c.Parts)
+	}
+	if c.MinPartSize == 0 {
+		c.MinPartSize = base.MinPartSize
+	}
+	if c.MinPartSize < 1 {
+		return c, fmt.Errorf("invalid MinPartSize %d: must be >= 1", c.MinPartSize)
+	}
+	return c, nil
+}
+
 // Result describes a completed download.
 type Result struct {
 	// Path is the final destination path.
 	Path string
+	// FinalURL is the byte-serving URL after redirects.
+	FinalURL string
 	// Size is the downloaded size in bytes.
 	Size int64
 	// ETag and LastModified are the server validators, when present.
@@ -166,6 +229,9 @@ type Downloader struct {
 	// address sets. Resolver failures disable placement for that run.
 	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
 
+	// conc is the validated base concurrency from Options; Policy overlays it
+	// per resource.
+	conc Concurrency
 	// placements tracks in-flight node placements so CloseIdleConnections can
 	// reach their pinned transports; each run registers and unregisters its own.
 	placementsMu sync.Mutex
@@ -181,25 +247,15 @@ func New(opt *Options) (*Downloader, error) {
 	if opt != nil {
 		o = *opt
 	}
-	if o.Parts == 0 {
-		o.Parts = defaultParts
+	defaults := Concurrency{
+		Parts: DefaultParts, MinParts: DefaultMinParts, MinPartSize: DefaultMinPartSize,
 	}
-	if o.Parts < 1 {
-		return nil, fmt.Errorf("invalid Parts %d: must be >= 1", o.Parts)
+	requested := Concurrency{Parts: o.Parts, MinParts: o.MinParts, MinPartSize: o.MinPartSize}
+	baseConc, err := requested.over(defaults)
+	if err != nil {
+		return nil, err
 	}
-	if o.MinParts == 0 {
-		o.MinParts = 1
-	}
-	if o.MinParts < 1 || o.MinParts > o.Parts {
-		return nil, fmt.Errorf("invalid MinParts %d: must satisfy 1 <= MinParts <= Parts (%d)",
-			o.MinParts, o.Parts)
-	}
-	if o.MinPartSize == 0 {
-		o.MinPartSize = defaultMinPartSize
-	}
-	if o.MinPartSize < 1 {
-		return nil, fmt.Errorf("invalid MinPartSize %d: must be >= 1", o.MinPartSize)
-	}
+	o.Parts, o.MinParts, o.MinPartSize = baseConc.Parts, baseConc.MinParts, baseConc.MinPartSize
 	if o.Timeout == 0 {
 		o.Timeout = defaultTimeout
 	}
@@ -212,7 +268,6 @@ func New(opt *Options) (*Downloader, error) {
 	if o.MaxRetries < 0 {
 		return nil, fmt.Errorf("invalid MaxRetries %d: must be >= 1", o.MaxRetries)
 	}
-	var err error
 	if o.ExpectedSHA256, err = normalizeChecksum(o.ExpectedSHA256, sha256HexLen, "ExpectedSHA256"); err != nil {
 		return nil, err
 	}
@@ -229,7 +284,7 @@ func New(opt *Options) (*Downloader, error) {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
 	d := &Downloader{
-		opt: o, rep: o.Reporter, log: o.Logger, reportSem: reportSem,
+		opt: o, conc: baseConc, rep: o.Reporter, log: o.Logger, reportSem: reportSem,
 		placements: make(map[*nodePlacement]struct{}),
 	}
 	d.bufs.New = func() any {
@@ -266,6 +321,23 @@ func newTransport(
 	if proxy == nil {
 		proxy = http.ProxyFromEnvironment
 	}
+	// Record every routing decision into the request's proxyRoute, when one
+	// is attached (elect attaches one per attempt). The transport stays
+	// ignorant of what the answer is for; consumers gate themselves.
+	selectProxy := proxy
+	proxy = func(req *http.Request) (*url.URL, error) {
+		proxyURL, err := selectProxy(req)
+		if route, ok := req.Context().Value(proxyRouteKey{}).(*proxyRoute); ok {
+			route.proxied = err != nil || proxyURL != nil
+		}
+		return proxyURL, err
+	}
+	maxIdleConnsPerHost := o.Parts + 1
+	if o.Policy != nil {
+		// The per-resource Parts is unknown here, so allow a generous pool
+		// rather than churn connections when a policy raises it.
+		maxIdleConnsPerHost = max(maxIdleConnsPerHost, 64)
+	}
 	return &http.Transport{
 		Proxy:                 proxy,
 		DialContext:           dial,
@@ -273,7 +345,7 @@ func newTransport(
 		TLSClientConfig:       o.TLSConfig,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		MaxIdleConnsPerHost:   o.Parts + 1,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 	}
 }
@@ -414,6 +486,28 @@ type resolvedRequest struct {
 	sha256, sha1 string
 }
 
+type proxyRouteKey struct{}
+
+// proxyRoute records the internal transport's routing decision for one
+// election attempt. Proxy resolution runs synchronously inside the attempt's
+// client.Do, so a plain bool suffices.
+type proxyRoute struct {
+	proxied bool
+}
+
+// concurrencyFor resolves the run's concurrency: Options values, adjusted by
+// Options.Policy for the byte-serving URL when one is configured.
+func (d *Downloader) concurrencyFor(finalURL string) (Concurrency, error) {
+	if d.opt.Policy == nil {
+		return d.conc, nil
+	}
+	conc, err := d.opt.Policy(finalURL).over(d.conc)
+	if err != nil {
+		return conc, fmt.Errorf("policy for %s: %w", redactURL(finalURL), err)
+	}
+	return conc, nil
+}
+
 func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, error) {
 	rawURL, dest := rq.url, rq.dest
 	sourceURL, err := parseURL(rawURL)
@@ -421,27 +515,35 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 	electStart := time.Now()
-	resp, remoteAddr, electCancel, err := d.elect(ctx, rawURL)
+	elected, err := d.elect(ctx, rawURL)
 	if err != nil {
 		return nil, err
 	}
 	electDur := time.Since(electStart)
+	resp, remoteAddr, electCancel := elected.resp, elected.remoteAddr, elected.cancel
+	// fail abandons the election response on an early exit; every return
+	// between here and the run taking ownership must go through it.
+	fail := func(err error) (*Result, error) {
+		electCancel(nil)
+		resp.Body.Close()
+		return nil, err
+	}
 	finalURL := resp.Request.URL.String()
+	conc, err := d.concurrencyFor(finalURL)
+	if err != nil {
+		return fail(err)
+	}
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
 	contentType := resp.Header.Get("Content-Type")
 
 	if rejected(contentType, d.opt.RejectContentTypes) {
-		electCancel(nil)
-		resp.Body.Close()
-		return nil, &ContentTypeError{ContentType: contentType}
+		return fail(&ContentTypeError{ContentType: contentType})
 	}
 
 	destPath, err := resolveDest(dest, finalURL, resp.Header)
 	if err != nil {
-		electCancel(nil)
-		resp.Body.Close()
-		return nil, err
+		return fail(err)
 	}
 	var total int64 = -1
 	multipart := false
@@ -470,19 +572,21 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		"total", total, "multipart", multipart, "dest", destPath)
 
 	r := &run{
-		d:           d,
-		rep:         rq.rep,
-		sha256:      rq.sha256,
-		sha1:        rq.sha1,
-		url:         finalURL,
-		sourceURL:   sourceURL,
-		destPath:    destPath,
-		partPath:    destPath + ".part",
-		total:       total,
-		etag:        etag,
-		lastMod:     lastMod,
-		contentType: contentType,
-		electDur:    electDur,
+		d:               d,
+		rep:             rq.rep,
+		sha256:          rq.sha256,
+		sha1:            rq.sha1,
+		url:             finalURL,
+		conc:            conc,
+		electionProxied: elected.proxied,
+		sourceURL:       sourceURL,
+		destPath:        destPath,
+		partPath:        destPath + ".part",
+		total:           total,
+		etag:            etag,
+		lastMod:         lastMod,
+		contentType:     contentType,
+		electDur:        electDur,
 	}
 	if initialUsable {
 		resp.Body = &closeOnceBody{ReadCloser: resp.Body}
@@ -653,22 +757,32 @@ func Discard(ctx context.Context, dest string) error {
 // contract that Close is safe (or effective) concurrently with Read, and
 // Options.Transport bodies are arbitrary. Callers must invoke it exactly
 // once the response is finished with (any cause; nil for ordinary cleanup).
-func (d *Downloader) elect(ctx context.Context, rawURL string) (
-	*http.Response, string, context.CancelCauseFunc, error) {
+// election is a successful elect result: the initial response, where its
+// final hop connected, how it was routed, and the cancel that aborts it.
+type election struct {
+	resp       *http.Response
+	remoteAddr string
+	proxied    bool
+	cancel     context.CancelCauseFunc
+}
+
+func (d *Downloader) elect(ctx context.Context, rawURL string) (election, error) {
 	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
 	for attempt := range 3 {
 		if attempt > 0 {
 			if err := sleepCtx(ctx, bo.next()); err != nil {
-				return nil, "", nil, err
+				return election{}, err
 			}
 		}
 		ectx, ecancel := context.WithCancelCause(ctx)
+		route := &proxyRoute{}
+		ectx = context.WithValue(ectx, proxyRouteKey{}, route)
 		req, err := http.NewRequestWithContext(ectx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			ecancel(nil)
-			return nil, "", nil, fmt.Errorf("build request: %w", err)
+			return election{}, fmt.Errorf("build request: %w", err)
 		}
 		d.applyHeaders(req, req.URL)
 		req.Header.Set("Range", "bytes=0-")
@@ -683,18 +797,18 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (
 			ecancel(nil)
 			err = redactErr(err)
 			if ctx.Err() != nil {
-				return nil, "", nil, err
+				return election{}, err
 			}
 			lastErr = err
 			continue
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
-			return resp, remoteAddr, ecancel, nil
+			return election{resp: resp, remoteAddr: remoteAddr, proxied: route.proxied, cancel: ecancel}, nil
 		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && emptyContentRange(resp.Header):
 			// A range request on a zero-length resource is unsatisfiable:
 			// the file exists and is empty.
-			return resp, remoteAddr, ecancel, nil
+			return election{resp: resp, remoteAddr: remoteAddr, proxied: route.proxied, cancel: ecancel}, nil
 		case isRetryableStatus(resp.StatusCode):
 			resp.Body.Close()
 			ecancel(nil)
@@ -702,10 +816,10 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (
 		default:
 			resp.Body.Close()
 			ecancel(nil)
-			return nil, "", nil, StatusError(resp.StatusCode)
+			return election{}, StatusError(resp.StatusCode)
 		}
 	}
-	return nil, "", nil, fmt.Errorf("initial request %s: %w", redactURL(rawURL), lastErr)
+	return election{}, fmt.Errorf("initial request %s: %w", redactURL(rawURL), lastErr)
 }
 
 func isRetryableStatus(code int) bool {
@@ -769,6 +883,7 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	}
 	res := &Result{
 		Path:         r.destPath,
+		FinalURL:     r.url,
 		Size:         fi.Size(),
 		ETag:         r.etag,
 		LastModified: r.lastMod,
@@ -891,8 +1006,11 @@ func hashFile(file *os.File, want256, want1 bool, buf []byte) (sum256, sum1 stri
 
 // run carries the state of one Get call.
 type run struct {
-	d           *Downloader
-	rep         Reporter
+	d   *Downloader
+	rep Reporter
+	// conc is this resource's effective concurrency: Options adjusted by
+	// Options.Policy for the final URL.
+	conc        Concurrency
 	sha256      string
 	sha1        string
 	url         string
@@ -918,6 +1036,8 @@ type run struct {
 	initialMu   sync.Mutex
 	initial     *http.Response
 	initialAddr string
+	// electionProxied: the election request went through a proxy.
+	electionProxied bool
 	// electionAddr survives closeInitial so placement can always union the
 	// actual election connection into the final host's later DNS answer.
 	electionAddr  string
@@ -970,6 +1090,15 @@ func (r *run) closeInitial() {
 	}
 }
 
+// placementInput projects the run's placement-relevant facts; canMultiply is
+// the one fact the caller computes.
+func (r *run) placementInput(canMultiply bool) placementInput {
+	return placementInput{
+		url: r.url, electionRemote: r.electionAddr, electionProxied: r.electionProxied,
+		electionInUse: r.hasInitial(), canMultiply: canMultiply, parts: r.conc.Parts,
+	}
+}
+
 func (r *run) hasInitial() bool {
 	r.initialMu.Lock()
 	defer r.initialMu.Unlock()
@@ -1001,7 +1130,7 @@ func (r *run) resumable() bool {
 // multipart downloads r.url (known size, ranges honored) with parallel
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
-	sched := newScheduler(r.d.opt.MinPartSize)
+	sched := newScheduler(r.conc.MinPartSize)
 	sourceID := resumeIdentity(r.d.opt.ResumeID, r.sourceURL)
 
 	flag := os.O_RDWR | os.O_CREATE
@@ -1342,9 +1471,9 @@ func (r *run) runWorkers(
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	remaining := sched.remainingBytes()
-	start := sched.prepare(r.d.opt.MinParts)
-	canRamp := rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts)
-	placement := r.d.newNodePlacement(runCtx, r.url, r.electionAddr, start > 1 || canRamp, r.hasInitial())
+	start := sched.prepare(r.conc.MinParts)
+	canRamp := rampEligible(remaining, r.conc.MinPartSize, r.conc.Parts)
+	placement := r.d.newNodePlacement(runCtx, r.placementInput(start > 1 || canRamp))
 	if placement != nil {
 		r.placement = placement
 		defer placement.close()
@@ -1400,19 +1529,19 @@ func (r *run) runWorkers(
 	// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
 	// the fixed 2*MinPartSize cap makes it earlier on larger objects.
 	// Size from REMAINING work so a near-complete resume still ramps.
-	window := max(min(2*r.d.opt.MinPartSize, remaining/16), 1)
+	window := max(min(2*r.conc.MinPartSize, remaining/16), 1)
 	r.ramp = &rampState{
 		spawn:     spawn,
 		demote:    retire,
 		now:       time.Now,
-		parts:     r.d.opt.Parts,
+		parts:     r.conc.Parts,
 		floor:     start,
 		window:    window,
 		settleMin: settleFloorFor(r.electDur),
 		admitted:  start,
 		markTime:  time.Now(),
 	}
-	if start >= r.d.opt.Parts || !canRamp {
+	if start >= r.conc.Parts || !canRamp {
 		// No throughput ramp: the floor already fills Parts, or the remaining
 		// work cannot feed every configured connection. The governor still
 		// exists so an explicit 429 can shed eager flows.

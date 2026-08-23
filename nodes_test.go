@@ -233,6 +233,15 @@ func TestDialPreferredClosesRaceLoser(t *testing.T) {
 
 func newPlacementForTest(t *testing.T, opt *Options, resolved []netip.Addr) (*Downloader, *nodePlacement) {
 	t.Helper()
+	return newPlacementForTestWithParts(t, opt, 0, resolved)
+}
+
+// newPlacementForTestWithParts is newPlacementForTest with an effective-Parts
+// override (0 means Options.Parts), as a Policy would produce.
+func newPlacementForTestWithParts(
+	t *testing.T, opt *Options, parts int, resolved []netip.Addr,
+) (*Downloader, *nodePlacement) {
+	t.Helper()
 	configured := *opt
 	configured.EnableNodeSelection = true
 	d, err := New(&configured)
@@ -240,8 +249,13 @@ func newPlacementForTest(t *testing.T, opt *Options, resolved []netip.Addr) (*Do
 		t.Fatal(err)
 	}
 	placeAddresses(d, resolved...)
-	p := d.newNodePlacement(t.Context(), "https://cdn.test/file",
-		"192.0.2.1:443", true, false)
+	if parts == 0 {
+		parts = d.opt.Parts
+	}
+	p := d.newNodePlacement(t.Context(), placementInput{
+		url: "https://cdn.test/file", electionRemote: "192.0.2.1:443", canMultiply: true,
+		parts: parts,
+	})
 	if p == nil {
 		t.Fatal("eligible direct transport did not initialize placement")
 	}
@@ -572,29 +586,17 @@ func TestNodePlacementInapplicablePaths(t *testing.T) {
 		opt      Options
 		rawURL   string
 		multiply bool
-		setup    func(*Downloader)
+		// proxied marks the election as having been routed through a proxy,
+		// which get() determines on the real election request.
+		proxied bool
+		setup   func(*Downloader)
 	}{
 		{name: "zero-value opt out", opt: Options{Parts: 2}, rawURL: "https://cdn.test/file", multiply: true},
 		{name: "single stream scheduler", opt: Options{Parts: 2, EnableNodeSelection: true}, rawURL: "https://cdn.test/file"},
-		{name: "parts one", opt: Options{Parts: 1, EnableNodeSelection: true}, rawURL: "https://cdn.test/file", multiply: true},
 		{name: "literal ip", opt: Options{Parts: 2, EnableNodeSelection: true}, rawURL: "https://192.0.2.10/file", multiply: true},
 		{name: "opaque transport", opt: Options{Parts: 2, EnableNodeSelection: true, Transport: http.DefaultTransport}, rawURL: "https://cdn.test/file", multiply: true},
-		{name: "proxy", opt: Options{Parts: 2, EnableNodeSelection: true}, rawURL: "https://cdn.test/file", multiply: true,
-			setup: func(d *Downloader) {
-				d.base.Proxy = func(*http.Request) (*url.URL, error) {
-					return url.Parse("http://proxy.test")
-				}
-			}},
-		// A caller proxy function may decide per request; a headerless
-		// preflight that happens to answer nil must not enable placement.
-		{name: "custom proxy func answering nil", rawURL: "https://cdn.test/file", multiply: true,
-			opt: Options{Parts: 2, EnableNodeSelection: true,
-				Proxy: func(r *http.Request) (*url.URL, error) {
-					if r.Header.Get("Authorization") != "" {
-						return url.Parse("http://proxy.test")
-					}
-					return nil, nil
-				}}},
+		{name: "proxied election", opt: Options{Parts: 2, EnableNodeSelection: true},
+			rawURL: "https://cdn.test/file", multiply: true, proxied: true},
 		{name: "resolver failure", opt: Options{Parts: 2, EnableNodeSelection: true}, rawURL: "https://cdn.test/file", multiply: true,
 			setup: func(d *Downloader) {
 				d.resolve = func(context.Context, string) ([]netip.Addr, error) {
@@ -623,12 +625,139 @@ func TestNodePlacementInapplicablePaths(t *testing.T) {
 			if tt.setup != nil {
 				tt.setup(d)
 			}
-			if p := d.newNodePlacement(t.Context(), tt.rawURL,
-				"192.0.2.1:443", tt.multiply, false); p != nil {
+			if p := d.newNodePlacement(t.Context(), placementInput{
+				url: tt.rawURL, electionRemote: "192.0.2.1:443", canMultiply: tt.multiply,
+				electionProxied: tt.proxied, parts: d.opt.Parts,
+			}); p != nil {
 				p.close()
 				t.Fatal("inapplicable path initialized node placement")
 			}
 		})
+	}
+}
+
+// TestProxyDecisionBindsToElectionRequest: the transport's wrapper records
+// the routing decision for the request it actually saw — headers included —
+// into the attached proxyRoute. (The refusal itself is covered by the
+// "proxied election" inapplicable-path case and the end-to-end proxy test.)
+func TestProxyDecisionBindsToElectionRequest(t *testing.T) {
+	t.Parallel()
+	d := newDL(t, &Options{Parts: 2, EnableNodeSelection: true,
+		Headers: http.Header{"Authorization": []string{"Bearer token"}},
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			if r.Header.Get("Authorization") != "" {
+				return url.Parse("http://proxy.test")
+			}
+			return nil, nil
+		}})
+	proxyDecision := func(authenticated bool) bool {
+		t.Helper()
+		route := &proxyRoute{}
+		req, err := http.NewRequest(http.MethodGet, "https://cdn.test/file", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(context.WithValue(req.Context(), proxyRouteKey{}, route))
+		if authenticated {
+			d.applyHeaders(req, req.URL)
+		}
+		if _, err := d.base.Proxy(req); err != nil {
+			t.Fatal(err)
+		}
+		return route.proxied
+	}
+	if proxyDecision(false) {
+		t.Fatal("headerless request must be judged direct by this proxy function")
+	}
+	if !proxyDecision(true) {
+		t.Fatal("the authenticated election request must be judged proxied")
+	}
+}
+
+// TestProxiedElectionNeverResolvesForPlacement drives get(): the election is
+// routed through a real forward proxy by a header-keyed proxy function, so
+// the run must refuse placement without ever consulting the resolver.
+func TestProxiedElectionNeverResolvesForPlacement(t *testing.T) {
+	t.Parallel()
+	data := testData(512 << 10)
+	var st stats
+	origin := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	t.Cleanup(origin.Close)
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		// The client asks for a hostname URL; only the proxy knows the origin.
+		out, err := http.NewRequestWithContext(r.Context(), r.Method, origin.URL+r.URL.Path, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		out.Header = r.Header.Clone()
+		resp, err := http.DefaultTransport.RoundTrip(out)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			w.Header()[k] = vs
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(proxy.Close)
+
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second decision for the same request deliberately disagrees, proving
+	// get reads the transport's recorded answer instead of calling Proxy again.
+	var proxyDecisions sync.Map
+	d := newDL(t, &Options{Parts: 4, MinParts: 4, MinPartSize: 64 << 10, EnableNodeSelection: true,
+		Headers: http.Header{"Authorization": []string{"Bearer token"}},
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			if r.Header.Get("Authorization") != "" {
+				if _, loaded := proxyDecisions.LoadOrStore(r, struct{}{}); loaded {
+					return nil, nil
+				}
+				return proxyURL, nil
+			}
+			return nil, nil
+		}})
+	var resolves atomic.Int32
+	d.resolve = func(context.Context, string) ([]netip.Addr, error) {
+		resolves.Add(1)
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}, nil
+	}
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	_, got := mustGet(t, d, "http://cdn.test/file.bin", dest)
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes differ from source")
+	}
+	if proxied.Load() == 0 {
+		t.Fatal("fixture did not route the election through the proxy")
+	}
+	if n := resolves.Load(); n != 0 {
+		t.Fatalf("proxied election consulted the resolver %d times; placement must be refused", n)
+	}
+}
+
+// TestPolicyRaisedPartsReachPlacement: the session cache is sized from the
+// run's effective Parts, not the Options value.
+func TestPolicyRaisedPartsReachPlacement(t *testing.T) {
+	t.Parallel()
+	_, p := newPlacementForTestWithParts(t, &Options{Parts: 2,
+		Policy: func(string) Concurrency { return Concurrency{Parts: 16, MinParts: 16} },
+	}, 16, []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")})
+	// Fill beyond the Options-sized cache (2*2 -> clamped to 8) and verify the
+	// policy-sized cache (2*16 = 32) retains the earliest session.
+	cache := p.tlsConfig.ClientSessionCache
+	for i := range 20 {
+		cache.Put(fmt.Sprintf("k%d", i), &tls.ClientSessionState{})
+	}
+	if _, ok := cache.Get("k0"); !ok {
+		t.Fatal("session cache sized from Options.Parts, not the policy's Parts")
 	}
 }
 
@@ -719,8 +848,9 @@ func TestNodeResolverReceivesBoundedContext(t *testing.T) {
 		deadline, _ = ctx.Deadline()
 		return nil, errors.New("fixture resolver failure")
 	}
-	if p := d.newNodePlacement(t.Context(), "https://cdn.test/file",
-		"192.0.2.1:443", true, false); p != nil {
+	if p := d.newNodePlacement(t.Context(), placementInput{
+		url: "https://cdn.test/file", electionRemote: "192.0.2.1:443", canMultiply: true, parts: 2,
+	}); p != nil {
 		p.close()
 		t.Fatal("failed resolver initialized placement")
 	}

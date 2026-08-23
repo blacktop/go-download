@@ -144,6 +144,28 @@ once and the governor never retires below it (`MinParts == Parts` is fixed
 parallelism); an explicit 429 still sheds eager flows. See the `Options`
 documentation for how small objects clamp the floor.
 
+`Options.Policy` applies such choices per resource: it is called with the
+byte-serving URL (after redirects) before any additional range request, and
+its zero fields keep the `Options` values. `Result.FinalURL` reports the same
+URL. When a policy only lowers `Parts`, an inherited `MinParts` is clamped to
+fit; explicitly returning `MinParts > Parts` fails that download.
+
+```go
+Policy: func(finalURL string) download.Concurrency {
+    u, err := url.Parse(finalURL)
+    if err != nil {
+        return download.Concurrency{}
+    }
+    host := download.NormalizeHost(u.Hostname())
+    const appleCDN = "cdn-apple.com"
+    if host == appleCDN || strings.HasSuffix(host, "."+appleCDN) {
+        // fixed parallelism, smaller splits
+        return download.Concurrency{Parts: 8, MinParts: 8, MinPartSize: 8 << 20}
+    }
+    return download.Concurrency{}
+},
+```
+
 Apple M5 Max, Go 1.27, August 21, 2026 (6 runs each, benchstat medians):
 
 | Workload | Baseline | `go-download` | Result |

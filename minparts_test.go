@@ -34,8 +34,8 @@ func TestMinPartsValidation(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("New(%+v) err = %v, wantErr %t", tc.opt, err, tc.wantErr)
 			}
-			if err == nil && tc.opt.MinParts == 0 && d.opt.MinParts != 1 {
-				t.Fatalf("default MinParts = %d, want 1", d.opt.MinParts)
+			if err == nil && tc.opt.MinParts == 0 && d.opt.MinParts != DefaultMinParts {
+				t.Fatalf("default MinParts = %d, want %d", d.opt.MinParts, DefaultMinParts)
 			}
 		})
 	}
@@ -325,15 +325,15 @@ func newElectionHarness(t *testing.T, size int) *electionHarness {
 	t.Cleanup(srv.Close)
 	d := newDL(t, &Options{Parts: 2, MinPartSize: 1 << 10})
 	h := newRetireHarness(t, d, srv.URL, int64(len(data)))
-	resp, addr, cancel, err := d.elect(t.Context(), srv.URL+"/file.bin")
+	elected, err := d.elect(t.Context(), srv.URL+"/file.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != http.StatusPartialContent {
-		t.Fatalf("election status = %d, want 206", resp.StatusCode)
+	if elected.resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("election status = %d, want 206", elected.resp.StatusCode)
 	}
-	resp.Body = &closeOnceBody{ReadCloser: resp.Body}
-	h.r.initial, h.r.initialAddr, h.r.initialCancel = resp, addr, cancel
+	elected.resp.Body = &closeOnceBody{ReadCloser: elected.resp.Body}
+	h.r.initial, h.r.initialAddr, h.r.initialCancel = elected.resp, elected.remoteAddr, elected.cancel
 	t.Cleanup(h.r.closeInitial)
 	return &electionHarness{retireHarness: h, data: data, st: st}
 }

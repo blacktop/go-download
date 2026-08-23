@@ -662,7 +662,8 @@ func TestOptionsValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.opt.Parts != defaultParts || d.opt.MinPartSize != defaultMinPartSize {
+	if d.opt.Parts != DefaultParts || d.opt.MinParts != DefaultMinParts ||
+		d.opt.MinPartSize != DefaultMinPartSize {
 		t.Error("nil Options must select defaults")
 	}
 }

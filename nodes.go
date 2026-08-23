@@ -103,51 +103,44 @@ type nodePlacement struct {
 	samplerDone   chan struct{}
 }
 
+// placementInput is what a run knows when it decides whether to place
+// connections: the byte-serving URL, how its election was routed and where
+// it landed, and the effective concurrency.
+type placementInput struct {
+	url             string
+	electionRemote  string
+	electionProxied bool
+	electionInUse   bool // the election body is still open for the byte-zero worker
+	canMultiply     bool // the scheduler can feed more than one connection
+	parts           int  // effective Parts after Options.Policy
+}
+
 // newNodePlacement enables placement only for an owned, direct, multipart
 // HTTP/1.1 transport whose final redirected hostname has at least two usable
 // addresses. Every inapplicable or discovery-failure path deliberately falls
 // back to the existing base transport.
-func (d *Downloader) newNodePlacement(
-	ctx context.Context, rawURL, electionRemote string,
-	schedulerCanMultiply, electionInUse bool,
-) *nodePlacement {
-	if !d.opt.EnableNodeSelection || !schedulerCanMultiply || d.opt.Parts <= 1 || d.base == nil {
+func (d *Downloader) newNodePlacement(ctx context.Context, in placementInput) *nodePlacement {
+	if !d.opt.EnableNodeSelection || !in.canMultiply || d.base == nil {
 		return nil
 	}
-	u, err := url.Parse(rawURL)
+	if in.electionProxied {
+		// Decided on the real election request (headers, cookies, redirects),
+		// never a synthetic preflight: a proxied election's remote is the
+		// proxy, which must not seed the origin pool.
+		d.log.Debug("node selection disabled for proxy route", "url", redactURL(in.url))
+		return nil
+	}
+	u, err := url.Parse(in.url)
 	if err != nil {
 		return nil
 	}
-	host := normalizeHostname(u.Hostname())
+	host := NormalizeHost(u.Hostname())
 	if host == "" {
 		return nil
 	}
 	if _, err := netip.ParseAddr(host); err == nil {
 		return nil
 	}
-	if d.opt.Proxy != nil {
-		// A caller-supplied proxy function may decide per request (headers,
-		// cookies, host). A headerless preflight cannot predict it, so treat
-		// it as opaque: placement must never dial origin addresses directly
-		// while the effective requests are proxied.
-		d.log.Debug("node selection disabled for custom proxy function", "url", redactURL(rawURL))
-		return nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil
-	}
-	if d.base.Proxy != nil {
-		// Environment proxy selection depends only on the URL, so a preflight
-		// answers exactly what every worker request will be told.
-		proxyURL, proxyErr := d.base.Proxy(req)
-		if proxyErr != nil || proxyURL != nil {
-			d.log.Debug("node selection disabled for proxy route", "url", redactURL(rawURL),
-				"proxy_error", proxyErr)
-			return nil
-		}
-	}
-
 	resolveCtx, cancelResolve := context.WithTimeout(ctx, nodeResolutionTimeout)
 	addrs, err := d.resolve(resolveCtx, host)
 	cancelResolve()
@@ -155,7 +148,7 @@ func (d *Downloader) newNodePlacement(
 		d.log.Debug("node selection disabled after resolver failure", "host", host, "err", err)
 		return nil
 	}
-	election, _ := canonicalRemoteAddr(electionRemote)
+	election, _ := canonicalRemoteAddr(in.electionRemote)
 	ordered := orderNodeAddresses(election, addrs)
 	if len(ordered) < 2 {
 		return nil
@@ -166,7 +159,7 @@ func (d *Downloader) newNodePlacement(
 		tlsConfig = d.opt.TLSConfig.Clone()
 	}
 	if tlsConfig.ClientSessionCache == nil {
-		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(max(8, 2*d.opt.Parts))
+		tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(max(8, 2*in.parts))
 	}
 
 	p := &nodePlacement{
@@ -174,7 +167,7 @@ func (d *Downloader) newNodePlacement(
 		host:            host,
 		port:            portOf(u),
 		election:        election,
-		electionPending: electionInUse && election.IsValid(),
+		electionPending: in.electionInUse && election.IsValid(),
 		byAddr:          make(map[netip.Addr]*nodeAddress, len(ordered)),
 		workers:         make(map[int]*placedWorker),
 		tlsConfig:       tlsConfig,
@@ -190,7 +183,11 @@ func (d *Downloader) newNodePlacement(
 	return p
 }
 
-func normalizeHostname(host string) string {
+// NormalizeHost canonicalizes a hostname for comparison: lower-cased, with
+// surrounding whitespace and one trailing dot removed. It is the form node
+// selection uses to match dial targets and the one callers should use when
+// classifying hosts for Options.Policy.
+func NormalizeHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 }
 
@@ -532,7 +529,7 @@ func (p *nodePlacement) createTransport(id int, primary netip.Addr) *http.Transp
 
 func (p *nodePlacement) matchesTarget(target string) bool {
 	host, port, err := net.SplitHostPort(target)
-	return err == nil && normalizeHostname(host) == p.host && port == p.port
+	return err == nil && NormalizeHost(host) == p.host && port == p.port
 }
 
 func (p *nodePlacement) closeTransport(id int) {
