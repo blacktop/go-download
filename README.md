@@ -95,6 +95,26 @@ dl, err := download.New(&download.Options{
 })
 ```
 
+One downloader can serve a whole transport/authentication session. Put
+artifact-specific headers, checksums, reporters, and signed-URL resume identity
+on each request; request header values replace option-level values with the
+same canonical name:
+
+```go
+res, err := dl.Do(ctx, &download.Request{
+    URL:      signedURL,
+    Dest:     destination,
+    Headers:  http.Header{"Authorization": {"Bearer " + token}},
+    ResumeID: stableOriginAndPath,
+})
+```
+
+`Do` snapshots the request header map and its value slices before networking,
+so the caller may safely reuse or mutate them after invocation. Sensitive
+headers retain `net/http`'s redirect protections. An empty request `ResumeID`
+inherits `Options.ResumeID`; validators and expected size still decide whether
+partial data is reusable.
+
 When explicitly enabled, node selection applies only to eligible multipart
 downloads using the built-in direct transport and at least two discovered
 addresses. It preserves the URL hostname for HTTP, TLS SNI, cookies, and

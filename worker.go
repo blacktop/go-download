@@ -259,6 +259,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 		}
 		throttled := errors.Is(err, StatusError(http.StatusTooManyRequests))
 		if throttled {
+			w.r.measurement.throttle()
 			// While siblings ARE progressing, waiting out the throttle is
 			// queued work rather than failure, so it costs no retry budget —
 			// a server admitting one range at a time must serialize us, not
@@ -267,6 +268,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			if cur := w.r.progress.Load(); cur > chargedAt {
 				chargedAt = cur
 				w.r.d.log.Debug("waiting out server throttle", "worker", w.id, "chunk", c.id)
+				w.r.measurement.retry()
 				if serr := w.sleep(ctx, time.Second); serr != nil {
 					return err
 				}
@@ -279,6 +281,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			return fmt.Errorf("chunk %d: %w: %w", c.id, ErrMaxRetry, err)
 		}
 		w.r.rep.ChunkRetry(c.id, attempt, err)
+		w.r.measurement.retry()
 		w.r.d.log.Debug("retrying chunk", "worker", w.id, "chunk", c.id,
 			"attempt", attempt, "err", err)
 		// 429s always sleep the flat politeness pause and never touch
@@ -378,6 +381,7 @@ func (w *worker) recordGotConn(chunkID int, ci httptrace.GotConnInfo) {
 		addr = w.place.gotConn(w.id, addr)
 	}
 	w.r.rep.Connected(chunkID, addr)
+	w.r.measurement.connected(addr)
 }
 
 func (w *worker) initialRangeAttempt(
@@ -408,6 +412,7 @@ func (w *worker) initialRangeAttempt(
 	defer timer.Stop()
 	if addr != "" {
 		w.r.rep.Connected(c.id, addr)
+		w.r.measurement.connected(addr)
 	}
 	if resp.StatusCode != http.StatusPartialContent {
 		_ = resp.Body.Close()
@@ -731,6 +736,9 @@ func (w *worker) singleStream(ctx context.Context) error {
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, StatusError(http.StatusTooManyRequests)) {
+			w.r.measurement.throttle()
+		}
 		if ctx.Err() != nil {
 			return err
 		}
@@ -741,6 +749,7 @@ func (w *worker) singleStream(ctx context.Context) error {
 			return fmt.Errorf("%w: %w", ErrMaxRetry, err)
 		}
 		w.r.rep.ChunkRetry(0, attempt+1, err)
+		w.r.measurement.retry()
 		if serr := w.sleep(ctx, w.bo.next()); serr != nil {
 			return err
 		}
@@ -849,6 +858,7 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 		defer stop()
 		if addr != "" {
 			w.r.rep.Connected(0, addr)
+			w.r.measurement.connected(addr)
 		}
 	}
 	timer := time.AfterFunc(w.timeout, func() { cancel(errStall) })

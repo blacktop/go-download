@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -90,6 +92,92 @@ func TestDoPerRequestReporterAndChecksum(t *testing.T) {
 	}
 
 	d.CloseIdleConnections() // smoke: must be safe on a live engine
+}
+
+func TestDoSnapshotsAndMergesRequestHeaders(t *testing.T) {
+	t.Parallel()
+	data := testData(128 << 10)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var first sync.Once
+	var mu sync.Mutex
+	var received []http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first.Do(func() {
+			close(started)
+			<-release
+		})
+		mu.Lock()
+		received = append(received, r.Header.Clone())
+		mu.Unlock()
+		if r.Header.Get("Range") == "bytes=0-" {
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", 4095, len(data)))
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:4096])
+			return
+		}
+		writeBareRange(w, r, data, `"v1"`)
+	}))
+	t.Cleanup(srv.Close)
+
+	optionHeaders := http.Header{
+		"X-Layer":       {"option-one", "option-two"},
+		"X-Option-Only": {"option-original"},
+	}
+	d := newDL(t, &Options{
+		Parts: 2, MinParts: 2, MinPartSize: 4 << 10, Headers: optionHeaders,
+	})
+	// New owns the option header map and its value slices.
+	optionHeaders["X-Layer"][0] = "option-mutated"
+	optionHeaders.Set("X-Option-Only", "option-mutated")
+
+	requestHeaders := http.Header{
+		"x-layer":        {"request-one", "request-two"},
+		"X-Request-Only": {"request-original"},
+	}
+	req := &Request{
+		URL: srv.URL + "/file.bin", Dest: filepath.Join(t.TempDir(), "file.bin"),
+		Headers: requestHeaders,
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.Do(t.Context(), req)
+		done <- err
+	}()
+
+	<-started
+	// Do has crossed its ownership boundary. Later changes to either the map or
+	// an existing value slice must not change worker requests.
+	requestHeaders["x-layer"][0] = "request-mutated"
+	requestHeaders.Set("X-Request-Only", "request-mutated")
+	requestHeaders.Set("X-Late", "late")
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) < 2 {
+		t.Fatalf("server saw %d requests, want election plus worker requests", len(received))
+	}
+	for i, header := range received {
+		if got := header.Values("X-Layer"); !slices.Equal(got, []string{"request-one", "request-two"}) {
+			t.Errorf("request %d merged X-Layer = %q", i, got)
+		}
+		if got := header.Get("X-Option-Only"); got != "option-original" {
+			t.Errorf("request %d option snapshot = %q", i, got)
+		}
+		if got := header.Get("X-Request-Only"); got != "request-original" {
+			t.Errorf("request %d request snapshot = %q", i, got)
+		}
+		if got := header.Get("X-Late"); got != "" {
+			t.Errorf("request %d observed late header %q", i, got)
+		}
+	}
 }
 
 func TestDoInvalidPerRequestChecksum(t *testing.T) {

@@ -274,6 +274,10 @@ func New(opt *Options) (*Downloader, error) {
 	if o.ExpectedSHA1, err = normalizeChecksum(o.ExpectedSHA1, sha1HexLen, "ExpectedSHA1"); err != nil {
 		return nil, err
 	}
+	// The Downloader owns its option-level header map and value slices. A
+	// caller may reuse or mutate the Options after New returns without racing
+	// future requests.
+	o.Headers = canonicalHeaderClone(o.Headers)
 	var reportSem chan struct{}
 	if o.Reporter != nil {
 		reportSem = make(chan struct{}, 1)
@@ -363,16 +367,48 @@ func (d *Downloader) newClient(rt http.RoundTripper) *http.Client {
 	return &http.Client{Transport: rt, Jar: d.opt.Jar}
 }
 
-func (d *Downloader) applyHeaders(req *http.Request, source *url.URL) {
+func applyHeaders(req *http.Request, headers http.Header, source *url.URL) {
 	copySensitive := shouldCopySensitiveHeaders(source, req.URL)
-	for k, vs := range d.opt.Headers {
+	for k, vs := range headers {
 		if !copySensitive && isSensitiveRequestHeader(k) {
 			continue
 		}
-		for _, v := range vs {
-			req.Header.Add(k, v)
-		}
+		// Replace rather than append. The resolved set already merged option
+		// and request values, and retries must not accumulate duplicates.
+		req.Header[k] = slices.Clone(vs)
 	}
+}
+
+// canonicalHeaderClone owns every value slice and folds equivalent header
+// names into one canonical key. Duplicate spellings within one input retain
+// their values; mergeHeaders decides precedence between layers.
+func canonicalHeaderClone(src http.Header) http.Header {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(http.Header, len(src))
+	keys := slices.Sorted(maps.Keys(src))
+	for _, key := range keys {
+		canonical := http.CanonicalHeaderKey(key)
+		if canonical == "" {
+			canonical = key
+		}
+		out[canonical] = append(out[canonical], src[key]...)
+	}
+	return out
+}
+
+// mergeHeaders resolves immutable request headers. Per-request values replace
+// the complete option-level slice for the same canonical header name.
+func mergeHeaders(options, request http.Header) http.Header {
+	merged := canonicalHeaderClone(options)
+	if merged == nil && len(request) > 0 {
+		merged = make(http.Header, len(request))
+	}
+	for key, values := range canonicalHeaderClone(request) {
+		merged[key] = slices.Clone(values)
+	}
+	return merged
 }
 
 // isSensitiveRequestHeader mirrors the header set protected by net/http
@@ -425,6 +461,15 @@ type Request struct {
 	// this download (hex; empty falls back).
 	ExpectedSHA256 string
 	ExpectedSHA1   string
+	// Headers are merged over Options.Headers by canonical name. A request
+	// value replaces the complete option-level value slice. The map and value
+	// slices are cloned when Do begins, so later caller mutation cannot change
+	// this run.
+	Headers http.Header
+	// ResumeID overrides Options.ResumeID for this download. Empty inherits the
+	// option-level identity. Validators and expected size remain authoritative
+	// before staged bytes are reused.
+	ResumeID string
 }
 
 // Get downloads url to dest. dest may be an explicit file path, an existing
@@ -440,6 +485,9 @@ func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
 	if req == nil {
 		return nil, errors.New("nil Request")
 	}
+	// Snapshot scalar request state before any reporter serialization can block.
+	// Headers are deeply cloned below.
+	rawURL, dest := req.URL, req.Dest
 	sha256sum, err := normalizeChecksum(req.ExpectedSHA256, sha256HexLen, "ExpectedSHA256")
 	if err != nil {
 		return nil, err
@@ -454,6 +502,12 @@ func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
 	if sha1sum == "" {
 		sha1sum = d.opt.ExpectedSHA1
 	}
+	resumeID := d.opt.ResumeID
+	if req.ResumeID != "" {
+		resumeID = req.ResumeID
+	}
+	headers := mergeHeaders(d.opt.Headers, req.Headers)
+	measurement := newRunMeasurement(ctx, d.log)
 	rep := req.Reporter
 	if rep == nil {
 		rep = d.rep
@@ -469,12 +523,15 @@ func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
 	}
 	start := time.Now()
 	res, err := d.get(ctx, &resolvedRequest{
-		url: req.URL, dest: req.Dest, rep: rep,
-		sha256: sha256sum, sha1: sha1sum,
+		url: rawURL, dest: dest, rep: rep,
+		sha256: sha256sum, sha1: sha1sum, headers: headers, resumeID: resumeID,
+		measurement: measurement,
 	})
+	elapsed := time.Since(start)
 	if res != nil {
-		res.Elapsed = time.Since(start)
+		res.Elapsed = elapsed
 	}
+	measurement.log(ctx, d.log, elapsed, res, err)
 	rep.Done(err)
 	return res, err
 }
@@ -484,6 +541,9 @@ type resolvedRequest struct {
 	url, dest    string
 	rep          Reporter
 	sha256, sha1 string
+	headers      http.Header
+	resumeID     string
+	measurement  *runMeasurement
 }
 
 type proxyRouteKey struct{}
@@ -515,7 +575,7 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 	electStart := time.Now()
-	elected, err := d.elect(ctx, rawURL)
+	elected, err := d.elect(ctx, rawURL, sourceURL, rq.headers, rq.measurement)
 	if err != nil {
 		return nil, err
 	}
@@ -533,6 +593,7 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 	if err != nil {
 		return fail(err)
 	}
+	rq.measurement.configure(resp.Request.URL, resp.Proto, conc, rq.sha256 != "" || rq.sha1 != "")
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
 	contentType := resp.Header.Get("Content-Type")
@@ -576,6 +637,9 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		rep:             rq.rep,
 		sha256:          rq.sha256,
 		sha1:            rq.sha1,
+		headers:         rq.headers,
+		resumeID:        rq.resumeID,
+		measurement:     rq.measurement,
 		url:             finalURL,
 		conc:            conc,
 		electionProxied: elected.proxied,
@@ -766,11 +830,16 @@ type election struct {
 	cancel     context.CancelCauseFunc
 }
 
-func (d *Downloader) elect(ctx context.Context, rawURL string) (election, error) {
+const electionAttempts = 3
+
+func (d *Downloader) elect(
+	ctx context.Context, rawURL string, sourceURL *url.URL, headers http.Header,
+	measurement *runMeasurement,
+) (election, error) {
 	client := d.newClient(d.roundTripper())
 	var bo backoff
 	var lastErr error
-	for attempt := range 3 {
+	for attempt := range electionAttempts {
 		if attempt > 0 {
 			if err := sleepCtx(ctx, bo.next()); err != nil {
 				return election{}, err
@@ -784,7 +853,7 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (election, error)
 			ecancel(nil)
 			return election{}, fmt.Errorf("build request: %w", err)
 		}
-		d.applyHeaders(req, req.URL)
+		applyHeaders(req, headers, sourceURL)
 		req.Header.Set("Range", "bytes=0-")
 		var remoteAddr string
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
@@ -800,6 +869,9 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (election, error)
 				return election{}, err
 			}
 			lastErr = err
+			if attempt+1 < electionAttempts {
+				measurement.retry()
+			}
 			continue
 		}
 		switch {
@@ -813,6 +885,12 @@ func (d *Downloader) elect(ctx context.Context, rawURL string) (election, error)
 			resp.Body.Close()
 			ecancel(nil)
 			lastErr = StatusError(resp.StatusCode)
+			if attempt+1 < electionAttempts {
+				measurement.retry()
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				measurement.throttle()
+			}
 		default:
 			resp.Body.Close()
 			ecancel(nil)
@@ -1013,6 +1091,8 @@ type run struct {
 	conc        Concurrency
 	sha256      string
 	sha1        string
+	headers     http.Header
+	resumeID    string
 	url         string
 	sourceURL   *url.URL
 	destPath    string
@@ -1047,8 +1127,9 @@ type run struct {
 	// ramp is the adaptive-concurrency governor; nil on the single-stream
 	// path. Its throughput ramp may be finished from the start, but its
 	// throttle control stays live for the run.
-	ramp      *rampState
-	placement *nodePlacement
+	ramp        *rampState
+	placement   *nodePlacement
+	measurement *runMeasurement
 }
 
 // closeOnceBody lets the worker timeout close an initial response to unblock a
@@ -1108,7 +1189,7 @@ func (r *run) hasInitial() bool {
 func (r *run) name() string { return filepath.Base(r.destPath) }
 
 func (r *run) applyHeaders(req *http.Request) {
-	r.d.applyHeaders(req, r.sourceURL)
+	applyHeaders(req, r.headers, r.sourceURL)
 }
 
 // validator returns the If-Range value proving the content is unchanged
@@ -1131,7 +1212,7 @@ func (r *run) resumable() bool {
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
 	sched := newScheduler(r.conc.MinPartSize)
-	sourceID := resumeIdentity(r.d.opt.ResumeID, r.sourceURL)
+	sourceID := resumeIdentity(r.resumeID, r.sourceURL)
 
 	flag := os.O_RDWR | os.O_CREATE
 	file, err := os.OpenFile(r.partPath, flag, 0o644)
@@ -1476,6 +1557,7 @@ func (r *run) runWorkers(
 	placement := r.d.newNodePlacement(runCtx, r.placementInput(start > 1 || canRamp))
 	if placement != nil {
 		r.placement = placement
+		r.measurement.setPlacement(true)
 		defer placement.close()
 	}
 

@@ -659,7 +659,7 @@ func TestProxyDecisionBindsToElectionRequest(t *testing.T) {
 		}
 		req = req.WithContext(context.WithValue(req.Context(), proxyRouteKey{}, route))
 		if authenticated {
-			d.applyHeaders(req, req.URL)
+			applyHeaders(req, d.opt.Headers, req.URL)
 		}
 		if _, err := d.base.Proxy(req); err != nil {
 			t.Fatal(err)

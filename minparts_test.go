@@ -325,7 +325,12 @@ func newElectionHarness(t *testing.T, size int) *electionHarness {
 	t.Cleanup(srv.Close)
 	d := newDL(t, &Options{Parts: 2, MinPartSize: 1 << 10})
 	h := newRetireHarness(t, d, srv.URL, int64(len(data)))
-	elected, err := d.elect(t.Context(), srv.URL+"/file.bin")
+	rawURL := srv.URL + "/file.bin"
+	sourceURL, err := parseURL(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elected, err := d.elect(t.Context(), rawURL, sourceURL, d.opt.Headers, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

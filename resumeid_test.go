@@ -2,11 +2,14 @@ package download
 
 import (
 	"bytes"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -125,5 +128,92 @@ func TestResumeIDStillHonoursValidators(t *testing.T) {
 	}
 	if res.Resumed {
 		t.Fatal("stale ETag must invalidate the sidecar even with a matching ResumeID")
+	}
+}
+
+func TestConcurrentRequestAuthAndResumeIsolation(t *testing.T) {
+	t.Parallel()
+	data := testData(256 << 10)
+	var st stats
+	var mu sync.Mutex
+	observed := make(map[string][]http.Header)
+	serveRange := rangeHandler(data, `"v1"`, &st)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		observed[r.URL.Path] = append(observed[r.URL.Path], r.Header.Clone())
+		mu.Unlock()
+		serveRange.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	type downloadCase struct {
+		path, auth, cookie, resumeID string
+	}
+	cases := []downloadCase{
+		{path: "/a.ipa", auth: "Bearer request-a", cookie: "asset=a", resumeID: "asset-a"},
+		{path: "/b.ipa", auth: "Bearer request-b", cookie: "asset=b", resumeID: "asset-b"},
+	}
+	d := newDL(t, &Options{
+		Parts: 2, MinParts: 2, MinPartSize: 16 << 10,
+		Headers: http.Header{
+			"Authorization": {"Bearer option"},
+			"Cookie":        {"asset=option"},
+			"X-Session":     {"shared"},
+		},
+		ResumeID: "option-resume-id",
+	})
+	dir := t.TempDir()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, len(cases))
+	for _, tc := range cases {
+		urlText := srv.URL + tc.path + "?credential=rotating"
+		sourceURL, err := url.Parse(urlText)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dest := filepath.Join(dir, filepath.Base(tc.path))
+		seedInterruptedDownload(t, dest, data, resumeIdentity(tc.resumeID, sourceURL))
+		wg.Go(func() {
+			res, err := d.Do(t.Context(), &Request{
+				URL: urlText, Dest: dest, ResumeID: tc.resumeID,
+				Headers: http.Header{
+					"authorization": {tc.auth},
+					"cookie":        {tc.cookie},
+				},
+			})
+			if err == nil && !res.Resumed {
+				err = fmt.Errorf("%s did not use its request ResumeID", tc.path)
+			}
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, tc := range cases {
+		headers := observed[tc.path]
+		if len(headers) < 2 {
+			t.Errorf("%s saw %d requests, want election plus resumed tail", tc.path, len(headers))
+			continue
+		}
+		for i, header := range headers {
+			if got := header.Get("Authorization"); got != tc.auth {
+				t.Errorf("%s request %d auth = %q, want %q", tc.path, i, got, tc.auth)
+			}
+			if got := header.Get("Cookie"); got != tc.cookie {
+				t.Errorf("%s request %d cookie = %q, want %q", tc.path, i, got, tc.cookie)
+			}
+			if got := header.Get("X-Session"); got != "shared" {
+				t.Errorf("%s request %d lost shared header: %q", tc.path, i, got)
+			}
+		}
 	}
 }

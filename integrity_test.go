@@ -66,6 +66,14 @@ func TestRedirectSensitiveHeadersNotReapplied(t *testing.T) {
 		mu.Lock()
 		received = append(received, r.Header.Clone())
 		mu.Unlock()
+		if r.Header.Get("Range") == "bytes=0-" {
+			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", 4095, len(data)))
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:4096])
+			return
+		}
 		writeBareRange(w, r, data, `"v1"`)
 	}))
 	defer target.Close()
@@ -81,15 +89,32 @@ func TestRedirectSensitiveHeadersNotReapplied(t *testing.T) {
 
 	d := newDL(t, &Options{
 		Parts:       2,
+		MinParts:    2,
 		MinPartSize: 4 << 10,
 		Headers: http.Header{
-			"Authorization":       {"Bearer origin-secret"},
-			"Cookie":              {"session=origin-secret"},
-			"Proxy-Authorization": {"Basic origin-secret"},
-			"X-Trace":             {"safe-trace"},
+			"Authorization":       {"Bearer option-secret"},
+			"Cookie":              {"session=option-secret"},
+			"Proxy-Authorization": {"Basic option-secret"},
+			"X-Trace":             {"option-trace"},
 		},
 	})
-	_, got := mustGet(t, d, sourceURL, filepath.Join(t.TempDir(), "file.bin"))
+	dest := filepath.Join(t.TempDir(), "file.bin")
+	_, err := d.Do(t.Context(), &Request{
+		URL: sourceURL, Dest: dest,
+		Headers: http.Header{
+			"authorization":       {"Bearer request-secret"},
+			"cookie":              {"session=request-secret"},
+			"proxy-authorization": {"Basic request-secret"},
+			"x-trace":             {"safe-trace"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("redirected download differs from source")
 	}
@@ -97,12 +122,12 @@ func TestRedirectSensitiveHeadersNotReapplied(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, name := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
-		if value := originHeader.Get(name); value == "" {
-			t.Errorf("origin request did not receive configured %s", name)
+		if value := originHeader.Get(name); !strings.Contains(value, "request-secret") {
+			t.Errorf("origin request %s = %q, want request override", name, value)
 		}
 	}
-	if len(received) != 1 {
-		t.Fatalf("target saw %d requests, want one useful redirected request", len(received))
+	if len(received) < 2 {
+		t.Fatalf("target saw %d requests, want redirect plus direct worker requests", len(received))
 	}
 	for i, h := range received {
 		for _, name := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
