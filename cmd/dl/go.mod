@@ -3,7 +3,7 @@ module github.com/blacktop/go-download/cmd/dl
 go 1.26
 
 require (
-	github.com/blacktop/go-download v0.2.3
+	github.com/blacktop/go-download v0.2.4
 	github.com/charmbracelet/log v1.0.0
 	github.com/spf13/cobra v1.10.2
 	github.com/vbauerster/mpb/v8 v8.15.2
