@@ -2,12 +2,16 @@ package download
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,7 +27,9 @@ const (
 )
 
 var (
-	errStall = errors.New("read stalled")
+	errStall           = errors.New("read stalled")
+	errSlowNode        = errors.New("slow node culled")
+	errNodeUnavailable = errors.New("node address unavailable")
 	// errWorkerRetired is the cancellation cause used to wake and gracefully
 	// stop a worker the ramp demoted; it must never surface as a download
 	// failure.
@@ -40,14 +46,66 @@ type permanentError struct{ err error }
 func (e *permanentError) Error() string { return e.err.Error() }
 func (e *permanentError) Unwrap() error { return e.err }
 
+type nodeRotationError struct {
+	addrs     []netip.Addr
+	err       error
+	permanent error
+}
+
+func (e *nodeRotationError) Error() string { return e.err.Error() }
+func (e *nodeRotationError) Unwrap() error { return e.err }
+
+// rotationBudget grants one budget-free attempt per unique failed address,
+// then one DNS refresh, before an address failure falls back to the ordinary
+// retry budget. A retained permanent cause (a bad certificate) regains
+// precedence once every rotation is spent.
+type rotationBudget struct {
+	tried     map[netip.Addr]struct{}
+	refreshed bool
+	permanent error
+}
+
+// admit reports whether rotation r earns a free retry; otherwise it returns
+// the permanent cause to surface, if any.
+func (b *rotationBudget) admit(
+	ctx context.Context, place *nodePlacement, r *nodeRotationError,
+) (free bool, permanent error) {
+	if r.permanent != nil {
+		b.permanent = r.permanent
+	}
+	if b.tried == nil {
+		b.tried = make(map[netip.Addr]struct{})
+	}
+	for _, addr := range r.addrs {
+		if _, seen := b.tried[addr]; !seen {
+			b.tried[addr] = struct{}{}
+			free = true
+		}
+	}
+	if free {
+		return true, nil
+	}
+	if !b.refreshed && place != nil {
+		b.refreshed = true
+		place.refresh(ctx)
+		return true, nil
+	}
+	return false, b.permanent
+}
+
 // worker owns one connection slot: it pulls chunks from the scheduler and
 // downloads each with retry and stall detection.
 type worker struct {
-	id      int
-	r       *run
-	sched   *scheduler
-	file    *os.File
-	client  *http.Client
+	id     int
+	r      *run
+	sched  *scheduler
+	file   *os.File
+	client *http.Client
+	place  *nodePlacement
+	// gotConn records whether the current attempt obtained a connection; a
+	// failure before that point is connection establishment, not the server.
+	gotConn atomic.Bool
+	placed  *placedWorker
 	timeout time.Duration
 	dtt     int // full buffers until the next timeout decay step
 	bo      backoff
@@ -72,6 +130,7 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File) *worker {
 		r:       r,
 		sched:   sched,
 		file:    file,
+		place:   r.placement,
 		timeout: r.d.opt.Timeout,
 		buf:     *bp,
 		bufp:    bp,
@@ -79,6 +138,9 @@ func newWorker(id int, r *run, sched *scheduler, file *os.File) *worker {
 	}
 	if r.d.sleepHook != nil {
 		w.sleep = r.d.sleepHook
+	}
+	if w.place != nil {
+		w.placed = w.place.registerWorker(id)
 	}
 	return w
 }
@@ -97,6 +159,7 @@ func (w *worker) releaseBuf() {
 // run pulls chunks until the scheduler has nothing left for this worker.
 func (w *worker) run(ctx context.Context) error {
 	defer w.releaseBuf()
+	defer w.closePlacement()
 	defer w.sched.exit(w.id)
 	for {
 		if ctx.Err() != nil {
@@ -152,6 +215,7 @@ func genuineUnderRetirement(err error) bool {
 // re-downloads written bytes.
 func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 	attempt := 0
+	var rotations rotationBudget
 	chargedAt := w.r.progress.Load()
 	for {
 		err := w.attempt(ctx, c)
@@ -178,6 +242,20 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 			// immediately without charging progress against the retry budget.
 			w.r.d.log.Debug("continuing capped range", "worker", w.id, "chunk", c.id)
 			continue
+		}
+		if errors.Is(err, errSlowNode) {
+			w.r.d.log.Debug("retrying chunk after slow-node migration",
+				"worker", w.id, "chunk", c.id)
+			continue
+		}
+		if rotation, ok := errors.AsType[*nodeRotationError](err); ok {
+			if free, perm := rotations.admit(ctx, w.place, rotation); perm != nil {
+				return &permanentError{perm}
+			} else if free {
+				w.r.d.log.Debug("rotating after address failure",
+					"worker", w.id, "chunk", c.id, "err", rotation.err)
+				continue
+			}
 		}
 		throttled := errors.Is(err, StatusError(http.StatusTooManyRequests))
 		if throttled {
@@ -222,6 +300,10 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 	if !todo {
 		return nil
 	}
+	if w.placed != nil && w.placed.rotate.Swap(false) {
+		// A cull landed between attempts: re-reserve before dialing.
+		w.dropPlacementTransport()
+	}
 	if cursor == 0 {
 		// The election body starts at byte zero: whichever worker is granted
 		// that chunk consumes it instead of issuing a duplicate request.
@@ -229,15 +311,25 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 			return w.initialRangeAttempt(ctx, c, end, resp, addr, ecancel)
 		}
 	}
-	w.ensureClient()
+	if err := w.ensureClient(); err != nil {
+		return err
+	}
 
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	defer w.place.beginAttempt(w.placed, cancel)()
 	timer := time.AfterFunc(w.timeout, func() { cancel(errStall) })
 	defer timer.Stop()
 
+	w.gotConn.Store(false)
 	trace := &httptrace.ClientTrace{GotConn: func(ci httptrace.GotConnInfo) {
-		w.r.rep.Connected(c.id, ci.Conn.RemoteAddr().String())
+		w.gotConn.Store(true)
+		addr := ci.Conn.RemoteAddr().String()
+		// A reused connection was attributed when it was first obtained.
+		if w.place != nil && !ci.Reused {
+			addr = w.place.gotConn(w.id, addr)
+		}
+		w.r.rep.Connected(c.id, addr)
 	}}
 	reqCtx := httptrace.WithClientTrace(actx, trace)
 	req, err := http.NewRequestWithContext(reqCtx,
@@ -253,7 +345,7 @@ func (w *worker) attempt(ctx context.Context, c *chunk) error {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return w.classify(err, actx)
+		return w.classifyConnection(err, actx, w.gotConn.Load())
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent:
@@ -287,8 +379,13 @@ func (w *worker) initialRangeAttempt(
 	resp *http.Response, addr string, ecancel context.CancelCauseFunc,
 ) error {
 	defer ecancel(nil)
+	if w.place != nil && addr != "" {
+		addr = w.place.attachInitial(w.id, addr)
+		defer w.place.releaseAddress(w.placed)
+	}
 	actx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	defer w.place.beginAttempt(w.placed, cancel)()
 	// The response was created before worker 0 existed, on its own request
 	// context. Forward every local cancellation cause (stall, retirement,
 	// parent cancel) into that request so a blocked body read genuinely
@@ -391,8 +488,15 @@ type observedReader struct {
 }
 
 func (o *observedReader) Read(p []byte) (int, error) {
+	var counter *nodeByteCounter
+	if o.w.placed != nil {
+		counter = o.w.placed.counter.Load()
+	}
 	n, err := o.r.Read(p)
 	if n > 0 {
+		if counter != nil && o.w.placed.counter.Load() == counter {
+			counter.bytes.Add(int64(n))
+		}
 		total := o.w.r.progress.Add(int64(n))
 		if o.w.r.ramp != nil {
 			if !o.w.sawBody {
@@ -467,14 +571,81 @@ func (w *worker) classify(err error, actx context.Context) error {
 	if _, ok := errors.AsType[*permanentError](err); ok {
 		return err
 	}
+	if context.Cause(actx) == errSlowNode { //nolint:errorlint // exact internal policy sentinel
+		w.dropPlacementTransport()
+		return errSlowNode
+	}
+	if rotation, ok := errors.AsType[*nodeRotationError](err); ok {
+		// dialPreferred already parked the failed addresses.
+		w.dropPlacementTransport()
+		return rotation
+	}
+	if w.place != nil && certificateFailure(err) {
+		// A bad certificate on one address may rotate to another, but
+		// verification is never weakened: once every unique address is
+		// exhausted the original failure regains permanent precedence.
+		return w.rotationError(err, err)
+	}
 	if context.Cause(actx) == errStall { //nolint:errorlint // exact sentinel set by our AfterFunc
 		w.bumpTimeout()
+		w.rotateAfterStall()
 		return errStall
 	}
 	if errors.Is(err, io.EOF) {
 		return errShortBody
 	}
 	return err
+}
+
+// classifyConnection extends ordinary attempt classification with the
+// lifecycle fact supplied by httptrace: without GotConn, dialing completed but
+// the connection was never usable (normally TLS establishment). Rotate the
+// pinned transport immediately unless cancellation already explains the
+// failure or a more specific classifier did.
+func (w *worker) classifyConnection(err error, actx context.Context, gotConn bool) error {
+	classified := w.classify(err, actx)
+	if gotConn || w.place == nil || actx.Err() != nil {
+		return classified
+	}
+	switch classified.(type) {
+	case *nodeRotationError, *permanentError:
+		return classified
+	}
+	return w.rotationError(classified, nil)
+}
+
+// rotationError parks the worker's current address without a slow-node
+// strike, drops its pinned transport, and wraps err so downloadChunk can grant
+// a budget-free rotation; permanent, when set, is surfaced once rotations are
+// exhausted.
+func (w *worker) rotationError(err, permanent error) error {
+	addr := w.place.currentAddress(w.placed)
+	w.place.markAvailabilityFailure(addr)
+	w.dropPlacementTransport()
+	var addrs []netip.Addr
+	if addr.IsValid() {
+		addrs = []netip.Addr{addr}
+	}
+	return &nodeRotationError{
+		addrs: addrs, err: fmt.Errorf("%w: %w", errNodeUnavailable, err), permanent: permanent,
+	}
+}
+
+func certificateFailure(err error) bool {
+	var verification *tls.CertificateVerificationError
+	var unknown x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	return errors.As(err, &verification) || errors.As(err, &unknown) ||
+		errors.As(err, &hostname) || errors.As(err, &invalid)
+}
+
+// rotateAfterStall gives this worker a one-reservation preference for another
+// address. A read stall is not evidence that the address is unavailable to
+// every worker, so it must not herd the run through a node-wide cooldown.
+func (w *worker) rotateAfterStall() {
+	w.place.avoidCurrentOnNextReservation(w.placed)
+	w.dropPlacementTransport()
 }
 
 func (w *worker) bumpTimeout() {
@@ -509,12 +680,40 @@ func (w *worker) decayTimeout() {
 	}
 }
 
-// ensureClient lazily builds the worker's HTTP client.
-func (w *worker) ensureClient() {
+// ensureClient lazily builds either the shared base client or a cloned
+// single-connection transport with a preferred logical address.
+func (w *worker) ensureClient() error {
 	if w.client != nil {
+		return nil
+	}
+	if w.place == nil {
+		w.client = w.r.d.newClient(w.r.d.roundTripper())
+		return nil
+	}
+	primary, err := w.place.reserve(w.id)
+	if err != nil {
+		return &nodeRotationError{err: fmt.Errorf("%w: %w", errNodeUnavailable, err)}
+	}
+	tr := w.place.createTransport(w.id, primary)
+	w.client = w.r.d.newClient(tr)
+	w.r.d.log.Debug("worker preferred node", "worker", w.id, "addr", primary)
+	return nil
+}
+
+// dropPlacementTransport closes the worker's pinned transport and releases
+// its address; the next ensureClient reserves afresh. No-op without placement.
+func (w *worker) dropPlacementTransport() {
+	if w.place == nil {
 		return
 	}
-	w.client = w.r.d.newClient(w.r.d.roundTripper())
+	w.place.closeTransport(w.id)
+	w.place.releaseAddress(w.placed)
+	w.client = nil
+}
+
+func (w *worker) closePlacement() {
+	w.dropPlacementTransport()
+	w.place.removeWorker(w.id)
 }
 
 // singleStream downloads the whole body sequentially (no Range support or
@@ -627,7 +826,9 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 	initial := resp != nil
 	defer ecancel(nil)
 	if !initial {
-		w.ensureClient()
+		if err := w.ensureClient(); err != nil {
+			return err
+		}
 	}
 
 	actx, cancel := context.WithCancelCause(ctx)

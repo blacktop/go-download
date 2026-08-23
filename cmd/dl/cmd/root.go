@@ -45,16 +45,18 @@ var log = charmlog.NewWithOptions(os.Stderr, charmlog.Options{
 })
 
 var flags struct {
-	output   string
-	parts    int
-	timeout  time.Duration
-	retries  int
-	headers  []string
-	sha256   string
-	force    bool
-	quiet    bool
-	insecure bool
-	verbose  bool
+	output              string
+	parts               int
+	timeout             time.Duration
+	retries             int
+	headers             []string
+	sha256              string
+	resumeID            string
+	enableNodeSelection bool
+	force               bool
+	quiet               bool
+	insecure            bool
+	verbose             bool
 }
 
 func init() {
@@ -68,6 +70,10 @@ func init() {
 	rootCmd.Flags().StringVar(&flags.sha256, "sha256", "",
 		"expected sha256 (hex); verified before rename")
 	rootCmd.Flags().BoolVarP(&flags.force, "force", "f", false, "overwrite existing destination")
+	rootCmd.Flags().StringVar(&flags.resumeID, "resume-id", "",
+		"stable resume identity when the URL carries rotating signed credentials")
+	rootCmd.Flags().BoolVar(&flags.enableNodeSelection, "enable-node-selection", false,
+		"enable multi-address node placement for eligible direct hosts")
 	rootCmd.Flags().BoolVarP(&flags.quiet, "quiet", "q", false, "no progress output")
 	rootCmd.Flags().BoolVar(&flags.insecure, "insecure", false, "skip TLS certificate verification")
 	rootCmd.Flags().BoolVarP(&flags.verbose, "verbose", "V", false, "verbose output")
@@ -89,15 +95,7 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 
-		opt := &download.Options{
-			Parts:          flags.parts,
-			Timeout:        flags.timeout,
-			MaxRetries:     flags.retries,
-			Headers:        headers,
-			ExpectedSHA256: flags.sha256,
-			Overwrite:      flags.force,
-			Logger:         slog.New(log),
-		}
+		opt := downloadOptions(headers)
 		if flags.insecure {
 			opt.TLSConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- user opted in
 		}
@@ -137,6 +135,20 @@ var rootCmd = &cobra.Command{
 		log.Info("downloaded", summary...)
 		return nil
 	},
+}
+
+func downloadOptions(headers http.Header) *download.Options {
+	return &download.Options{
+		Parts:               flags.parts,
+		Timeout:             flags.timeout,
+		MaxRetries:          flags.retries,
+		Headers:             headers,
+		ExpectedSHA256:      flags.sha256,
+		Overwrite:           flags.force,
+		ResumeID:            flags.resumeID,
+		EnableNodeSelection: flags.enableNodeSelection,
+		Logger:              slog.New(log),
+	}
 }
 
 func parseHeaders(raw []string) (http.Header, error) {

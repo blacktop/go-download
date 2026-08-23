@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -257,7 +259,26 @@ func BenchmarkSharedCapMultipart(b *testing.B) {
 // resume. A wall-time or allocation regression here means the small-file
 // lifecycle grew real overhead.
 func BenchmarkSmallFileDefault(b *testing.B) {
-	benchmarkDefaultDownload(b, 4<<20)
+	benchmarkDefaultDownload(b, 4<<20, false)
+}
+
+// BenchmarkSmallFileNodeSelectionEnabled and its disabled peer are separate
+// top-level benchmarks so evidence runs can alternate process order without a
+// consistently warmed second sub-benchmark. Neither path initializes placement.
+func BenchmarkSmallFileNodeSelectionEnabled(b *testing.B) {
+	benchmarkDefaultDownload(b, 4<<20, true)
+}
+
+func BenchmarkSmallFileNodeSelectionDisabled(b *testing.B) {
+	benchmarkDefaultDownload(b, 4<<20, false)
+}
+
+func BenchmarkEqualNodePlacementEnabled(b *testing.B) {
+	benchmarkEqualNodePlacement(b, true)
+}
+
+func BenchmarkEqualNodePlacementDisabled(b *testing.B) {
+	benchmarkEqualNodePlacement(b, false)
 }
 
 // BenchmarkSmallFileDurableStdlib is the semantics-matched baseline for
@@ -271,14 +292,14 @@ func BenchmarkSmallFileDurableStdlib(b *testing.B) {
 // adaptive expansion (8 parts * 16 MiB). It protects the large-file path
 // without forcing aggressive multipart settings into a small fixture.
 func BenchmarkLargeFileDefault(b *testing.B) {
-	benchmarkDefaultDownload(b, 128<<20)
+	benchmarkDefaultDownload(b, 128<<20, false)
 }
 
 func BenchmarkLargeFileDurableStdlib(b *testing.B) {
 	benchmarkDurableStdlib(b, 128<<20)
 }
 
-func benchmarkDefaultDownload(b *testing.B, size int) {
+func benchmarkDefaultDownload(b *testing.B, size int, enableNodeSelection bool) {
 	b.Helper()
 	data := testData(size)
 	var st stats
@@ -286,7 +307,10 @@ func benchmarkDefaultDownload(b *testing.B, size int) {
 	b.Cleanup(srv.Close)
 
 	dir := b.TempDir()
-	d, err := New(&Options{Logger: slog.New(slog.DiscardHandler)})
+	d, err := New(&Options{
+		EnableNodeSelection: enableNodeSelection,
+		Logger:              slog.New(slog.DiscardHandler),
+	})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -295,6 +319,42 @@ func benchmarkDefaultDownload(b *testing.B, size int) {
 	for b.Loop() {
 		dest := filepath.Join(dir, "bench.bin")
 		if _, err := d.Get(b.Context(), srv.URL+"/file.bin", dest); err != nil {
+			b.Fatal(err)
+		}
+		if err := os.Remove(dest); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkEqualNodePlacement(b *testing.B, enableNodeSelection bool) {
+	b.Helper()
+	data := testData(128 << 20)
+	var st stats
+	srv := httptest.NewServer(throttledRangeHandler(data, `"v1"`, &st,
+		2*time.Millisecond, 64, func(*http.Request) bool { return true }))
+	b.Cleanup(srv.Close)
+	backend := strings.TrimPrefix(srv.URL, "http://")
+	a := netip.MustParseAddr("192.0.2.1")
+	addrB := netip.MustParseAddr("192.0.2.2")
+
+	d, err := New(&Options{
+		Parts: 8, MinParts: 8, MinPartSize: 1 << 20,
+		EnableNodeSelection: enableNodeSelection,
+		Logger:              slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	placeAddresses(d, a, addrB)
+	d.dial = logicalDialer(80, a, map[netip.Addr]string{a: backend, addrB: backend}, nil)
+	b.Cleanup(d.CloseIdleConnections)
+	dir := b.TempDir()
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		dest := filepath.Join(dir, "bench.bin")
+		if _, err := d.Get(b.Context(), "http://cdn.test/file.bin", dest); err != nil {
 			b.Fatal(err)
 		}
 		if err := os.Remove(dest); err != nil {

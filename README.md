@@ -9,6 +9,8 @@
 ## Features
 
 - Parallel HTTP/1.1 range downloads that add connections only while they help.
+- Opt-in direct-host placement across resolved CDN addresses, with a 300 ms
+  fallback race and conservative replacement of persistently slow addresses.
 - Work stealing: idle connections can finish the slow tail of another range.
 - Safe resume using a `.part.json` sidecar and ETag or Last-Modified validation.
 - Stall recovery from the last byte written. Non-range servers fall back to a clean restart.
@@ -83,14 +85,28 @@ Configure the downloader with `download.Options`:
 
 ```go
 dl, err := download.New(&download.Options{
-    Parts:          8,                // parallel connections (cap)
-    MinParts:       1,                // opened eagerly; never retired below
-    ResumeID:       "",               // stable resume identity for signed URLs
-    MinPartSize:    16 << 20,         // never split ranges below 2x this
-    ExpectedSHA256: "6ca0e5...",      // verify before the final install
-    Reporter:       myProgressUI,     // receive progress events
+    Parts:               8,           // parallel connections (cap)
+    MinParts:            1,           // opened eagerly; never retired below
+    EnableNodeSelection: true,        // opt into CDN address placement
+    ResumeID:            "",          // stable resume identity for signed URLs
+    MinPartSize:         16 << 20,    // never split ranges below 2x this
+    ExpectedSHA256:      "6ca0e5...", // verify before the final install
+    Reporter:            myProgressUI,
 })
 ```
+
+When explicitly enabled, node selection applies only to eligible multipart
+downloads using the built-in direct transport and at least two discovered
+addresses. It preserves the URL hostname for HTTP, TLS SNI, cookies, and
+certificate verification. Single-flow and small-file runs, literal-IP URLs,
+proxies, custom transports, one-address hosts, and resolver failures retain the
+ordinary transport path.
+
+After ramping settles, culling compares complete, stable ten-second windows.
+The best address must deliver at least 8 MiB of aggregate evidence; a candidate
+needs the complete time window, not the same byte floor. An address below 25%
+of the best per-connection rate for two evaluations is migrated without
+charging retry budget, then receives a later passive recovery probe.
 
 For HTTP/3, pass a QUIC `http.RoundTripper`, such as quic-go, through
 `Options.Transport`. The core library does not depend on a QUIC implementation.

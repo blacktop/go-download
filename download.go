@@ -11,13 +11,16 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"maps"
 	"mime"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +86,10 @@ type Options struct {
 	// Proxy selects a proxy per request for the internal transport (nil means
 	// http.ProxyFromEnvironment). Ignored when Transport is set.
 	Proxy func(*http.Request) (*url.URL, error)
+	// EnableNodeSelection opts into direct-host address placement for eligible
+	// multipart runs with an owned direct transport and at least two
+	// resolved/election addresses. The zero value keeps the base transport.
+	EnableNodeSelection bool
 	// ExpectedSHA256 is the hex-encoded checksum to verify before the
 	// final install. Empty disables verification.
 	ExpectedSHA256 string
@@ -155,6 +162,14 @@ type Downloader struct {
 
 	// dial is the internal transport's TCP dialer; tests override it.
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// resolve is the final-host resolver; tests replace it with deterministic
+	// address sets. Resolver failures disable placement for that run.
+	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+
+	// placements tracks in-flight node placements so CloseIdleConnections can
+	// reach their pinned transports; each run registers and unregisters its own.
+	placementsMu sync.Mutex
+	placements   map[*nodePlacement]struct{}
 	// sleepHook replaces every worker's retry/backoff sleeper in tests
 	// (channel-coordinated fakes instead of wall-clock assertions).
 	sleepHook func(ctx context.Context, d time.Duration) error
@@ -213,7 +228,10 @@ func New(opt *Options) (*Downloader, error) {
 	if o.Logger == nil {
 		o.Logger = slog.New(slog.DiscardHandler)
 	}
-	d := &Downloader{opt: o, rep: o.Reporter, log: o.Logger, reportSem: reportSem}
+	d := &Downloader{
+		opt: o, rep: o.Reporter, log: o.Logger, reportSem: reportSem,
+		placements: make(map[*nodePlacement]struct{}),
+	}
 	d.bufs.New = func() any {
 		b := make([]byte, bufSize)
 		return &b
@@ -222,6 +240,9 @@ func New(opt *Options) (*Downloader, error) {
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).DialContext
+	d.resolve = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	}
 	if o.Transport == nil {
 		d.base = newTransport(o, d.dialContext)
 	}
@@ -467,6 +488,7 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		resp.Body = &closeOnceBody{ReadCloser: resp.Body}
 		r.initial = resp
 		r.initialAddr = remoteAddr
+		r.electionAddr = remoteAddr
 		r.initialCancel = electCancel
 	} else {
 		electCancel(nil)
@@ -561,6 +583,24 @@ func (d *Downloader) CloseIdleConnections() {
 	if tr, ok := d.opt.Transport.(interface{ CloseIdleConnections() }); ok {
 		tr.CloseIdleConnections()
 	}
+	d.placementsMu.Lock()
+	placements := slices.Collect(maps.Keys(d.placements))
+	d.placementsMu.Unlock()
+	for _, p := range placements {
+		p.closeIdleConnections()
+	}
+}
+
+func (d *Downloader) registerPlacement(p *nodePlacement) {
+	d.placementsMu.Lock()
+	d.placements[p] = struct{}{}
+	d.placementsMu.Unlock()
+}
+
+func (d *Downloader) unregisterPlacement(p *nodePlacement) {
+	d.placementsMu.Lock()
+	delete(d.placements, p)
+	d.placementsMu.Unlock()
 }
 
 // Discard removes dest's staged .part file and resume sidecar so the next
@@ -875,16 +915,20 @@ type run struct {
 	// body read on an arbitrary transport; it travels with the response and
 	// is invoked exactly once by whoever disposes of it. initialMu makes the
 	// hand-off atomic across eagerly started workers.
-	initialMu     sync.Mutex
-	initial       *http.Response
-	initialAddr   string
+	initialMu   sync.Mutex
+	initial     *http.Response
+	initialAddr string
+	// electionAddr survives closeInitial so placement can always union the
+	// actual election connection into the final host's later DNS answer.
+	electionAddr  string
 	initialCancel context.CancelCauseFunc
 	// progress counts body bytes read this run (drives the concurrency ramp).
 	progress atomic.Int64
 	// ramp is the adaptive-concurrency governor; nil on the single-stream
 	// path. Its throughput ramp may be finished from the start, but its
 	// throttle control stays live for the run.
-	ramp *rampState
+	ramp      *rampState
+	placement *nodePlacement
 }
 
 // closeOnceBody lets the worker timeout close an initial response to unblock a
@@ -924,6 +968,12 @@ func (r *run) closeInitial() {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+func (r *run) hasInitial() bool {
+	r.initialMu.Lock()
+	defer r.initialMu.Unlock()
+	return r.initial != nil
 }
 
 func (r *run) name() string { return filepath.Base(r.destPath) }
@@ -1291,6 +1341,14 @@ func (r *run) runWorkers(
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	remaining := sched.remainingBytes()
+	start := sched.prepare(r.d.opt.MinParts)
+	canRamp := rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts)
+	placement := r.d.newNodePlacement(runCtx, r.url, r.electionAddr, start > 1 || canRamp, r.hasInitial())
+	if placement != nil {
+		r.placement = placement
+		defer placement.close()
+	}
 
 	var wg sync.WaitGroup
 	var firstErr error
@@ -1337,8 +1395,6 @@ func (r *run) runWorkers(
 			}
 		}
 	}
-	remaining := sched.remainingBytes()
-	start := sched.prepare(r.d.opt.MinParts)
 	// Window: big enough to measure meaningfully while leaving room to
 	// evaluate several doubling steps. At the remaining/16 branch, the
 	// default 1→2→4→8 ramp reaches its final judgment near the midpoint;
@@ -1356,11 +1412,14 @@ func (r *run) runWorkers(
 		admitted:  start,
 		markTime:  time.Now(),
 	}
-	if start >= r.d.opt.Parts || !rampEligible(remaining, r.d.opt.MinPartSize, r.d.opt.Parts) {
+	if start >= r.d.opt.Parts || !canRamp {
 		// No throughput ramp: the floor already fills Parts, or the remaining
 		// work cannot feed every configured connection. The governor still
 		// exists so an explicit 429 can shed eager flows.
 		r.ramp.done.Store(true)
+	}
+	if placement != nil {
+		placement.startCuller(runCtx, sched, r.ramp)
 	}
 	for id := range start {
 		spawn(id)

@@ -258,6 +258,20 @@ func (s *scheduler) cursor(c *chunk) (off, end int64, todo bool) {
 	return off, c.end, off < c.end
 }
 
+// workerRemaining returns the unclaimed tail currently owned by workerID.
+// Zero is conservative for culling: a worker between chunks is treated as a
+// draining tail and cannot make its address eligible for judgment.
+func (s *scheduler) workerRemaining(workerID int) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.active {
+		if c.owner == workerID {
+			return max(c.end-(c.off+c.done), 0)
+		}
+	}
+	return 0
+}
+
 // complete removes a finished chunk from the active set.
 func (s *scheduler) complete(c *chunk) {
 	s.mu.Lock()
