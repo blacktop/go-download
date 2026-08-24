@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestPolicySeesByteServingHost: the policy is consulted with the
@@ -105,6 +109,83 @@ func TestInvalidPolicyFailsAfterElection(t *testing.T) {
 	}
 	if n := len(st.rangeHeaders()); n != 1 {
 		t.Fatalf("server saw %d requests, want only the election", n)
+	}
+}
+
+// TestPolicyAppliesBeforeResumeScheduling pins the ordering contract: the
+// byte-serving URL's policy is resolved before a matching sidecar is turned
+// into scheduler work. A policy-raised floor must therefore split only the
+// missing tail, not fall back to the Options-level single worker or restart
+// already staged bytes.
+func TestPolicyAppliesBeforeResumeScheduling(t *testing.T) {
+	t.Parallel()
+	data := testData(1 << 20)
+	var st stats
+	tail := int64(len(data)) - 64<<10
+	var arrivals atomic.Int32
+	var barrierTimedOut atomic.Bool
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	serveRange := rangeHandler(data, `"v1"`, &st)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if start, ok := parseRangeStart(r.Header.Get("Range")); ok && start >= tail {
+			if arrivals.Add(1) >= 4 {
+				releaseOnce.Do(func() { close(release) })
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+				barrierTimedOut.Store(true)
+			}
+		}
+		serveRange.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	rawURL := srv.URL + "/artifact.bin?credential=refreshed"
+	sourceURL, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "artifact.bin")
+	const resumeID = "stable-artifact"
+	seedInterruptedDownload(t, dest, data, resumeIdentity(resumeID, sourceURL))
+
+	var policyURL string
+	d := newDL(t, &Options{
+		Parts: 1, MinPartSize: 1 << 20,
+		Policy: func(finalURL string) Concurrency {
+			policyURL = finalURL
+			return Concurrency{Parts: 4, MinParts: 4, MinPartSize: 8 << 10}
+		},
+	})
+	res, err := d.Do(t.Context(), &Request{URL: rawURL, Dest: dest, ResumeID: resumeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Resumed {
+		t.Fatal("matching sidecar was not resumed")
+	}
+	if policyURL != rawURL {
+		t.Fatalf("policy URL = %q, want byte-serving URL %q", policyURL, rawURL)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("policy-governed resume installed different bytes")
+	}
+	starts := st.rangeStarts()
+	if barrierTimedOut.Load() || arrivals.Load() < 4 || len(starts) < 5 || starts[0] != 0 {
+		t.Fatalf("range starts = %v arrivals=%d barrier_timeout=%t, want election plus four concurrent resumed-tail ranges",
+			starts, arrivals.Load(), barrierTimedOut.Load())
+	}
+	for _, start := range starts[1:] {
+		if start < tail {
+			t.Fatalf("policy-governed resume restarted staged bytes at %d before tail %d", start, tail)
+		}
 	}
 }
 
