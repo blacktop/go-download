@@ -77,18 +77,18 @@ type Options struct {
 	Timeout time.Duration
 	// MaxRetries is the per-chunk retry budget. Default 10.
 	MaxRetries int
-	// Headers are added to every request (User-Agent, auth, ...). On a
-	// redirect, credentials follow net/http's policy: sensitive headers are
-	// not copied to an unrelated host.
+	// Headers are added to every request, for example User-Agent and
+	// authentication. On a redirect, credentials follow net/http's policy:
+	// sensitive headers are not copied to an unrelated host.
 	Headers http.Header
 	// Jar supplies cookies to every request (session auth). Nil means no
 	// cookie handling.
 	Jar http.CookieJar
-	// Transport overrides the internal HTTP/1.1 transport (this is the HTTP/3
-	// escape hatch: plug in a quic-go RoundTripper here). WARNING: an HTTP/2 transport defeats
-	// parallel parts — h2 multiplexes every range request onto a single
-	// TCP connection. For *http.Transport, force HTTP/1.1 (Protocols) and
-	// choose its connection and header buffer sizes for the workload.
+	// Transport overrides the internal HTTP/1.1 transport. It is also the
+	// HTTP/3 escape hatch: plug in a quic-go RoundTripper here. WARNING: an
+	// HTTP/2 transport defeats parallel parts by multiplexing every range
+	// request onto one TCP connection. For *http.Transport, force HTTP/1.1
+	// (Protocols) and size its connection and header buffers for the workload.
 	Transport http.RoundTripper
 	// TLSConfig is used by the internal transport. Ignored when Transport
 	// is set.
@@ -155,10 +155,9 @@ type Concurrency struct {
 	MinPartSize int64
 }
 
-// over fills c's zero fields from base and validates the result. An
-// inherited MinParts is clamped to a lowered Parts (this only bites on the
-// Policy path — New's base floor is 1); an explicit one that exceeds Parts is
-// an error.
+// over fills c's zero fields from base and validates the result. If c lowers
+// Parts below an inherited MinParts, the floor is clamped to the new cap; an
+// explicitly set MinParts above Parts is an error.
 func (c Concurrency) over(base Concurrency) (Concurrency, error) {
 	if c.Parts == 0 {
 		c.Parts = base.Parts

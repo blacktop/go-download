@@ -88,7 +88,7 @@ dl, err := download.New(&download.Options{
     Parts:               8,           // parallel connections (cap)
     MinParts:            1,           // opened eagerly; never retired below
     EnableNodeSelection: true,        // opt into CDN address placement
-    ResumeID:            "",          // stable resume identity for signed URLs
+    ResumeID:            "",          // empty hashes URL including query
     MinPartSize:         16 << 20,    // never split ranges below 2x this
     ExpectedSHA256:      "6ca0e5...", // verify before the final install
     Reporter:            myProgressUI,
@@ -96,7 +96,7 @@ dl, err := download.New(&download.Options{
 ```
 
 One downloader can serve a whole transport/authentication session. Put
-artifact-specific headers, checksums, reporters, and signed-URL resume identity
+artifact-specific headers, checksums, reporters, and stable resume identity
 on each request; request header values replace option-level values with the
 same canonical name:
 
@@ -211,23 +211,24 @@ Individual WAN ratios ranged from 0.844× to 1.109×.
 ### Node-placement boundary
 
 Node placement is opt-in because distributing flows across every resolved
-address is not universally faster than staying on the election address. A
-held-out public Apple CDN sweep on August 23, 2026 used three interleaved
-45-second rounds per configuration:
+address is not universally faster than staying on the election address. The
+final public Apple campaign used ten adjacent, order-alternated 45-second pairs
+on the same IPSW and production `8/8/8 MiB` tuple:
 
-| Parts/MinParts | Placement | Median MiB/s |
+| Comparison | Paired median | Bootstrap 95% lower bound |
 |---|---:|---:|
-| 8/8 | off | 13.31 |
-| 4/4 | off | 12.23 |
-| 4/4 | on | 11.25 |
-| 8/8 | on | 10.47 |
-| 1/1 | off | 9.22 |
+| Existing v0.2.5 spread / placement off | 1.0278× | 0.9503× |
+| Champion candidate / placement off | 0.9635× | 0.8503× |
+| Champion candidate / existing spread | **0.8708×** | 0.7539× |
 
-The 8/8 enabled/disabled ratios were 0.94, 0.79, and 0.74. Placement used all
-four resolved addresses, including one whose per-connection rate was roughly
-three times slower than the fastest. That spread remained above the
-conservative 25% culling threshold, so migration correctly did not fire, but
-the diversified run was slower.
+All arms recorded zero retries and zero HTTP 429s. An initial three-round
+screen put the spread/disabled median near 0.79×, while the next day's ten-pair
+median was 1.03×. That reversal is why placement remains opt-in: neither a
+short screen nor one day's route behavior supports an automatic default. The
+champion/challenger candidate was rejected and removed after losing the direct
+head-to-head. It did not advance to complete-file, held-out, or authenticated
+testing. Timed cancellation means these arms support throughput and routing
+conclusions, not integrity parity.
 
 Conversely, the deterministic 100:1 slow-node fixture migrated work losslessly
 and completed in about 0.667× the disabled wall time, a 1.50× speedup. Local
