@@ -51,6 +51,7 @@ var flags struct {
 	retries             int
 	headers             []string
 	sha256              string
+	md5                 string
 	resumeID            string
 	enableNodeSelection bool
 	force               bool
@@ -69,6 +70,8 @@ func init() {
 		"extra header, 'Key: Value' (repeatable)")
 	rootCmd.Flags().StringVar(&flags.sha256, "sha256", "",
 		"expected sha256 (hex); verified before rename")
+	rootCmd.Flags().StringVar(&flags.md5, "md5", "",
+		"expected MD5 integrity value (hex); verified before rename")
 	rootCmd.Flags().BoolVarP(&flags.force, "force", "f", false, "overwrite existing destination")
 	rootCmd.Flags().StringVar(&flags.resumeID, "resume-id", "",
 		"stable resume identity when the URL carries rotating signed credentials")
@@ -132,6 +135,9 @@ var rootCmd = &cobra.Command{
 		if res.SHA256 != "" {
 			summary = append(summary, "sha256", "verified")
 		}
+		if res.MD5 != "" {
+			summary = append(summary, "md5", "verified")
+		}
 		log.Info("downloaded", summary...)
 		return nil
 	},
@@ -144,6 +150,7 @@ func downloadOptions(headers http.Header) *download.Options {
 		MaxRetries:          flags.retries,
 		Headers:             headers,
 		ExpectedSHA256:      flags.sha256,
+		ExpectedMD5:         flags.md5,
 		Overwrite:           flags.force,
 		ResumeID:            flags.resumeID,
 		EnableNodeSelection: flags.enableNodeSelection,

@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"crypto/md5" // #nosec G501 -- integrity checks against published MD5 values
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/tls"
@@ -122,6 +123,11 @@ type Options struct {
 	// disables verification. May be combined with ExpectedSHA256; the
 	// file is read once.
 	ExpectedSHA1 string
+	// ExpectedMD5 is the hex-encoded MD5 checksum to verify before the final
+	// install. It supports APIs that publish MD5 as an integrity value; it is
+	// not a collision-resistant trust root. Empty disables verification. May
+	// be combined with the SHA checksums; the file is read once.
+	ExpectedMD5 string
 	// RejectContentTypes aborts a download at the initial response — before any byte
 	// is staged — when the response's media type matches an entry (e.g.
 	// "text/html" for CDNs that answer dead links with an HTML error page
@@ -204,6 +210,8 @@ type Result struct {
 	SHA256 string
 	// SHA1 is the hex checksum, set only when ExpectedSHA1 was verified.
 	SHA1 string
+	// MD5 is the hex checksum, set only when ExpectedMD5 was verified.
+	MD5 string
 }
 
 // Downloader downloads files. It is safe for concurrent use.
@@ -271,6 +279,9 @@ func New(opt *Options) (*Downloader, error) {
 		return nil, err
 	}
 	if o.ExpectedSHA1, err = normalizeChecksum(o.ExpectedSHA1, sha1HexLen, "ExpectedSHA1"); err != nil {
+		return nil, err
+	}
+	if o.ExpectedMD5, err = normalizeChecksum(o.ExpectedMD5, md5HexLen, "ExpectedMD5"); err != nil {
 		return nil, err
 	}
 	// The Downloader owns its option-level header map and value slices. A
@@ -456,10 +467,11 @@ type Request struct {
 	// Options.Reporter. Downloads with per-request reporters may run
 	// concurrently; downloads sharing the Options reporter are serialized.
 	Reporter Reporter
-	// ExpectedSHA256 / ExpectedSHA1 override the Options checksums for
+	// ExpectedSHA256 / ExpectedSHA1 / ExpectedMD5 override the Options checksums for
 	// this download (hex; empty falls back).
 	ExpectedSHA256 string
 	ExpectedSHA1   string
+	ExpectedMD5    string
 	// Headers are merged over Options.Headers by canonical name. A request
 	// value replaces the complete option-level value slice. The map and value
 	// slices are cloned when Do begins, so later caller mutation cannot change
@@ -495,11 +507,18 @@ func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	md5sum, err := normalizeChecksum(req.ExpectedMD5, md5HexLen, "ExpectedMD5")
+	if err != nil {
+		return nil, err
+	}
 	if sha256sum == "" {
 		sha256sum = d.opt.ExpectedSHA256
 	}
 	if sha1sum == "" {
 		sha1sum = d.opt.ExpectedSHA1
+	}
+	if md5sum == "" {
+		md5sum = d.opt.ExpectedMD5
 	}
 	resumeID := d.opt.ResumeID
 	if req.ResumeID != "" {
@@ -523,7 +542,8 @@ func (d *Downloader) Do(ctx context.Context, req *Request) (*Result, error) {
 	start := time.Now()
 	res, err := d.get(ctx, &resolvedRequest{
 		url: rawURL, dest: dest, rep: rep,
-		sha256: sha256sum, sha1: sha1sum, headers: headers, resumeID: resumeID,
+		sha256: sha256sum, sha1: sha1sum, md5: md5sum,
+		headers: headers, resumeID: resumeID,
 		measurement: measurement,
 	})
 	elapsed := time.Since(start)
@@ -540,6 +560,7 @@ type resolvedRequest struct {
 	url, dest    string
 	rep          Reporter
 	sha256, sha1 string
+	md5          string
 	headers      http.Header
 	resumeID     string
 	measurement  *runMeasurement
@@ -592,7 +613,8 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 	if err != nil {
 		return fail(err)
 	}
-	rq.measurement.configure(resp.Request.URL, resp.Proto, conc, rq.sha256 != "" || rq.sha1 != "")
+	rq.measurement.configure(resp.Request.URL, resp.Proto, conc,
+		rq.sha256 != "" || rq.sha1 != "" || rq.md5 != "")
 	etag := resp.Header.Get("ETag")
 	lastMod := resp.Header.Get("Last-Modified")
 	contentType := resp.Header.Get("Content-Type")
@@ -636,6 +658,7 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		rep:             rq.rep,
 		sha256:          rq.sha256,
 		sha1:            rq.sha1,
+		md5:             rq.md5,
 		headers:         rq.headers,
 		resumeID:        rq.resumeID,
 		measurement:     rq.measurement,
@@ -705,8 +728,9 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 }
 
 const (
-	sha256HexLen = 64
-	sha1HexLen   = 40
+	sha256HexLen = sha256.Size * 2
+	sha1HexLen   = sha1.Size * 2
+	md5HexLen    = md5.Size * 2
 )
 
 // normalizeChecksum validates a hex digest of the given length and lowers it.
@@ -969,8 +993,8 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 	}
 	if r.checksumConfigured() {
 		bp := r.d.bufs.Get().(*[]byte)
-		sum256, sum1, err := hashFile(file,
-			r.sha256 != "", r.sha1 != "", *bp)
+		sum256, sum1, sumMD5, err := hashFile(file,
+			r.sha256 != "", r.sha1 != "", r.md5 != "", *bp)
 		r.d.bufs.Put(bp)
 		if err != nil {
 			return nil, err
@@ -988,6 +1012,13 @@ func (r *run) verifyAndFinalize(file *os.File, resumed bool) (*Result, error) {
 					Expected: r.sha1, Actual: sum1, Path: r.partPath}
 			}
 			res.SHA1 = sum1
+		}
+		if r.md5 != "" {
+			if sumMD5 != r.md5 {
+				return nil, &ChecksumError{Algo: "md5",
+					Expected: r.md5, Actual: sumMD5, Path: r.partPath}
+			}
+			res.MD5 = sumMD5
 		}
 	}
 	if err := file.Sync(); err != nil {
@@ -1055,12 +1086,14 @@ func installNoReplace(
 }
 
 // hashFile reads file once and returns the requested hex digests.
-func hashFile(file *os.File, want256, want1 bool, buf []byte) (sum256, sum1 string, err error) {
+func hashFile(
+	file *os.File, want256, want1, wantMD5 bool, buf []byte,
+) (sum256, sum1, sumMD5 string, err error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return "", "", fmt.Errorf("seek for hashing: %w", err)
+		return "", "", "", fmt.Errorf("seek for hashing: %w", err)
 	}
 	var writers []io.Writer
-	var h256, h1 hash.Hash
+	var h256, h1, hMD5 hash.Hash
 	if want256 {
 		h256 = sha256.New()
 		writers = append(writers, h256)
@@ -1069,8 +1102,12 @@ func hashFile(file *os.File, want256, want1 bool, buf []byte) (sum256, sum1 stri
 		h1 = sha1.New() // #nosec G401 -- verification against a published SHA-1
 		writers = append(writers, h1)
 	}
+	if wantMD5 {
+		hMD5 = md5.New() // #nosec G401 -- verification against a published MD5
+		writers = append(writers, hMD5)
+	}
 	if _, err := io.CopyBuffer(io.MultiWriter(writers...), file, buf); err != nil {
-		return "", "", fmt.Errorf("hash %s: %w", file.Name(), err)
+		return "", "", "", fmt.Errorf("hash %s: %w", file.Name(), err)
 	}
 	if h256 != nil {
 		sum256 = hex.EncodeToString(h256.Sum(nil))
@@ -1078,7 +1115,10 @@ func hashFile(file *os.File, want256, want1 bool, buf []byte) (sum256, sum1 stri
 	if h1 != nil {
 		sum1 = hex.EncodeToString(h1.Sum(nil))
 	}
-	return sum256, sum1, nil
+	if hMD5 != nil {
+		sumMD5 = hex.EncodeToString(hMD5.Sum(nil))
+	}
+	return sum256, sum1, sumMD5, nil
 }
 
 // run carries the state of one Get call.
@@ -1090,6 +1130,7 @@ type run struct {
 	conc        Concurrency
 	sha256      string
 	sha1        string
+	md5         string
 	headers     http.Header
 	resumeID    string
 	url         string
@@ -1146,7 +1187,7 @@ func (b *closeOnceBody) Close() error {
 }
 
 func (r *run) checksumConfigured() bool {
-	return r.sha256 != "" || r.sha1 != ""
+	return r.sha256 != "" || r.sha1 != "" || r.md5 != ""
 }
 
 // takeInitial hands the pending initial response (with its request cancel,

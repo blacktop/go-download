@@ -3,6 +3,7 @@ package download
 import (
 	"bytes"
 	"context"
+	"crypto/md5" // #nosec G501 -- test fixtures for published MD5 integrity
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -516,6 +517,8 @@ func TestSHA1Verification(t *testing.T) {
 	hexSum1 := hex.EncodeToString(sum1[:])
 	sum256 := sha256.Sum256(data)
 	hexSum256 := hex.EncodeToString(sum256[:])
+	sumMD5 := md5.Sum(data) // #nosec G401 -- test fixture for published MD5 integrity
+	hexSumMD5 := hex.EncodeToString(sumMD5[:])
 	var st stats
 	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
 	t.Cleanup(srv.Close)
@@ -530,13 +533,17 @@ func TestSHA1Verification(t *testing.T) {
 		}
 	})
 
-	t.Run("both algorithms", func(t *testing.T) {
+	t.Run("all algorithms", func(t *testing.T) {
 		t.Parallel()
 		dest := filepath.Join(t.TempDir(), "file.bin")
-		d := newDL(t, &Options{ExpectedSHA1: hexSum1, ExpectedSHA256: hexSum256, MinPartSize: 4 << 10})
+		d := newDL(t, &Options{
+			ExpectedSHA1: hexSum1, ExpectedSHA256: hexSum256, ExpectedMD5: hexSumMD5,
+			MinPartSize: 4 << 10,
+		})
 		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
-		if res.SHA1 != hexSum1 || res.SHA256 != hexSum256 {
-			t.Errorf("Result checksums = (%q, %q), want (%q, %q)", res.SHA1, res.SHA256, hexSum1, hexSum256)
+		if res.SHA1 != hexSum1 || res.SHA256 != hexSum256 || res.MD5 != hexSumMD5 {
+			t.Errorf("Result checksums = (%q, %q, %q), want (%q, %q, %q)",
+				res.SHA1, res.SHA256, res.MD5, hexSum1, hexSum256, hexSumMD5)
 		}
 	})
 
@@ -555,6 +562,50 @@ func TestSHA1Verification(t *testing.T) {
 		}
 		if _, err := os.Stat(dest); !os.IsNotExist(err) {
 			t.Error("mismatched file must not be renamed into place")
+		}
+	})
+}
+
+func TestMD5Verification(t *testing.T) {
+	t.Parallel()
+	data := testData(64 << 10)
+	sum := md5.Sum(data) // #nosec G401 -- test fixture for published MD5 integrity
+	hexSum := hex.EncodeToString(sum[:])
+	var st stats
+	srv := httptest.NewServer(rangeHandler(data, `"v1"`, &st))
+	t.Cleanup(srv.Close)
+
+	t.Run("match", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		d := newDL(t, &Options{ExpectedMD5: hexSum, MinPartSize: 4 << 10})
+		res, _ := mustGet(t, d, srv.URL+"/file.bin", dest)
+		if res.MD5 != hexSum {
+			t.Errorf("Result.MD5 = %q, want %q", res.MD5, hexSum)
+		}
+	})
+
+	t.Run("mismatch retains staged bytes", func(t *testing.T) {
+		t.Parallel()
+		dest := filepath.Join(t.TempDir(), "file.bin")
+		bad := "00000000000000000000000000000000"
+		d := newDL(t, &Options{ExpectedMD5: bad, MinPartSize: 4 << 10})
+		_, err := d.Get(t.Context(), srv.URL+"/file.bin", dest)
+		var ce *ChecksumError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected ChecksumError, got %v", err)
+		}
+		if ce.Algo != "md5" || ce.Expected != bad || ce.Actual != hexSum {
+			t.Errorf("ChecksumError = %#v", ce)
+		}
+		if ce.Path != dest+".part" {
+			t.Errorf("ChecksumError.Path = %q, want %q", ce.Path, dest+".part")
+		}
+		if _, err := os.Stat(dest); !os.IsNotExist(err) {
+			t.Error("mismatched file must not be renamed into place")
+		}
+		if _, err := os.Stat(dest + ".part"); err != nil {
+			t.Fatalf("staged .part must be retained: %v", err)
 		}
 	})
 }
@@ -657,6 +708,9 @@ func TestOptionsValidation(t *testing.T) {
 	}
 	if _, err := New(&Options{ExpectedSHA1: "xyz"}); err == nil {
 		t.Error("bad sha1 must error")
+	}
+	if _, err := New(&Options{ExpectedMD5: "xyz"}); err == nil {
+		t.Error("bad md5 must error")
 	}
 	d, err := New(nil)
 	if err != nil {

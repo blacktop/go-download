@@ -26,6 +26,7 @@ func TestDownloadOptionsMapFlags(t *testing.T) {
 	flags.timeout = 17 * time.Second
 	flags.retries = 3
 	flags.sha256 = "0123456789abcdef"
+	flags.md5 = "fedcba9876543210"
 	flags.resumeID = "stable-object"
 	flags.force = true
 	if err := selectionFlag.Value.Set("true"); err != nil {
@@ -50,6 +51,9 @@ func TestDownloadOptionsMapFlags(t *testing.T) {
 	}
 	if opt.ExpectedSHA256 != flags.sha256 {
 		t.Errorf("ExpectedSHA256 = %q, want %q", opt.ExpectedSHA256, flags.sha256)
+	}
+	if opt.ExpectedMD5 != flags.md5 {
+		t.Errorf("ExpectedMD5 = %q, want %q", opt.ExpectedMD5, flags.md5)
 	}
 	if opt.ResumeID != flags.resumeID {
 		t.Errorf("ResumeID = %q, want %q", opt.ResumeID, flags.resumeID)

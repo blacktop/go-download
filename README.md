@@ -14,7 +14,7 @@
 - Work stealing: idle connections can finish the slow tail of another range.
 - Safe resume using a `.part.json` sidecar and ETag or Last-Modified validation.
 - Stall recovery from the last byte written. Non-range servers fall back to a clean restart.
-- Atomic installation after size and optional checksum (SHA-256/SHA-1) verification. Existing destinations are preserved unless overwrite is enabled.
+- Atomic installation after size and optional checksum (SHA-256/SHA-1/MD5) verification. Existing destinations are preserved unless overwrite is enabled.
 - Standard library only. Progress UIs can implement `Reporter` or use the `dl` command.
 
 ## How it works
@@ -102,10 +102,11 @@ same canonical name:
 
 ```go
 res, err := dl.Do(ctx, &download.Request{
-    URL:      signedURL,
-    Dest:     destination,
-    Headers:  http.Header{"Authorization": {"Bearer " + token}},
-    ResumeID: stableOriginAndPath,
+    URL:         signedURL,
+    Dest:        destination,
+    Headers:     http.Header{"Authorization": {"Bearer " + token}},
+    ExpectedMD5: publishedMD5, // integrity value from artifact metadata
+    ResumeID:    stableOriginAndPath,
 })
 ```
 
@@ -114,6 +115,9 @@ so the caller may safely reuse or mutate them after invocation. Sensitive
 headers retain `net/http`'s redirect protections. An empty request `ResumeID`
 inherits `Options.ResumeID`; validators and expected size still decide whether
 partial data is reusable.
+
+MD5 support is for comparison with APIs that publish MD5 as an integrity
+value; it is not a collision-resistant authenticity check.
 
 When explicitly enabled, node selection applies only to eligible multipart
 downloads using the built-in direct transport and at least two discovered

@@ -3,7 +3,7 @@ package download
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/md5" // #nosec G501 -- test fixture for published MD5 integrity
 	"errors"
 	"fmt"
 	"io"
@@ -181,20 +181,20 @@ func TestMultipartRequiresValidatorOrChecksum(t *testing.T) {
 		}
 	})
 
-	t.Run("checksum permits multipart", func(t *testing.T) {
+	t.Run("md5 permits multipart", func(t *testing.T) {
 		t.Parallel()
 		data := testData(4 << 20)
-		sum := fmt.Sprintf("%x", sha256.Sum256(data))
+		sum := fmt.Sprintf("%x", md5.Sum(data)) // #nosec G401 -- published MD5 fixture
 		var st stats
 		srv := httptest.NewServer(throttledRangeHandler(data, "", &st,
 			5*time.Millisecond, 64, func(*http.Request) bool { return true }))
 		defer srv.Close()
 
 		d := newDL(t, &Options{
-			Parts: 4, MinPartSize: 256 << 10, ExpectedSHA256: sum,
+			Parts: 4, MinPartSize: 256 << 10, ExpectedMD5: sum,
 		})
 		res, got := mustGet(t, d, srv.URL+"/file.bin", filepath.Join(t.TempDir(), "file.bin"))
-		if !bytes.Equal(got, data) || res.SHA256 != sum {
+		if !bytes.Equal(got, data) || res.MD5 != sum {
 			t.Fatal("checksummed multipart download failed")
 		}
 		if got := len(st.rangeHeaders()); got < 2 {

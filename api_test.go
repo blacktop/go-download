@@ -2,6 +2,7 @@ package download
 
 import (
 	"bytes"
+	"crypto/md5" // #nosec G501 -- test fixture for published MD5 integrity
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,21 +38,27 @@ func (r *startStopReporter) Done(error) {
 	r.dones++
 }
 
-func TestDoPerRequestReporterAndChecksum(t *testing.T) {
+func TestDoPerRequestReporterAndChecksums(t *testing.T) {
 	t.Parallel()
 	dataA := testData(64 << 10)
 	dataB := append(testData(32<<10), 0x42)
 	sumA := sha256.Sum256(dataA)
 	sumB := sha256.Sum256(dataB)
+	md5A := md5.Sum(dataA) // #nosec G401 -- test fixture for published MD5 integrity
+	md5B := md5.Sum(dataB) // #nosec G401 -- test fixture for published MD5 integrity
 	var stA, stB stats
 	srvA := httptest.NewServer(rangeHandler(dataA, `"a"`, &stA))
 	t.Cleanup(srvA.Close)
 	srvB := httptest.NewServer(rangeHandler(dataB, `"b"`, &stB))
 	t.Cleanup(srvB.Close)
 
-	// One long-lived engine, per-request reporters and checksums,
-	// concurrent downloads.
-	d := newDL(t, &Options{MinPartSize: 4 << 10})
+	// On one long-lived engine, A inherits the option-level MD5 while B
+	// replaces it per request. The concurrent runs prove reporters and resolved
+	// checksums cannot leak across downloads.
+	d := newDL(t, &Options{
+		MinPartSize: 4 << 10,
+		ExpectedMD5: strings.ToUpper(hex.EncodeToString(md5A[:])),
+	})
 	dir := t.TempDir()
 	repA, repB := &startStopReporter{}, &startStopReporter{}
 
@@ -67,6 +75,7 @@ func TestDoPerRequestReporterAndChecksum(t *testing.T) {
 		resB, errB = d.Do(t.Context(), &Request{
 			URL: srvB.URL + "/b.bin", Dest: filepath.Join(dir, "b.bin"),
 			Reporter: repB, ExpectedSHA256: hex.EncodeToString(sumB[:]),
+			ExpectedMD5: hex.EncodeToString(md5B[:]),
 		})
 	})
 	wg.Wait()
@@ -76,6 +85,9 @@ func TestDoPerRequestReporterAndChecksum(t *testing.T) {
 	}
 	if resA.SHA256 != hex.EncodeToString(sumA[:]) || resB.SHA256 != hex.EncodeToString(sumB[:]) {
 		t.Error("per-request checksums not verified")
+	}
+	if resA.MD5 != hex.EncodeToString(md5A[:]) || resB.MD5 != hex.EncodeToString(md5B[:]) {
+		t.Errorf("resolved MD5 checksums crossed runs: %q / %q", resA.MD5, resB.MD5)
 	}
 	gotA, _ := os.ReadFile(resA.Path)
 	gotB, _ := os.ReadFile(resB.Path)
@@ -185,6 +197,9 @@ func TestDoInvalidPerRequestChecksum(t *testing.T) {
 	d := newDL(t, nil)
 	if _, err := d.Do(t.Context(), &Request{URL: "http://x/", ExpectedSHA256: "zz"}); err == nil {
 		t.Error("bad per-request sha256 must error")
+	}
+	if _, err := d.Do(t.Context(), &Request{URL: "http://x/", ExpectedMD5: "zz"}); err == nil {
+		t.Error("bad per-request md5 must error")
 	}
 	if _, err := d.Do(t.Context(), nil); err == nil {
 		t.Error("nil request must error")

@@ -44,7 +44,7 @@ func (e StatusError) Error() string {
 }
 
 // ChecksumError is returned when the downloaded file does not match the
-// expected SHA-256/SHA-1. The fully-downloaded bytes are retained at Path
+// expected SHA-256/SHA-1/MD5. The fully-downloaded bytes are retained at Path
 // (published checksums are sometimes simply wrong). For resumable downloads
 // (multipart with a server validator) a rerun with a corrected checksum — or
 // none — finalizes from the staged file without refetching content; a rerun
@@ -52,7 +52,7 @@ func (e StatusError) Error() string {
 // staged file. Single-stream and validator-less downloads cannot reuse the
 // staged bytes and download again.
 type ChecksumError struct {
-	Algo     string // "sha256" or "sha1"
+	Algo     string // "sha256", "sha1", or "md5"
 	Expected string
 	Actual   string
 	Path     string // retained staging file
