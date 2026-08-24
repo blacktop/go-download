@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,45 +111,48 @@ func TestInvalidPolicyFailsAfterElection(t *testing.T) {
 	}
 }
 
-// TestPolicyAppliesBeforeResumeScheduling pins the ordering contract: the
-// byte-serving URL's policy is resolved before a matching sidecar is turned
-// into scheduler work. A policy-raised floor must therefore split only the
-// missing tail, not fall back to the Options-level single worker or restart
-// already staged bytes.
-func TestPolicyAppliesBeforeResumeScheduling(t *testing.T) {
+// TestPolicyGovernsResumedScheduling pins the effect contract: a resumed run
+// schedules under the policy-resolved concurrency, not the Options base. With
+// Options at one part / 1 MiB and a policy of 4/4/8 KiB, only an honored
+// eager floor can put four tail requests inside the barrier simultaneously —
+// a ramped Parts 4 would arrive sequentially — and staged bytes must never be
+// re-requested.
+func TestPolicyGovernsResumedScheduling(t *testing.T) {
 	t.Parallel()
 	data := testData(1 << 20)
 	var st stats
-	tail := int64(len(data)) - 64<<10
-	var arrivals atomic.Int32
+	// activeTail gauges the tail requests blocked inside the barrier right
+	// now; the gate opens the moment four are simultaneous. releaseOnce
+	// guards the close: post-release stragglers can raise the gauge to four
+	// again. The timeout only bounds the failure path; a passing run releases
+	// in milliseconds.
+	var activeTail atomic.Int32
 	var barrierTimedOut atomic.Bool
 	var releaseOnce sync.Once
 	release := make(chan struct{})
+	var tail int64
 	serveRange := rangeHandler(data, `"v1"`, &st)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if start, ok := parseRangeStart(r.Header.Get("Range")); ok && start >= tail {
-			if arrivals.Add(1) >= 4 {
+			if activeTail.Add(1) >= 4 {
 				releaseOnce.Do(func() { close(release) })
 			}
+			defer activeTail.Add(-1)
 			select {
 			case <-release:
 			case <-r.Context().Done():
 				return
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				barrierTimedOut.Store(true)
 			}
 		}
 		serveRange.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	rawURL := srv.URL + "/artifact.bin?credential=refreshed"
-	sourceURL, err := url.Parse(rawURL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rawURL := srv.URL + "/artifact.bin"
 	dest := filepath.Join(t.TempDir(), "artifact.bin")
 	const resumeID = "stable-artifact"
-	seedInterruptedDownload(t, dest, data, resumeIdentity(resumeID, sourceURL))
+	tail = seedInterruptedDownload(t, dest, data, resumeIdentity(resumeID, nil))
 
 	var policyURL string
 	d := newDL(t, &Options{
@@ -177,10 +179,13 @@ func TestPolicyAppliesBeforeResumeScheduling(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("policy-governed resume installed different bytes")
 	}
+	// A recorded tail start passed the barrier, and only four simultaneous
+	// tail requests open it; the timeout path is the sole other exit and
+	// fails below.
 	starts := st.rangeStarts()
-	if barrierTimedOut.Load() || arrivals.Load() < 4 || len(starts) < 5 || starts[0] != 0 {
-		t.Fatalf("range starts = %v arrivals=%d barrier_timeout=%t, want election plus four concurrent resumed-tail ranges",
-			starts, arrivals.Load(), barrierTimedOut.Load())
+	if barrierTimedOut.Load() || len(starts) < 5 || starts[0] != 0 {
+		t.Fatalf("range starts = %v barrier_timeout=%t, want election plus four simultaneous resumed-tail ranges",
+			starts, barrierTimedOut.Load())
 	}
 	for _, start := range starts[1:] {
 		if start < tail {

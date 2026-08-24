@@ -44,13 +44,15 @@ func TestResumeIdentity(t *testing.T) {
 }
 
 // seedInterruptedDownload stages a mostly complete .part and its sidecar
-// under identity id, as an interrupted run would leave them.
-func seedInterruptedDownload(t *testing.T, dest string, data []byte, id string) {
+// under identity id, as an interrupted run would leave them. It returns the
+// offset of the missing 64 KiB tail so callers never re-derive the geometry.
+func seedInterruptedDownload(t *testing.T, dest string, data []byte, id string) int64 {
 	t.Helper()
 	part := dest + ".part"
 	staged := make([]byte, len(data))
 	copy(staged, data)
-	chunks := []chunkState{{Off: int64(len(data)) - 64<<10, End: int64(len(data)), Done: 0}}
+	tail := int64(len(data)) - 64<<10
+	chunks := []chunkState{{Off: tail, End: int64(len(data)), Done: 0}}
 	for i := chunks[0].Off; i < chunks[0].End; i++ {
 		staged[i] = 0
 	}
@@ -62,6 +64,7 @@ func seedInterruptedDownload(t *testing.T, dest string, data []byte, id string) 
 	if err := side.save(statePath(part)); err != nil {
 		t.Fatal(err)
 	}
+	return tail
 }
 
 // TestResumeIDSurvivesRotatedCredentials: an interrupted download under one
@@ -88,7 +91,7 @@ func TestResumeIDSurvivesRotatedCredentials(t *testing.T) {
 				t.Fatal(err)
 			}
 			dest := filepath.Join(t.TempDir(), "app.ipa")
-			seedInterruptedDownload(t, dest, data, resumeIdentity(tc.resumeID, old))
+			tail := seedInterruptedDownload(t, dest, data, resumeIdentity(tc.resumeID, old))
 
 			d := newDL(t, &Options{Parts: 2, MinPartSize: 16 << 10, ResumeID: tc.resumeID})
 			res, got := mustGet(t, d, srv.URL+"/app.ipa?accessKey=refreshed", dest)
@@ -102,7 +105,7 @@ func TestResumeIDSurvivesRotatedCredentials(t *testing.T) {
 				// Only the missing tail may be requested from the server; the
 				// election (bytes=0-) is closed unread once the sidecar is accepted.
 				for _, start := range st.rangeStarts() {
-					if start != 0 && start < int64(len(data))-64<<10 {
+					if start != 0 && start < tail {
 						t.Fatalf("resumed run requested bytes from %d; want only the missing tail", start)
 					}
 				}
