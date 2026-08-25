@@ -76,15 +76,24 @@ func init() {
 	rootCmd.Flags().StringVar(&flags.resumeID, "resume-id", "",
 		"stable resume identity when the URL carries rotating signed credentials")
 	rootCmd.Flags().BoolVar(&flags.enableNodeSelection, "enable-node-selection", false,
-		"enable multi-address node placement for eligible direct hosts")
+		"spread large direct-CDN downloads across addresses and move work off consistently slow nodes")
 	rootCmd.Flags().BoolVarP(&flags.quiet, "quiet", "q", false, "no progress output")
 	rootCmd.Flags().BoolVar(&flags.insecure, "insecure", false, "skip TLS certificate verification")
 	rootCmd.Flags().BoolVarP(&flags.verbose, "verbose", "V", false, "verbose output")
 }
 
 var rootCmd = &cobra.Command{
-	Use:           "dl <url>",
-	Short:         "Download a file as fast as possible: adaptive parallel parts and resume",
+	Use:   "dl <url>",
+	Short: "Download a file as fast as possible: adaptive parallel parts and resume",
+	Long: `Download a file with adaptive parallel parts and safe resume.
+
+For large files on an eligible direct CDN, --enable-node-selection spreads
+range requests across the host's resolved addresses, measures their actual
+throughput, and moves unfinished work away from consistently slow addresses.
+It remains opt-in because some CDN routes are faster without placement. Use
+--verbose to see whether placement activated and which addresses it connected to.`,
+	Example: `  # Opt into measured multi-address placement for a large CDN file
+  dl --enable-node-selection --verbose https://cdn.example.com/large-file`,
 	Args:          cobra.ExactArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,

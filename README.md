@@ -145,8 +145,11 @@ go install github.com/blacktop/go-download/cmd/dl@latest
 dl -p 8 --sha256 020a1e8... https://dl.google.com/go/go1.26.7.darwin-arm64.tar.gz
 
 # Opt into multi-address placement for an eligible direct CDN host:
-dl -p 8 --enable-node-selection https://cdn.example.com/large-file
+dl -p 8 --enable-node-selection -V https://cdn.example.com/large-file
 ```
+
+Verbose output reports whether placement activated and which addresses it
+connected to. Ineligible routes automatically keep the ordinary transport path.
 
 Run the same command after an interruption to resume the download.
 

@@ -1,10 +1,34 @@
 package cmd
 
 import (
+	"bytes"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestHelpAdvertisesNodeSelection(t *testing.T) {
+	var output bytes.Buffer
+	rootCmd.SetOut(&output)
+	t.Cleanup(func() { rootCmd.SetOut(nil) })
+	if err := rootCmd.Help(); err != nil {
+		t.Fatal(err)
+	}
+	help := output.String()
+	for _, want := range []string{
+		"For large files on an eligible direct CDN",
+		"--enable-node-selection spreads",
+		"moves unfinished work away from consistently slow addresses",
+		"It remains opt-in",
+		"which addresses it connected to",
+		"dl --enable-node-selection --verbose https://cdn.example.com/large-file",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help does not contain %q:\n%s", want, help)
+		}
+	}
+}
 
 func TestDownloadOptionsMapFlags(t *testing.T) {
 	selectionFlag := rootCmd.Flags().Lookup("enable-node-selection")
