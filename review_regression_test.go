@@ -306,13 +306,11 @@ func TestElectionTraceAsync(t *testing.T) {
 	var callbacks sync.WaitGroup
 	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		trace := httptrace.ContextClientTrace(req.Context())
-		callbacks.Add(1)
-		go func() {
-			defer callbacks.Done()
+		callbacks.Go(func() {
 			for range 1000 {
 				trace.GotConn(httptrace.GotConnInfo{Conn: traceTestConn{addr: "192.0.2.2:443"}})
 			}
-		}()
+		})
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
 	})
 	defer callbacks.Wait()
