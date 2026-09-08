@@ -659,7 +659,8 @@ func (d *Downloader) get(ctx context.Context, rq *resolvedRequest) (*Result, err
 		sha256:          rq.sha256,
 		sha1:            rq.sha1,
 		md5:             rq.md5,
-		headers:         rq.headers,
+		headers:         elected.headers,
+		headerSource:    resp.Request.URL,
 		resumeID:        rq.resumeID,
 		measurement:     rq.measurement,
 		url:             finalURL,
@@ -805,7 +806,7 @@ func Discard(ctx context.Context, dest string) error {
 	}
 	defer unlock()
 	part := dest + ".part"
-	f, err := os.OpenFile(part, os.O_RDWR, 0)
+	f, err := openStaging(part, os.O_RDWR)
 	if os.IsNotExist(err) {
 		if err := os.Remove(statePath(part)); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove sidecar: %w", err)
@@ -848,9 +849,31 @@ func Discard(ctx context.Context, dest string) error {
 // final hop connected, how it was routed, and the cancel that aborts it.
 type election struct {
 	resp       *http.Response
+	headers    http.Header
 	remoteAddr string
 	proxied    bool
 	cancel     context.CancelCauseFunc
+}
+
+// electionConnection belongs to one redirect hop. ClientTrace callbacks may
+// arrive concurrently or after RoundTrip returns; old hops must not overwrite
+// the final hop's address.
+type electionConnection struct {
+	mu   sync.Mutex
+	addr string
+}
+
+func (c *electionConnection) gotConn(ci httptrace.GotConnInfo) {
+	addr := ci.Conn.RemoteAddr().String()
+	c.mu.Lock()
+	c.addr = addr
+	c.mu.Unlock()
+}
+
+func (c *electionConnection) snapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.addr
 }
 
 const electionAttempts = 3
@@ -878,12 +901,30 @@ func (d *Downloader) elect(
 		}
 		applyHeaders(req, headers, sourceURL)
 		req.Header.Set("Range", "bytes=0-")
-		var remoteAddr string
+		connection := &electionConnection{}
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-			GotConn: func(ci httptrace.GotConnInfo) {
-				remoteAddr = ci.Conn.RemoteAddr().String()
-			},
+			GotConn: connection.gotConn,
 		}))
+		approvedHeaders := headers.Clone()
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			// net/http has already applied its IDNA-aware redirect policy,
+			// but has not yet added the destination's cookie-jar values.
+			// Retain only caller header keys, not election Range or Referer.
+			approvedHeaders = make(http.Header, len(headers))
+			for name := range headers {
+				if values, ok := req.Header[name]; ok {
+					approvedHeaders[name] = slices.Clone(values)
+				}
+			}
+			connection = &electionConnection{}
+			*req = *req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+				GotConn: connection.gotConn,
+			}))
+			return nil
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			ecancel(nil)
@@ -899,11 +940,11 @@ func (d *Downloader) elect(
 		}
 		switch {
 		case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
-			return election{resp: resp, remoteAddr: remoteAddr, proxied: route.proxied, cancel: ecancel}, nil
+			return election{resp: resp, headers: approvedHeaders, remoteAddr: connection.snapshot(), proxied: route.proxied, cancel: ecancel}, nil
 		case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && emptyContentRange(resp.Header):
 			// A range request on a zero-length resource is unsatisfiable:
 			// the file exists and is empty.
-			return election{resp: resp, remoteAddr: remoteAddr, proxied: route.proxied, cancel: ecancel}, nil
+			return election{resp: resp, headers: approvedHeaders, remoteAddr: connection.snapshot(), proxied: route.proxied, cancel: ecancel}, nil
 		case isRetryableStatus(resp.StatusCode):
 			resp.Body.Close()
 			ecancel(nil)
@@ -1141,6 +1182,9 @@ type run struct {
 	etag        string
 	lastMod     string
 	contentType string // from the initial response
+	// headerSource scopes the headers approved by election redirects. Resume
+	// identity still uses sourceURL, the caller's original resource URL.
+	headerSource *url.URL
 	// electDur is the election round-trip wall time: the best available
 	// proxy for what a fresh connection on this path costs (DNS, dial, TLS,
 	// TTFB). It scales the ramp's settling floor.
@@ -1229,7 +1273,11 @@ func (r *run) hasInitial() bool {
 func (r *run) name() string { return filepath.Base(r.destPath) }
 
 func (r *run) applyHeaders(req *http.Request) {
-	applyHeaders(req, r.headers, r.sourceURL)
+	source := r.headerSource
+	if source == nil {
+		source = r.sourceURL
+	}
+	applyHeaders(req, r.headers, source)
 }
 
 // validator returns the If-Range value proving the content is unchanged
@@ -1248,6 +1296,15 @@ func (r *run) resumable() bool {
 	return r.validator() != ""
 }
 
+// invalidateState removes coverage before fresh writes can invalidate it, even
+// when no replacement sidecar can be saved (e.g. checksum-only multipart).
+func (r *run) invalidateState() error {
+	if err := os.Remove(statePath(r.partPath)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("invalidate resume state: %w", err)
+	}
+	return nil
+}
+
 // multipart downloads r.url (known size, ranges honored) with parallel
 // workers, dynamic chunk splitting, and resume.
 func (r *run) multipart(ctx context.Context) (*Result, error) {
@@ -1255,7 +1312,7 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 	sourceID := resumeIdentity(r.resumeID, r.sourceURL)
 
 	flag := os.O_RDWR | os.O_CREATE
-	file, err := os.OpenFile(r.partPath, flag, 0o644)
+	file, err := openStaging(r.partPath, flag)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}
@@ -1286,6 +1343,9 @@ func (r *run) multipart(ctx context.Context) (*Result, error) {
 		resumedBytes = r.total - st.remaining()
 		r.d.log.Debug("resuming", "bytes", resumedBytes, "chunks", len(st.Chunks))
 	} else {
+		if err := r.invalidateState(); err != nil {
+			return nil, err
+		}
 		if err := file.Truncate(r.total); err != nil {
 			return nil, fmt.Errorf("preallocate %s: %w", r.partPath, err)
 		}
@@ -1738,10 +1798,8 @@ func (r *run) runWorkers(
 func (r *run) single(ctx context.Context) (*Result, error) {
 	// No O_TRUNC and no eager sidecar removal: an existing multipart .part
 	// stays resumable until a single-stream attempt actually starts writing
-	// (singleAttempt truncates only after a successful response). A stale
-	// sidecar is removed by verifyAndFinalize on success and is harmless
-	// otherwise (usable() rejects it once the .part size changed).
-	file, err := os.OpenFile(r.partPath, os.O_RDWR|os.O_CREATE, 0o644)
+	// (singleAttempt invalidates the sidecar before its first truncation).
+	file, err := openStaging(r.partPath, os.O_RDWR|os.O_CREATE)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", r.partPath, err)
 	}

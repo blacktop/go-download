@@ -220,6 +220,7 @@ func (w *worker) downloadChunk(ctx context.Context, c *chunk) error {
 	for {
 		err := w.attempt(ctx, c)
 		if err == nil {
+			w.bo.reset()
 			w.sched.complete(c)
 			w.r.rep.ChunkDone(c.id)
 			return nil
@@ -674,6 +675,9 @@ func (w *worker) bumpTimeout() {
 }
 
 func (w *worker) decayTimeout() {
+	// A full healthy read resets retry backoff independently of the stall
+	// timeout ladder, including when no stall has ever raised the timeout.
+	w.bo.reset()
 	base := w.r.d.opt.Timeout
 	if w.timeout <= base {
 		w.timeout = base
@@ -687,7 +691,6 @@ func (w *worker) decayTimeout() {
 	w.dtt = decayWindow
 	if w.timeout <= base {
 		w.timeout = base
-		w.bo.reset()
 	}
 }
 
@@ -807,6 +810,9 @@ func checkSingleStatus(resp *http.Response, initial bool, total int64) (empty bo
 // completeEmptySingle finishes a zero-length download: truncate, announce,
 // done — no body bytes are ever involved.
 func (w *worker) completeEmptySingle() error {
+	if err := w.r.invalidateState(); err != nil {
+		return &permanentError{err}
+	}
 	if err := w.file.Truncate(0); err != nil {
 		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
 	}
@@ -905,6 +911,9 @@ func (w *worker) singleAttempt(ctx context.Context) error {
 
 	// Truncate only after a successful response: a failed attempt must not
 	// destroy previously staged bytes (e.g. a resumable multipart .part).
+	if err := w.r.invalidateState(); err != nil {
+		return &permanentError{err}
+	}
 	if err := w.file.Truncate(0); err != nil {
 		return &permanentError{fmt.Errorf("truncate %s: %w", w.file.Name(), err)}
 	}

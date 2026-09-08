@@ -30,7 +30,7 @@ func lockStaging(f *os.File) error {
 	if err != nil {
 		return fmt.Errorf("stat locked staging file %s: %w", f.Name(), err)
 	}
-	current, err := os.Stat(f.Name())
+	current, err := os.Lstat(f.Name())
 	if os.IsNotExist(err) {
 		return fmt.Errorf("%w: staging path changed while acquiring lock", ErrLocked)
 	}

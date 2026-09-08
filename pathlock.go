@@ -3,6 +3,8 @@ package download
 import (
 	"context"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -34,6 +36,13 @@ func refDestination(dest string) (string, *pathLockEntry, error) {
 	// needs the directory to exist anyway.
 	if dir, rerr := filepath.EvalSymlinks(filepath.Dir(key)); rerr == nil {
 		key = filepath.Join(dir, filepath.Base(key))
+	}
+
+	// Windows normally treats case variants as one file. Fold conservatively:
+	// case-sensitive directories may serialize distinct names, but cannot
+	// permit co-writes through case aliases where staging flock is unavailable.
+	if runtime.GOOS == "windows" {
+		key = strings.ToUpper(key)
 	}
 
 	destinationLocks.mu.Lock()

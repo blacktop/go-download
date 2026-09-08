@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 )
 
@@ -66,11 +67,19 @@ func (st *stateFile) save(path string) error {
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return fmt.Errorf("write state %s: %w", tmp, err)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create state temporary file: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close state: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("rename state: %w", err)
 	}
 	return nil

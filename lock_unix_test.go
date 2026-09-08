@@ -185,3 +185,24 @@ func TestGetRefusesLockedStagingFile(t *testing.T) {
 		t.Fatalf("Get after lock release: %v", err)
 	}
 }
+
+func TestLockStagingRejectsSymlinkReplacement(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	part := filepath.Join(dir, "file.part")
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	moved := filepath.Join(dir, "moved.part")
+	if err := os.Rename(part, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, part); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockStaging(f); !errors.Is(err, ErrLocked) {
+		t.Fatalf("symlink replacement accepted: %v", err)
+	}
+}

@@ -45,7 +45,7 @@ func parseContentDisposition(input string) string {
 // second pass would corrupt names containing '+' or literal '%').
 func deriveName(location string, header http.Header) (string, error) {
 	if name := parseContentDisposition(header.Get("Content-Disposition")); name != "" {
-		return filepath.Base(name), nil
+		return derivedBase(name), nil
 	}
 	u, err := parseURL(location)
 	if err != nil {
@@ -55,10 +55,16 @@ func deriveName(location string, header http.Header) (string, error) {
 	if name == "" {
 		name = u.Opaque
 	}
-	if base := filepath.Base(name); base != "." && base != string(filepath.Separator) && base != "/" {
-		return base, nil
+	return derivedBase(name), nil
+}
+
+// derivedBase must name a file, never the selected directory or its parent.
+func derivedBase(name string) string {
+	base := filepath.Base(name)
+	if base == "." || base == ".." || !filepath.IsLocal(base) {
+		return ""
 	}
-	return "", nil
+	return base
 }
 
 // resolveDest turns the user-supplied dest into a concrete file path.
